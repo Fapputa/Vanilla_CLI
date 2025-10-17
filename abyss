@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Abyss - terminal editor for prompt_toolkit v2.0.10
-(…entier comme ton original, avec ajouts pour lancer/stopper GUI/ncurses/term)
+Abyss - terminal editor for prompt_toolkit v2.0.11
+(…original, avec ajouts pour lancer/stopper GUI/ncurses/term)
 """
 import sys
 import os
@@ -22,6 +22,24 @@ from prompt_toolkit.widgets import TextArea, Button, Dialog
 from prompt_toolkit.lexers import PygmentsLexer
 from prompt_toolkit.document import Document
 from prompt_toolkit.application import get_app
+from prompt_toolkit.layout.menus import CompletionsMenu
+from prompt_toolkit.styles import Style
+from prompt_toolkit.lexers import Lexer
+from pygments.token import Token
+from pygments.lexers import PythonLexer
+from prompt_toolkit.styles import Style
+
+style = Style.from_dict({
+    "search": "bg:#4444ff #ffffff",
+})
+
+
+search_state = {
+    "query": "",
+    "matches": [],
+    "current_index": 0,
+    "floating": None
+}
 
 # Pygments lexers (best-effort)
 try:
@@ -82,6 +100,51 @@ title_bar = Window(
 body_container = VSplit([left_gutter, editor_window], padding=1)
 root_container = FloatContainer(content=HSplit([title_bar, body_container]), floats=[])
 layout_main = Layout(root_container, focused_element=editor_window)
+# ---- Highlight functions ----
+
+class SearchHighlightLexer(Lexer):
+    def __init__(self, base_lexer=None, highlight_word=""):
+        self.base_lexer = base_lexer
+        self.highlight_word = highlight_word
+
+    def lex_document(self, document):
+        def get_line(lineno):
+            line = document.lines[lineno]
+            result = []
+            i = 0
+            while i < len(line):
+                if self.highlight_word and line[i:i+len(self.highlight_word)] == self.highlight_word:
+                    # Style en string, compatible PTK3+
+                    result.append(("class:search", self.highlight_word))
+                    i += len(self.highlight_word)
+                else:
+                    result.append(("", line[i]))
+                    i += 1
+            return result
+        return get_line
+
+# ---- Reset Lexer ----
+
+def reset_lexer():
+    """Remet la coloration normale du fichier actuel."""
+    if CURRENT_FILE:
+        detect_mode(CURRENT_FILE)
+    else:
+        editor.lexer = PygmentsLexer(CLexer)
+
+
+# ---- Update search ----
+
+
+def update_search_highlight():
+    query = search_state.get("query", "")
+    if query:
+        base_lexer = editor.lexer
+        editor.lexer = SearchHighlightLexer(base_lexer=base_lexer, highlight_word=query)
+    else:
+        detect_mode(CURRENT_FILE or "file.c")
+
+
 
 # ---- Helper functions ----
 def save_file(filename: str):
@@ -91,16 +154,29 @@ def save_file(filename: str):
         f.write(editor.text)
     output.text = f"Saved to {filename}"
 
+
 def open_save_dialog():
-    fname_input = TextArea(multiline=False, height=1, text=CURRENT_FILE or "")
+    global CURRENT_FILE
+
+    # Préremplir avec le nom courant
+    from prompt_toolkit.document import Document
+    initial_text = CURRENT_FILE if CURRENT_FILE else ""
+    fname_input = TextArea(
+        multiline=False,
+        height=1,
+        text=initial_text  # <- texte initial
+    )
+    fname_input.buffer.document = Document(text=initial_text, cursor_position=len(initial_text))
+
     kb_dialog = KeyBindings()
+
 
     def on_ok():
         fname = fname_input.text.strip()
         root_container.floats[:] = []
         if fname:
             save_file(fname)
-            get_app().exit(result=fname)
+            layout_main.focus(editor_window)
         else:
             output.text = "error vanilla 403"
             layout_main.focus(editor_window)
@@ -355,6 +431,71 @@ def _(event):
     body_container.children[:] = [left_gutter, editor_window, middle_gap, output_window]
     layout_main.focus(editor_window)
 
+
+
+def open_search_dialog():
+    from prompt_toolkit.layout import Float
+    from prompt_toolkit.widgets import TextArea, Button, Dialog
+    global search_state
+
+    search_input = TextArea(multiline=False, height=1, text=search_state["query"] or "")
+    
+    def do_search(next=True):
+        text = editor.text
+        query = search_input.text
+        search_state["query"] = query
+        if not query:
+            search_state["matches"] = []
+            return
+        matches = [m.start() for m in re.finditer(re.escape(query), text)]
+        search_state["matches"] = matches
+        if not matches:
+            update_search_highlight()
+            return
+        if next:
+            search_state["current_index"] = (search_state["current_index"] + 1) % len(matches)
+        else:
+            search_state["current_index"] = (search_state["current_index"] - 1) % len(matches)
+        pos = matches[search_state["current_index"]]
+        editor.buffer.cursor_position = pos
+        update_search_highlight()
+    kb_search = KeyBindings()
+    @kb_search.add("enter")
+    def _(event):
+        do_search(next=True)
+        
+    @kb_search.add("c-p")
+    def _(event):
+        do_search(next=False)
+        
+    @kb_search.add("escape")
+    def _(event):
+        if search_state["floating"] in root_container.floats:
+            root_container.floats.remove(search_state["floating"])
+            layout_main.focus(editor_window)
+            search_state["floating"] = None
+            reset_lexer()
+            
+    search_input.control.key_bindings = kb_search
+    ok_button = Button(text="Close", handler=lambda: kb_search.get_bindings_for_keys(['escape'])[0].handler(None))
+    dialog = Dialog(
+        title="Rechercher",
+        body=search_input,
+        buttons=[ok_button],
+        width=60,
+        modal=True
+    )
+    floating = Float(content=dialog)
+    search_state["floating"] = floating
+    root_container.floats.append(floating)
+    layout_main.focus(search_input.control)
+@kb.add("c-f")
+def _(event):
+    open_search_dialog()
+
+
+
+
 # ---- NEW: Ctrl-L toggle pour lancer GUI/ncurses/terminal ----
 @kb.add("c-l")
 def _(event):
@@ -540,16 +681,23 @@ def _(event):
     buf.newline()
 
 # ---- Application ----
-app = Application(layout=layout_main, key_bindings=kb, full_screen=True)
+
+app = Application(
+    layout=layout_main,
+    key_bindings=kb,
+    full_screen=True,
+    style=style
+)
 
 # ---- Main runner ----
 if __name__ == "__main__":
     if len(sys.argv) > 1:
         arg = sys.argv[1]
-        if arg != "vide" and os.path.exists(arg):
+        if arg != "vide":
             CURRENT_FILE = arg
-            with open(arg, "r", encoding="utf-8") as fh:
-                editor.text = fh.read()
+            if os.path.exists(arg):
+                with open(arg, "r", encoding="utf-8") as fh:
+                    editor.text = fh.read()
             detect_mode(arg)
     else:
         detect_mode("file.c")

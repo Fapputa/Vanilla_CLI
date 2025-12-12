@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Abyss - terminal editor for prompt_toolkit v2.0.11
-(…original, avec ajouts pour lancer/stopper GUI/ncurses/term)
+(Version corrigée : Fix PHP execution + Ajout Undo/Redo)
 """
 import sys
 import os
@@ -14,25 +14,40 @@ import shutil
 import signal
 import time
 from pathlib import Path
+
+# Prompt Toolkit imports
 from prompt_toolkit import Application
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import Layout, VSplit, HSplit, FloatContainer, Float, Window
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.widgets import TextArea, Button, Dialog
-from prompt_toolkit.lexers import PygmentsLexer
+from prompt_toolkit.lexers import PygmentsLexer, Lexer
 from prompt_toolkit.document import Document
 from prompt_toolkit.application import get_app
-from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.styles import Style
-from prompt_toolkit.lexers import Lexer
-from pygments.token import Token
-from pygments.lexers import PythonLexer
-from prompt_toolkit.styles import Style
+from prompt_toolkit.selection import SelectionType 
 
+# Pygments imports
+from pygments.token import Token
+try:
+    from pygments.lexers import (
+        CLexer, CppLexer, PythonLexer, BashLexer, JsonLexer, SqlLexer,
+        NasmLexer, CSharpLexer, HtmlLexer, JavascriptLexer, PhpLexer
+    )
+except Exception:
+    # Fallback si certains lexers manquent
+    from pygments.lexers import CLexer, PythonLexer, BashLexer, JsonLexer, SqlLexer
+    from pygments.lexers import HtmlLexer as PhpLexer 
+    CppLexer = CLexer
+    NasmLexer = CLexer
+    CSharpLexer = CLexer
+    HtmlLexer = CLexer
+    JavascriptLexer = CLexer 
+
+# --- Styles & Globals ---
 style = Style.from_dict({
     "search": "bg:#4444ff #ffffff",
 })
-
 
 search_state = {
     "query": "",
@@ -41,29 +56,13 @@ search_state = {
     "floating": None
 }
 
-# Pygments lexers (best-effort)
-try:
-    from pygments.lexers import (
-        CLexer, CppLexer, PythonLexer, BashLexer, JsonLexer, SqlLexer,
-        NasmLexer, CSharpLexer, HtmlLexer, JavascriptLexer
-    )
-except Exception:
-    from pygments.lexers import CLexer, PythonLexer, BashLexer, JsonLexer, SqlLexer
-    CppLexer = CLexer
-    NasmLexer = CLexer
-    CSharpLexer = CLexer
-    HtmlLexer = CLexer
-    JavascriptLexer = CLexer  # petite faute corrigée
-
-# Globals
 CURRENT_FILE = None
 SPLIT_VIEW = False
 CURRENT_MODE = "c"
-HTML_SERVER_STARTED = False  # éviter plusieurs serveurs
+SERVER_STARTED = False 
 
-# NEW: processes en cours (clé -> subprocess.Popen)
-RUNNING_PROCS = {}  # ex: RUNNING_PROCS["gui_python"] = Popen(...)
-# Key to identify the "session" we spawn for Ctrl-L toggle
+# Processus en cours (clé -> subprocess.Popen)
+RUNNING_PROCS = {} 
 TOGGLE_KEY = "ctrl_l_process"
 
 # --- Text widgets ---
@@ -93,14 +92,15 @@ middle_gap = Window(width=2, char=" ")
 
 title_bar = Window(
     height=1,
-    content=FormattedTextControl([('reverse', ' Abyss ')]),
+    content=FormattedTextControl([('reverse', ' Abyss | Ctrl+Space: Select | Ctrl+Z: Undo | Ctrl+Y: Redo | Ctrl+B: Run/Serve ')]),
     style='reverse'
 )
 
 body_container = VSplit([left_gutter, editor_window], padding=1)
 root_container = FloatContainer(content=HSplit([title_bar, body_container]), floats=[])
 layout_main = Layout(root_container, focused_element=editor_window)
-# ---- Highlight functions ----
+
+# ---- Highlight Search Custom Lexer ----
 
 class SearchHighlightLexer(Lexer):
     def __init__(self, base_lexer=None, highlight_word=""):
@@ -114,7 +114,6 @@ class SearchHighlightLexer(Lexer):
             i = 0
             while i < len(line):
                 if self.highlight_word and line[i:i+len(self.highlight_word)] == self.highlight_word:
-                    # Style en string, compatible PTK3+
                     result.append(("class:search", self.highlight_word))
                     i += len(self.highlight_word)
                 else:
@@ -123,18 +122,12 @@ class SearchHighlightLexer(Lexer):
             return result
         return get_line
 
-# ---- Reset Lexer ----
-
 def reset_lexer():
     """Remet la coloration normale du fichier actuel."""
     if CURRENT_FILE:
         detect_mode(CURRENT_FILE)
     else:
         editor.lexer = PygmentsLexer(CLexer)
-
-
-# ---- Update search ----
-
 
 def update_search_highlight():
     query = search_state.get("query", "")
@@ -144,32 +137,27 @@ def update_search_highlight():
     else:
         detect_mode(CURRENT_FILE or "file.c")
 
-
-
 # ---- Helper functions ----
+
 def save_file(filename: str):
     global CURRENT_FILE
     CURRENT_FILE = filename
-    with open(filename, "w", encoding="utf-8") as f:
-        f.write(editor.text)
-    output.text = f"Saved to {filename}"
-
+    try:
+        with open(filename, "w", encoding="utf-8") as f:
+            f.write(editor.text)
+        output.text = f"Saved to {filename}"
+    except Exception as e:
+        output.text = f"Error saving: {e}"
 
 def open_save_dialog():
     global CURRENT_FILE
-
-    # Préremplir avec le nom courant
-    from prompt_toolkit.document import Document
     initial_text = CURRENT_FILE if CURRENT_FILE else ""
-    fname_input = TextArea(
-        multiline=False,
-        height=1,
-        text=initial_text  # <- texte initial
-    )
-    fname_input.buffer.document = Document(text=initial_text, cursor_position=len(initial_text))
+    fname_input = TextArea(multiline=False, height=1, text=initial_text)
+    
+    # Position cursor at end
+    fname_input.buffer.cursor_position = len(initial_text)
 
     kb_dialog = KeyBindings()
-
 
     def on_ok():
         fname = fname_input.text.strip()
@@ -178,7 +166,7 @@ def open_save_dialog():
             save_file(fname)
             layout_main.focus(editor_window)
         else:
-            output.text = "error vanilla 403"
+            output.text = "Filename cancelled."
             layout_main.focus(editor_window)
 
     ok_button = Button(text="OK", handler=on_ok)
@@ -232,6 +220,8 @@ def detect_mode(filename: str):
         editor.lexer = PygmentsLexer(CSharpLexer); CURRENT_MODE = "cs"
     elif filename.endswith(".html"):
         editor.lexer = PygmentsLexer(HtmlLexer); CURRENT_MODE = "html"
+    elif filename.endswith(".php"):
+        editor.lexer = PygmentsLexer(PhpLexer); CURRENT_MODE = "php"
     elif filename.endswith(".js"):
         editor.lexer = PygmentsLexer(JavascriptLexer); CURRENT_MODE = "js"
     else:
@@ -241,98 +231,59 @@ def contains_ncurses(text: str) -> bool:
     return "#include <ncurses.h>" in text or '#include "ncurses.h"' in text
 
 def is_port_in_use(port=8000):
-    """Vérifie si le port est déjà utilisé"""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         return s.connect_ex(('localhost', port)) == 0
 
 def compile_and_run_for_extension(ext: str):
     flags = read_flags()
     flags_str = " ".join(flags)
-
     temp_file = "temp" + ext
     with open(temp_file, "w", encoding="utf-8") as f:
         f.write(editor.text)
 
-    if ext in (".c", ".cpp", ".s", ".asm", ".py", ".sh", ".cs"):
-        # Gestion standard comme avant
-        if ext in (".c", "c", ""):
-            compile_cmd = f"gcc {temp_file} -o temp {flags_str}".strip()
-            compile_res = subprocess.getoutput(compile_cmd)
-            if compile_res.strip():
-                return False, f"Compilation errors:\n{compile_res}"
-        elif ext in (".cpp", ".cxx", ".cc"):
-            compile_cmd = f"g++ {temp_file} -o temp {flags_str}".strip()
-            compile_res = subprocess.getoutput(compile_cmd)
-            if compile_res.strip():
-                return False, f"Compilation errors:\n{compile_res}"
-        elif ext in (".s", ".asm"):
-            asm_o = "temp.o"
-            nasm_res = subprocess.getoutput(f"nasm -f elf64 {temp_file} -o {asm_o} 2>&1")
-            if nasm_res.strip() != "":
-                compile_cmd = f"gcc {temp_file} -o temp {flags_str} 2>&1"
-                compile_res = subprocess.getoutput(compile_cmd)
-                if compile_res.strip():
-                    return False, f"Compilation errors:\n{compile_res}"
-            else:
-                ld_res = subprocess.getoutput(f"ld {asm_o} -o temp 2>&1")
-                if ld_res.strip():
-                    return False, f"Linker errors:\n{ld_res}"
-        elif ext == ".py":
-            run_out = subprocess.getoutput(f"python3 {temp_file} 2>&1")
-            return False, run_out if run_out.strip() else "(no output)"
-        elif ext == ".sh":
-            os.chmod(temp_file, 0o755)
-            run_out = subprocess.getoutput(f"bash {temp_file} 2>&1")
-            return False, run_out if run_out.strip() else "(no output)"
-        elif ext == ".cs":
-            compile_res = subprocess.getoutput(f"mcs {temp_file} -out:temp.exe 2>&1")
-            if compile_res.strip():
-                return False, f"Compilation errors:\n{compile_res}"
-            run_out = subprocess.getoutput("mono temp.exe 2>&1")
-            return False, run_out if run_out.strip() else "(no output)"
-        elif ext == ".js":
-            run_out = subprocess.getoutput(f"node {temp_file} 2>&1")
-            return False, run_out if run_out.strip() else "(no output)"
+    # Compilation logic (standard)
+    if ext in (".c", "c", ""):
+        compile_cmd = f"gcc {temp_file} -o temp {flags_str}".strip()
+        res = subprocess.getoutput(compile_cmd)
+        if res.strip(): return False, f"Errors:\n{res}"
+    elif ext in (".cpp", ".cxx", ".cc"):
+        compile_cmd = f"g++ {temp_file} -o temp {flags_str}".strip()
+        res = subprocess.getoutput(compile_cmd)
+        if res.strip(): return False, f"Errors:\n{res}"
+    elif ext in (".s", ".asm"):
+        asm_o = "temp.o"
+        nasm = subprocess.getoutput(f"nasm -f elf64 {temp_file} -o {asm_o} 2>&1")
+        if nasm.strip(): return False, f"NASM Error:\n{nasm}"
+        ld = subprocess.getoutput(f"ld {asm_o} -o temp 2>&1")
+        if ld.strip(): return False, f"Linker Error:\n{ld}"
+    elif ext == ".py":
+        out = subprocess.getoutput(f"python3 {temp_file} 2>&1")
+        return False, out if out.strip() else "(no output)"
+    elif ext == ".sh":
+        os.chmod(temp_file, 0o755)
+        out = subprocess.getoutput(f"bash {temp_file} 2>&1")
+        return False, out if out.strip() else "(no output)"
+    elif ext == ".js":
+        out = subprocess.getoutput(f"node {temp_file} 2>&1")
+        return False, out if out.strip() else "(no output)"
+    
+    # Run compiled binary
+    if ext in (".c", ".cpp", ".s", ".asm"):
+        out = subprocess.getoutput("./temp 2>&1")
+        return False, out if out.strip() else "(no output)"
 
-        run_out = subprocess.getoutput("./temp 2>&1")
-        return False, run_out if run_out.strip() else "(no output)"
+    return False, "(no execution logic for this type)"
 
-    if ext in (".json", ".sql"):
-        return False, "(no execution for this file type — syntax highlighting only)"
+# ---- Process Helpers ----
 
-    if ext == ".html":
-        global HTML_SERVER_STARTED
-        # Supprimer les commentaires
-        clean_text = re.sub(r"<!--.*?-->", "", editor.text, flags=re.DOTALL)
-        temp_file = "temp.html"
-        with open(temp_file, "w", encoding="utf-8") as f:
-            f.write(clean_text)
-
-        # Lancer le serveur une seule fois si le port est libre
-        if not HTML_SERVER_STARTED and not is_port_in_use(8000):
-            subprocess.Popen(["python3", "-m", "http.server", "8000"],
-                             stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL)
-            HTML_SERVER_STARTED = True
-
-        html_file = os.path.basename(CURRENT_FILE or temp_file)
-        url = f"http://localhost:8000/{html_file}"
-        webbrowser.open(url)
-        return True, f"Serving {html_file} at {url} (Ctrl+C to stop)"
-
-    return False, "(no output)"
-
-# ---- NEW helpers pour lancer/terminer processus externes ----
 def find_terminal_emulator():
-    """Retourne la commande et le format d'appel pour lancer un terminal interactif."""
-    # On essaie dans l'ordre courant : utilitaire / options pratiques
     candidates = [
-        ("x-terminal-emulator", ["x-terminal-emulator", "-e"]),  # Debian generic
-        ("gnome-terminal", ["gnome-terminal", "--"]),            # GNOME
-        ("konsole", ["konsole", "-e"]),                          # KDE
-        ("xterm", ["xterm", "-e"]),                              # xterm
-        ("alacritty", ["alacritty", "-e"]),                      # alacritty
-        ("kitty", ["kitty", "-e"]),                              # kitty
+        ("x-terminal-emulator", ["x-terminal-emulator", "-e"]),
+        ("gnome-terminal", ["gnome-terminal", "--"]),
+        ("konsole", ["konsole", "-e"]),
+        ("xterm", ["xterm", "-e"]),
+        ("alacritty", ["alacritty", "-e"]),
+        ("kitty", ["kitty", "-e"]),
         ("urxvt", ["urxvt", "-e"])
     ]
     for name, proto in candidates:
@@ -340,39 +291,31 @@ def find_terminal_emulator():
             return proto
     return None
 
-def start_detached_process(key: str, args: list, use_terminal=False, title=None):
-    """Démarre et garde la Popen dans RUNNING_PROCS[key]. Si déjà existant, le remplace."""
-    # Si déjà lancé -> on le termine proprement avant de relancer.
+def start_detached_process(key: str, args: list, use_terminal=False):
     if key in RUNNING_PROCS and RUNNING_PROCS[key] is not None:
         stop_process(key)
 
     if use_terminal:
         term = find_terminal_emulator()
         if term is None:
-            # Pas d'émulateur : fallback démarrer en arrière-plan (ne convient pas pour ncurses)
             proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
         else:
-            # Construire la commande à placer après -e / -- ...
-            # On veut que le terminal reste ouvert après la fin (optionnel) : on ajoute `; exec $SHELL`
+            def q(s): return shlex_quote(s)
             cmdstr = " ".join(shlex_quote(a) for a in args)
-            # selon terminal, il faut une forme différente
-            if term[0].endswith("gnome-terminal"):
-                # gnome-terminal -- bash -c "cmd; exec bash"
-                proc = subprocess.Popen([term[0], "--", "bash", "-c", f"{cmdstr}; exec bash"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            elif term[0].endswith("konsole"):
-                proc = subprocess.Popen([term[0], "-e", "bash", "-c", f"{cmdstr}; exec bash"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # Adapt terminal launch
+            if "gnome-terminal" in term[0] or "konsole" in term[0]:
+                full_args = term + ["bash", "-c", f"{cmdstr}; exec bash"]
             else:
-                # xterm / alacritty / kitty acceptent -e "cmd"
-                proc = subprocess.Popen([term[0], term[1], "bash", "-c", f"{cmdstr}; exec bash"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                full_args = term + ["bash", "-c", f"{cmdstr}; exec bash"]
+            
+            proc = subprocess.Popen(full_args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     else:
-        # Processus détaché normal (pour GUI), on ne redirige pas stdout/stderr pour voir erreurs si besoin
         proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
 
     RUNNING_PROCS[key] = proc
     return proc
 
 def stop_process(key: str, timeout=2.0):
-    """Tente terminate(), attend, puis kill() si nécessaire."""
     proc = RUNNING_PROCS.get(key)
     if not proc:
         return False
@@ -380,7 +323,6 @@ def stop_process(key: str, timeout=2.0):
         proc.terminate()
     except Exception:
         pass
-    # wait with timeout
     try:
         proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -393,20 +335,63 @@ def stop_process(key: str, timeout=2.0):
     return True
 
 def shlex_quote(s):
-    # petit remplacement de shlex.quote pour compatibilité sans import lourd
     import shlex
     return shlex.quote(s)
 
-# ---- Key bindings ----
+# ---- Key Bindings ----
 kb = KeyBindings()
+
+# --- UNDO / REDO (NOUVEAU) ---
+@kb.add("c-z")
+def _(event):
+    """Annuler."""
+    event.app.current_buffer.undo()
+
+@kb.add("c-y")
+def _(event):
+    """Rétablir."""
+    event.app.current_buffer.redo()
+# ----------------------------
+
+@kb.add("tab")
+def _(event):
+    # Utilisez 4 espaces ASCII standard ici
+    event.app.current_buffer.insert_text("    ")
+    
+@kb.add("c-space")
+def _(event):
+    buff = event.app.current_buffer
+    if buff.selection_state:
+        buff.exit_selection()
+    else:
+        buff.start_selection(selection_type=SelectionType.CHARACTERS)
+
+@kb.add("escape", "c") 
+def _(event):
+    data = event.app.current_buffer.copy_selection()
+    event.app.clipboard.set_data(data)
+    event.app.current_buffer.exit_selection()
+
+@kb.add("escape", "x")
+def _(event):
+    data = event.app.current_buffer.cut_selection()
+    event.app.clipboard.set_data(data)
+
+@kb.add("c-v")
+def _(event):
+    event.app.current_buffer.paste_clipboard_data(event.app.clipboard.get_data())
+
+@kb.add("backspace")
+def _(event):
+    buff = event.app.current_buffer
+    if buff.selection_state:
+        buff.cut_selection()
+    else:
+        buff.delete_before_cursor(1)
 
 @kb.add("c-x")
 def _(event):
     root_container.floats[:] = []
-    try:
-        subprocess.call("reset", shell=True)
-    except Exception:
-        pass
     event.app.exit(result=None)
 
 @kb.add("c-o")
@@ -419,8 +404,7 @@ def _(event):
     doc = buf.document
     before = len(doc.current_line_before_cursor)
     after = len(doc.current_line_after_cursor)
-    if doc.cursor_position < len(doc.text):
-        after += 1
+    if doc.cursor_position < len(doc.text): after += 1
     buf.delete_before_cursor(before)
     buf.delete(after)
 
@@ -431,13 +415,13 @@ def _(event):
     body_container.children[:] = [left_gutter, editor_window, middle_gap, output_window]
     layout_main.focus(editor_window)
 
+@kb.add("c-f")
+def _(event):
+    open_search_dialog()
 
-
+# --- Search Dialog ---
 def open_search_dialog():
-    from prompt_toolkit.layout import Float
-    from prompt_toolkit.widgets import TextArea, Button, Dialog
     global search_state
-
     search_input = TextArea(multiline=False, height=1, text=search_state["query"] or "")
     
     def do_search(next=True):
@@ -459,15 +443,12 @@ def open_search_dialog():
         pos = matches[search_state["current_index"]]
         editor.buffer.cursor_position = pos
         update_search_highlight()
+
     kb_search = KeyBindings()
     @kb_search.add("enter")
-    def _(event):
-        do_search(next=True)
-        
+    def _(event): do_search(next=True)
     @kb_search.add("c-p")
-    def _(event):
-        do_search(next=False)
-        
+    def _(event): do_search(next=False)
     @kb_search.add("escape")
     def _(event):
         if search_state["floating"] in root_container.floats:
@@ -478,195 +459,179 @@ def open_search_dialog():
             
     search_input.control.key_bindings = kb_search
     ok_button = Button(text="Close", handler=lambda: kb_search.get_bindings_for_keys(['escape'])[0].handler(None))
-    dialog = Dialog(
-        title="Rechercher",
-        body=search_input,
-        buttons=[ok_button],
-        width=60,
-        modal=True
-    )
+    dialog = Dialog(title="Search", body=search_input, buttons=[ok_button], width=60, modal=True)
     floating = Float(content=dialog)
     search_state["floating"] = floating
     root_container.floats.append(floating)
     layout_main.focus(search_input.control)
-@kb.add("c-f")
-def _(event):
-    open_search_dialog()
 
-
-
-
-# ---- NEW: Ctrl-L toggle pour lancer GUI/ncurses/terminal ----
 @kb.add("c-l")
 def _(event):
-    """
-    Ctrl-L:
-    - Si fichier Python (.py) -> lance le script en detached (GUI PyQt par ex.)
-    - Si fichier C et contient ncurses -> lance l'exécutable dans un terminal séparé
-    - Si fichier .sh -> lance le script dans un terminal séparé (utile pour spinner)
-    - Si déjà lancé -> arrête le processus et affiche message
-    """
     global CURRENT_FILE
     if not CURRENT_FILE:
-        output.text = "No current file to run (save first)."
+        output.text = "Save first."
         return
-
     ext = os.path.splitext(CURRENT_FILE)[1]
     key = f"{TOGGLE_KEY}:{CURRENT_FILE}"
-    # If already running -> stop
     if key in RUNNING_PROCS:
-        stopped = stop_process(key)
-        output.text = f"Stopped process for {CURRENT_FILE}."
+        stop_process(key)
+        output.text = f"Stopped {CURRENT_FILE}."
         return
 
-    # Save current file before launching
-    try:
-        save_file(CURRENT_FILE)
-    except Exception as e:
-        output.text = f"Error saving before launch: {e}"
-        return
-
-    # Decide how to launch
+    save_file(CURRENT_FILE)
+    
+    # Simple launcher logic
     if ext == ".py":
-        # GUI Python: start python3 file.py detached
-        args = ["python3", CURRENT_FILE]
-        start_detached_process(key, args, use_terminal=False)
-        output.text = f"Launched Python GUI: {CURRENT_FILE} (detached). Appuyez à nouveau sur Ctrl-L pour fermer."
-        return
-
-    if ext == ".sh":
-        # Shell script: launch in a terminal so spinner/ncurses shows
-        args = ["bash", CURRENT_FILE]
-        start_detached_process(key, args, use_terminal=True)
-        output.text = f"Launched shell script in new terminal: {CURRENT_FILE}."
-        return
-
-    # C / ncurses: compile then run in terminal emulator if it uses ncurses
-    if ext in (".c", ".cpp", ".s", ".asm"):
-        # compile into temp_exe (non intrusif)
-        bin_name = "temp_ncurses_exec"
-        if ext == ".c":
-            compile_cmd = f"gcc {CURRENT_FILE} -o {bin_name}"
-        elif ext in (".cpp", ".cxx", ".cc"):
-            compile_cmd = f"g++ {CURRENT_FILE} -o {bin_name}"
-        else:
-            compile_cmd = None
-
-        if compile_cmd:
-            compile_out = subprocess.getoutput(compile_cmd + " 2>&1")
-            if compile_out.strip():
-                output.text = f"Compilation failed:\n{compile_out}"
+        start_detached_process(key, ["python3", CURRENT_FILE], use_terminal=False)
+        output.text = "Launched Python (detached)."
+    elif ext == ".sh":
+        start_detached_process(key, ["bash", CURRENT_FILE], use_terminal=True)
+        output.text = "Launched Bash (terminal)."
+    elif ext == ".js":
+        start_detached_process(key, ["node", CURRENT_FILE], use_terminal=False)
+        output.text = "Launched Node (detached)."
+    elif ext in (".c", ".cpp", ".s", ".asm"):
+        # Compile Ncurses/Binary for terminal launch
+        bin_name = "temp_exec"
+        cmd = ""
+        if ext == ".c": cmd = f"gcc {CURRENT_FILE} -o {bin_name}"
+        elif ext.startswith(".c"): cmd = f"g++ {CURRENT_FILE} -o {bin_name}"
+        
+        if cmd:
+            res = subprocess.getoutput(cmd)
+            if res.strip():
+                output.text = f"Build Fail:\n{res}"
                 return
-
-            # If source contains ncurses includes -> launch in terminal
-            with open(CURRENT_FILE, "r", encoding="utf-8", errors="ignore") as fh:
-                txt = fh.read()
-            if contains_ncurses(txt):
-                args = [os.path.abspath(f"./{bin_name}")]
-                start_detached_process(key, args, use_terminal=True)
-                output.text = f"Lancé exécutable ncurses dans un terminal: {bin_name}"
-                return
-            else:
-                # Non-ncurses: exécution normale en arrière-plan (mais si interactif, l'utilisateur devrait utiliser terminal)
-                args = [os.path.abspath(f"./{bin_name}")]
-                start_detached_process(key, args, use_terminal=False)
-                output.text = f"Lancé exécutable: {bin_name} (détaché)"
-                return
-
-    # JS, cs, etc. -> comportement par défaut : lancer en detached
-    if ext == ".js":
-        args = ["node", CURRENT_FILE]
-        start_detached_process(key, args, use_terminal=False)
-        output.text = f"Lancé node {CURRENT_FILE} (détaché)."
-        return
-
-    # fallback
-    args = ["bash", "-c", f"python3 {CURRENT_FILE}"]
-    start_detached_process(key, args, use_terminal=True)
-    output.text = f"Lancé (fallback) {CURRENT_FILE} dans un terminal."
+            
+            # Check for ncurses
+            with open(CURRENT_FILE, "r", errors="ignore") as f: txt = f.read()
+            use_term = contains_ncurses(txt)
+            start_detached_process(key, [os.path.abspath(f"./{bin_name}")], use_terminal=use_term)
+            output.text = f"Launched binary ({'terminal' if use_term else 'detached'})."
+    else:
+        output.text = "Extension not handled by Ctrl-L."
 
 @kb.add("c-b")
 def _(event):
-    ext = os.path.splitext(CURRENT_FILE or (sys.argv[1] if len(sys.argv) > 1 else ""))[1]
-    # Sauvegarde du fichier courant
+    """
+    Build & Run in Abyss (Ctrl+B).
+    CORRIGÉ POUR PHP : Execute proprement dans le dossier.
+    """
+    global SERVER_STARTED
     if CURRENT_FILE:
         save_file(CURRENT_FILE)
+    
+    filename = CURRENT_FILE or (sys.argv[1] if len(sys.argv) > 1 else "")
+    if not filename:
+        output.text = "No file open."
+        return
+        
+    ext = os.path.splitext(filename)[1]
+    abs_path = os.path.abspath(filename)
+    file_dir = os.path.dirname(abs_path)
+    base_name = os.path.basename(filename)
 
-    # HTML spécifique
-    if ext == ".html":
-        temp_file = "temp.html"
-        clean_text = re.sub(r"<!--.*?-->", "", editor.text, flags=re.DOTALL)
-        with open(temp_file, "w", encoding="utf-8") as f:
-            f.write(clean_text)
+    # -- HTML / PHP SERVER --
+    if ext in (".html", ".php"):
+        key = "web_server"
+        
+        # Determine Command
+        if ext == ".php":
+            # PHP Server: doit être lancé dans le dossier du fichier (cwd=file_dir)
+            cmd = ["php", "-S", "localhost:8000"]
+        else:
+            # HTML Server (Python)
+            cmd = ["python3", "-m", "http.server", "8000"]
 
-        # Lancer serveur silencieux si port libre
-        global HTML_SERVER_STARTED
-        if not HTML_SERVER_STARTED and not is_port_in_use(8000):
-            subprocess.Popen(
-                ["python3", "-m", "http.server", "8000"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
-            HTML_SERVER_STARTED = True
+        if not SERVER_STARTED and not is_port_in_use(8000):
+            try:
+                # On lance le serveur dans le bon dossier
+                proc = subprocess.Popen(
+                    cmd, 
+                    cwd=file_dir, # <-- FIX: Le serveur root est le dossier du fichier
+                    stdout=subprocess.DEVNULL, 
+                    stderr=subprocess.DEVNULL
+                )
+                RUNNING_PROCS[key] = proc
+                SERVER_STARTED = True
+                output.text = f"Server started at http://localhost:8000 (root: {file_dir})"
+            except Exception as e:
+                output.text = f"Error starting server: {e}"
+                return
+        else:
+            output.text = "Server already running or port 8000 busy."
 
-        html_file = os.path.basename(CURRENT_FILE)
-        url = f"http://localhost:8000/{html_file}"
+        # Ouvre le navigateur sur le fichier spécifique
+        url = f"http://localhost:8000/{base_name}"
         webbrowser.open(url)
-
-        # Quitter Abyss mais renvoyer le fichier pour le relancer automatiquement
-        event.app.exit(result=CURRENT_FILE)
+        # Note: on ne quitte pas l'app pour ne pas tuer le serveur (si géré par Popen)
         return
 
-    # Pour les autres fichiers
+    # -- STANDARD COMPILE & RUN --
     handled_in_terminal, message = compile_and_run_for_extension(ext)
     output.text = message
-    if handled_in_terminal and ext != ".html":
+    if handled_in_terminal:
         event.app.exit()
         os.system("./temp && clear")
 
-
-# ---- Autopairs ----
+# ---- Autopairs & Formatting ----
 pairs = {"{": "}", "(": ")", "[": "]", "\"": "\"", "'": "'", "<": ">"}
 for opening, closing in pairs.items():
     @kb.add(opening)
     def _(event, opening=opening, closing=closing):
-        buf = event.app.current_buffer
-        buf.insert_text(opening + closing)
-        buf.cursor_left()
+        event.app.current_buffer.insert_text(opening + closing)
+        event.app.current_buffer.cursor_left()
 
-# ---- Auto-indent & auto-close HTML tags ----
+
 @kb.add("enter")
 def _(event):
     buf = event.app.current_buffer
-    doc: Document = buf.document
-    before = doc.text_before_cursor.rstrip()
+    doc = buf.document
+    
+    # Récupère l'indentation de la ligne actuelle
+    m = re.match(r'(\s*)', doc.current_line_before_cursor)
+    base_indent = m.group(1) if m else ""
+    inner_indent = base_indent + "    " # Indentation augmentée (+4 espaces ASCII)
 
-    # C-style braces
-    if before.endswith("{"):
-        m = re.match(r'(\s*)', doc.current_line_before_cursor)
-        base_indent = m.group(1) if m else ""
-        inner = base_indent + "    "
+    # 1. Gestion du cas C-style/Acoolades après Auto-pairage
+    # Si le curseur est entre { et } (e.g., après avoir tapé '{')
+    before_trimmed = doc.text_before_cursor.rstrip()
+    after_trimmed = doc.text_after_cursor.lstrip()
+
+    if before_trimmed.endswith("{") and after_trimmed.startswith("}"):
+        
+        # 1. Supprimer le '}' final (qui est le premier caractère après le curseur)
+        buf.delete(1) 
+        
+        # 2. Insérer la structure : Nouvelle Ligne + Indentation Interne + Nouvelle Ligne + Indentation de Base
         pos0 = buf.cursor_position
-        buf.insert_text("\n" + inner + "\n" + base_indent)
-        buf.cursor_position = pos0 + 1 + len(inner)
+        buf.insert_text("\n" + inner_indent + "\n" + base_indent + "}")
+        
+        # 3. Positionner le curseur sur la ligne du milieu
+        buf.cursor_position = pos0 + 1 + len(inner_indent)
+        
         return
+    
+    # 2. Ancienne logique C-style (pour le cas où l'utilisateur a supprimé le '}' de fin)
+    # L'ancienne logique pour before.endswith("{") n'est plus nécessaire ici car gérée par le cas 1.
+    # Nous la laissons si l'utilisateur a tapé { puis ENTER rapidement SANS l'autopair.
+    if before_trimmed.endswith("{"):
+         # Nous réutilisons la logique d'ancienne version (si on a juste un {)
+         pos0 = buf.cursor_position
+         buf.insert_text("\n" + inner_indent + "\n" + base_indent) # Pas de } car il n'était pas là au départ
+         buf.cursor_position = pos0 + 1 + len(inner_indent)
+         return
 
-    # Python indent
-    if CURRENT_MODE == "py" and before.endswith(":"):
+
+    # 3. Python/ASM indent (Votre ancienne logique, corrigée avec espaces ASCII)
+    if CURRENT_MODE in ("py", "asm") and before_trimmed.endswith(":"):
         m = re.match(r'(\s*)', doc.current_line_before_cursor)
         base_indent = m.group(1) if m else ""
         buf.insert_text("\n" + base_indent + "    ")
         return
 
-    # ASM labels
-    if CURRENT_MODE == "asm" and before.endswith(":"):
-        m = re.match(r'(\s*)', doc.current_line_before_cursor)
-        base_indent = m.group(1) if m else ""
-        buf.insert_text("\n" + base_indent + "    ")
-        return
-
-    # HTML auto-close tags
-    if CURRENT_MODE == "html":
+    # 4. HTML auto-close tags (Votre ancienne logique, corrigée avec espaces ASCII)
+    if CURRENT_MODE in ("html"):
         m = re.match(r'(\s*)<([a-zA-Z0-9]+)>$', doc.current_line_before_cursor.strip())
         if m:
             base_indent = re.match(r'(\s*)', doc.current_line_before_cursor).group(1) or ""
@@ -677,43 +642,36 @@ def _(event):
             buf.cursor_position = pos0 + 1 + len(inner_indent)
             return
 
-    # Comportement par défaut
+    # 5. Comportement par défaut
     buf.newline()
 
-# ---- Application ----
 
-app = Application(
-    layout=layout_main,
-    key_bindings=kb,
-    full_screen=True,
-    style=style
-)
+# ---- App Entry ----
+app = Application(layout=layout_main, key_bindings=kb, full_screen=True, style=style)
 
-# ---- Main runner ----
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
+    if len(sys.argv) > 1 and sys.argv[1] != "vide":
         arg = sys.argv[1]
-        if arg != "vide":
-            CURRENT_FILE = arg
-            if os.path.exists(arg):
-                with open(arg, "r", encoding="utf-8") as fh:
-                    editor.text = fh.read()
-            detect_mode(arg)
+        CURRENT_FILE = arg
+        if os.path.exists(arg):
+            with open(arg, "r", encoding="utf-8") as fh:
+                editor.text = fh.read()
+        detect_mode(arg)
     else:
         detect_mode("file.c")
 
     try:
-        result = app.run()
+        app.run()
     finally:
         try:
             subprocess.call("reset", shell=True)
-        except Exception:
+        except:
             pass
-        for f in glob.glob("temp.*"):
-            try:
-                os.remove(f)
-            except Exception:
-                pass
+        
+        # Nettoyage des processus
+        for key in list(RUNNING_PROCS.keys()):
+            stop_process(key)
 
-    if result and isinstance(result, str):
-        os.execv(sys.executable, [sys.executable, sys.argv[0], result])
+        for f in glob.glob("temp*"):
+            try: os.remove(f)
+            except: pass

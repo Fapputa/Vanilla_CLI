@@ -46,12 +46,9 @@
 
 1. Copy all files into your `~/bin/` folder:
    ```bash
-   cp * ~/bin/
-
-   chmod +x ~/bin/*
-
-   echo 'export PATH="$HOME/bin:$PATH"' >> ~/.bashrc
-   source ~/.bashrc
+   cd Vanilla_CLI
+   sudo chmod +x **
+   sudo mv ** /home/$USER/bin/
 
    ```
 

@@ -15,12 +15,12 @@ from prompt_toolkit.selection import SelectionType
 try:
     from pygments.lexers import (
         CLexer, CppLexer, PythonLexer, BashLexer, JsonLexer, SqlLexer,
-        NasmLexer, CSharpLexer, HtmlLexer, JavascriptLexer, PhpLexer
+        NasmLexer, CSharpLexer, HtmlLexer, JavascriptLexer, PhpLexer, CssLexer
     )
 except Exception:
     from pygments.lexers import CLexer, PythonLexer, BashLexer, JsonLexer, SqlLexer
     from pygments.lexers import HtmlLexer as PhpLexer 
-    CppLexer = CLexer; NasmLexer = CLexer; CSharpLexer = CLexer; HtmlLexer = CLexer; JavascriptLexer = CLexer 
+    CppLexer = CLexer; NasmLexer = CLexer; CSharpLexer = CLexer; HtmlLexer = CLexer; JavascriptLexer = CLexer; CssLexer = CLexer
 
 style = Style.from_dict({"search": "bg:#4444ff #ffffff"})
 search_state = {"query": "", "matches": [], "current_index": 0, "floating": None}
@@ -85,15 +85,25 @@ def save_file(filename: str):
     try:
         with open(filename, "w", encoding="utf-8") as f: f.write(editor.text)
         output.text = f"Saved to {filename}"
+        detect_mode(filename)
     except Exception as e: output.text = f"Error: {e}"
 
 def detect_mode(filename: str):
     global CURRENT_MODE
-    ext = os.path.splitext(filename)[1]
+    ext = os.path.splitext(filename)[1].lower()
     map_ext = {
-        ".c": (CLexer, "c"), ".cpp": (CppLexer, "cpp"), ".py": (PythonLexer, "py"),
-        ".sh": (BashLexer, "sh"), ".php": (PhpLexer, "php"), ".html": (HtmlLexer, "html"),
-        ".js": (JavascriptLexer, "js"), ".json": (JsonLexer, "json"), ".asm": (NasmLexer, "asm")
+        ".c": (CLexer, "c"), ".h": (CLexer, "c"),
+        ".cpp": (CppLexer, "cpp"), ".cc": (CppLexer, "cpp"), ".hpp": (CppLexer, "cpp"),
+        ".cs": (CSharpLexer, "csharp"),
+        ".py": (PythonLexer, "py"),
+        ".sh": (BashLexer, "sh"),
+        ".php": (PhpLexer, "php"),
+        ".html": (HtmlLexer, "html"), ".htm": (HtmlLexer, "html"),
+        ".css": (CssLexer, "css"),
+        ".js": (JavascriptLexer, "js"),
+        ".json": (JsonLexer, "json"),
+        ".sql": (SqlLexer, "sql"),
+        ".asm": (NasmLexer, "asm"), ".s": (NasmLexer, "asm")
     }
     info = map_ext.get(ext, (CLexer, "c"))
     editor.lexer = PygmentsLexer(info[0])
@@ -159,7 +169,8 @@ def _(event):
     buf = event.app.current_buffer
     buf.cursor_position += len(buf.document.current_line_after_cursor)
     buf.delete_before_cursor(len(buf.document.current_line))
-    buf.delete(1)
+    if buf.document.text_after_cursor:
+        buf.delete(1)
 
 @kb.add("c-f")
 def _(event):
@@ -188,7 +199,7 @@ def _(event):
     show_output()
     if CURRENT_FILE: save_file(CURRENT_FILE)
     else: return
-    ext = os.path.splitext(CURRENT_FILE)[1]
+    ext = os.path.splitext(CURRENT_FILE)[1].lower()
     file_dir = os.path.dirname(os.path.abspath(CURRENT_FILE))
     if ext == ".php":
         if not SERVER_STARTED:
@@ -219,7 +230,7 @@ def _(event):
         pos = buf.cursor_position
         buf.insert_text("\n" + indent + "    " + "\n" + indent + "}")
         buf.cursor_position = pos + 5 + len(indent)
-    elif CURRENT_MODE in ("py", "asm") and doc.text_before_cursor.rstrip().endswith(":"):
+    elif CURRENT_MODE in ("py", "asm", "python", "assembly") and doc.text_before_cursor.rstrip().endswith(":"):
         buf.newline(); buf.insert_text(indent + "    ")
     else:
         buf.newline(); buf.insert_text(indent)

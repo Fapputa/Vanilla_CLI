@@ -19,7 +19,7 @@
 - **Keyboard Shortcuts**  
   - `Ctrl + K` – Delete a line  
   - `Ctrl + N` – Split the screen into two  
-  - `Ctrl + X` – Exit  
+  - `Ctrl + q` – Exit  
   - `Ctrl + O` – Save As  
   - `Ctrl + B` – Compile / Execute  
 

@@ -10,7 +10,7 @@
   Includes commands like `clip`, `compil`, and more, allowing for more flexible command-line operations.
 
 - **Abyss – CLI Code Editor**  
-  - Supports **C, C++, C#, Python, HTML, CSS, JSON, SQL, Shell, and Assembly**.  
+  - Supports **C, C++, C#, Python, HTML, CSS, JSON, SQL, Shell, PHP, and Assembly**.  
   - Automatic compilation based on file extension.  
   - Real-time compilation and execution preview.  
   - Split-screen interface: left side for code, right side for output.  

@@ -29,15 +29,20 @@ SPLIT_VIEW = False
 CURRENT_MODE = "c"
 SERVER_STARTED = False 
 RUNNING_PROCS = {} 
-TOGGLE_KEY = "ctrl_l_process"
 
 editor = TextArea(text="", multiline=True, line_numbers=True, wrap_lines=False, lexer=PygmentsLexer(CLexer), scrollbar=True, focus_on_click=True)
-output = TextArea(text="(Results will appear here)", multiline=True, read_only=True, wrap_lines=True, scrollbar=True)
+output = TextArea(text="(Results)", multiline=True, read_only=True, wrap_lines=True, scrollbar=True)
 editor_window = Window(content=editor.control, wrap_lines=False)
 output_window = Window(content=output.control, wrap_lines=True)
 left_gutter = Window(width=2, char=" ")
 middle_gap = Window(width=2, char=" ")
-title_bar = Window(height=1, content=FormattedTextControl([('reverse', ' Abyss | Ctrl+C/V/X | Ctrl+Shift+K: Kill | Ctrl+B: Run | Ctrl+Q: Quit ')]), style='reverse')
+
+title_bar = Window(
+    height=1, 
+    content=FormattedTextControl([('reverse', ' Abyss | Ctrl+O: Save | Ctrl+K: Clear | Ctrl+T: Kill Line | Ctrl+B: Run ')]), 
+    style='reverse'
+)
+
 body_container = VSplit([left_gutter, editor_window])
 root_container = FloatContainer(content=HSplit([title_bar, body_container]), floats=[])
 layout_main = Layout(root_container, focused_element=editor_window)
@@ -79,6 +84,7 @@ def save_file(filename: str):
     CURRENT_FILE = filename
     try:
         with open(filename, "w", encoding="utf-8") as f: f.write(editor.text)
+        output.text = f"Saved to {filename}"
     except Exception as e: output.text = f"Error: {e}"
 
 def detect_mode(filename: str):
@@ -102,6 +108,23 @@ def stop_process(key: str):
 
 kb = KeyBindings()
 
+@kb.add("c-o")
+def _(event):
+    fname_input = TextArea(multiline=False, height=1, text=CURRENT_FILE or "")
+    def on_ok():
+        save_file(fname_input.text.strip())
+        root_container.floats.pop()
+        layout_main.focus(editor_window)
+    kb_d = KeyBindings()
+    @kb_d.add("enter")
+    def _(e): on_ok()
+    @kb_d.add("escape")
+    def _(e): root_container.floats.pop(); layout_main.focus(editor_window)
+    fname_input.control.key_bindings = kb_d
+    dialog = Dialog(title="Save As", body=fname_input, buttons=[Button(text="OK", handler=on_ok)], width=60)
+    root_container.floats.append(Float(content=dialog))
+    layout_main.focus(fname_input.control)
+
 @kb.add("c-z")
 def _(event): event.app.current_buffer.undo()
 
@@ -122,14 +145,21 @@ def _(event):
 @kb.add("c-v")
 def _(event): event.app.current_buffer.paste_clipboard_data(event.app.clipboard.get_data())
 
+@kb.add("c-q")
+def _(event): event.app.exit()
+
 @kb.add("c-k")
 def _(event):
     buf = event.app.current_buffer
     buf.delete_before_cursor(len(buf.document.current_line_before_cursor))
     buf.delete(len(buf.document.current_line_after_cursor))
 
-@kb.add("c-q")
-def _(event): event.app.exit()
+@kb.add("c-t")
+def _(event):
+    buf = event.app.current_buffer
+    buf.cursor_position += len(buf.document.current_line_after_cursor)
+    buf.delete_before_cursor(len(buf.document.current_line))
+    buf.delete(1)
 
 @kb.add("c-f")
 def _(event):
@@ -146,8 +176,7 @@ def _(event):
     @kb_s.add("enter")
     def _(e): do_search()
     @kb_s.add("escape")
-    def _(e):
-        root_container.floats.pop(); reset_lexer(); layout_main.focus(editor_window)
+    def _(e): root_container.floats.pop(); reset_lexer(); layout_main.focus(editor_window)
     search_input.control.key_bindings = kb_s
     dialog = Dialog(title="Search", body=search_input, buttons=[Button(text="OK", handler=do_search)], width=60)
     root_container.floats.append(Float(content=dialog))
@@ -159,19 +188,15 @@ def _(event):
     show_output()
     if CURRENT_FILE: save_file(CURRENT_FILE)
     else: return
-    
     ext = os.path.splitext(CURRENT_FILE)[1]
     file_dir = os.path.dirname(os.path.abspath(CURRENT_FILE))
-    
     if ext == ".php":
         if not SERVER_STARTED:
             proc = subprocess.Popen(["php", "-S", "localhost:8080"], cwd=file_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             RUNNING_PROCS["server"] = proc
             SERVER_STARTED = True
         webbrowser.open("http://localhost:8080/" + os.path.basename(CURRENT_FILE))
-        output.text = "PHP Server on http://localhost:8080"
         return
-
     temp_exec = "./temp_bin"
     cmd = ""
     if ext == ".c": cmd = f"gcc {CURRENT_FILE} -o {temp_exec} && {temp_exec}"
@@ -179,10 +204,9 @@ def _(event):
     elif ext == ".py": cmd = f"python3 {CURRENT_FILE}"
     elif ext == ".sh": cmd = f"bash {CURRENT_FILE}"
     elif ext == ".js": cmd = f"node {CURRENT_FILE}"
-    
     if cmd:
         res = subprocess.getoutput(f"{cmd} 2>&1")
-        output.text = res if res.strip() else "(Finished)"
+        output.text = res if res.strip() else "(Execution finished)"
 
 @kb.add("enter")
 def _(event):
@@ -195,9 +219,10 @@ def _(event):
         pos = buf.cursor_position
         buf.insert_text("\n" + indent + "    " + "\n" + indent + "}")
         buf.cursor_position = pos + 5 + len(indent)
+    elif CURRENT_MODE in ("py", "asm") and doc.text_before_cursor.rstrip().endswith(":"):
+        buf.newline(); buf.insert_text(indent + "    ")
     else:
-        buf.newline()
-        buf.insert_text(indent)
+        buf.newline(); buf.insert_text(indent)
 
 @kb.add("tab")
 def _(event): event.app.current_buffer.insert_text("    ")
@@ -217,4 +242,6 @@ if __name__ == "__main__":
             detect_mode(CURRENT_FILE)
     Application(layout=layout_main, key_bindings=kb, full_screen=True, style=style).run()
     for k in list(RUNNING_PROCS.keys()): stop_process(k)
-    if os.path.exists("./temp_bin"): os.remove("./temp_bin")
+    if os.path.exists("./temp_bin"):
+        try: os.remove("./temp_bin")
+        except: pass

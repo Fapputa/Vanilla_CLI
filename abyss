@@ -189,7 +189,7 @@ def _(event):
     @kb_s.add("escape")
     def _(e): root_container.floats.pop(); reset_lexer(); layout_main.focus(editor_window)
     search_input.control.key_bindings = kb_s
-    dialog = Dialog(title="Search", body=search_input, buttons=[Button(text="OK", handler=do_search)], width=60)
+    dialog = Dialog(title="Search", body=search_input, buttons=[Button(text="OK", handler=on_ok)], width=60)
     root_container.floats.append(Float(content=dialog))
     layout_main.focus(search_input.control)
 
@@ -223,17 +223,28 @@ def _(event):
 def _(event):
     buf = event.app.current_buffer
     doc = buf.document
-    m = re.match(r'(\s*)', doc.current_line_before_cursor)
-    indent = m.group(1) if m else ""
-    if doc.text_before_cursor.rstrip().endswith("{") and doc.text_after_cursor.lstrip().startswith("}"):
+    
+    current_line = doc.current_line
+    
+    m = re.match(r'^(\s*)', current_line)
+    base_indent = m.group(1) if m else ""
+    
+    line_after_cursor = doc.current_line_after_cursor
+    stripped_line = current_line.rstrip()
+    
+    if doc.text_before_cursor.endswith("{") and doc.text_after_cursor.startswith("}"):
         buf.delete(1)
-        pos = buf.cursor_position
-        buf.insert_text("\n" + indent + "    " + "\n" + indent + "}")
-        buf.cursor_position = pos + 5 + len(indent)
-    elif CURRENT_MODE in ("py", "asm", "python", "assembly") and doc.text_before_cursor.rstrip().endswith(":"):
-        buf.newline(); buf.insert_text(indent + "    ")
+        new_indent = base_indent + "    "
+        buf.insert_text("\n" + new_indent + "\n" + base_indent + "}")
+        buf.cursor_position -= len(base_indent) + 2
+    elif stripped_line.endswith("{") and line_after_cursor.strip() == "":
+        buf.insert_text("\n" + base_indent + "    ")
+    elif CURRENT_MODE in ("py", "asm", "python", "assembly") and stripped_line.endswith(":") and line_after_cursor.strip() == "":
+        buf.insert_text("\n" + base_indent + "    ")
+    elif stripped_line == "}" and len(base_indent) >= 4:
+        buf.insert_text("\n" + base_indent[:-4])
     else:
-        buf.newline(); buf.insert_text(indent)
+        buf.insert_text("\n" + base_indent)
 
 @kb.add("tab")
 def _(event): event.app.current_buffer.insert_text("    ")

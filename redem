@@ -1,0 +1,82 @@
+#!/bin/bash
+
+# Script de redémarrage WiFi pour distributions minimalistes
+# Usage: sudo ./wifi-reset.sh
+
+echo "=== Redémarrage des interfaces WiFi ==="
+
+# Vérifier si exécuté en root
+if [ "$EUID" -ne 0 ]; then 
+    echo "Erreur: Ce script doit être exécuté avec sudo"
+    exit 1
+fi
+
+# Détecter l'interface WiFi
+WIFI_INTERFACE=$(iw dev | awk '$1=="Interface"{print $2}' | head -n1)
+
+if [ -z "$WIFI_INTERFACE" ]; then
+    echo "Aucune interface WiFi détectée, recherche alternative..."
+    WIFI_INTERFACE=$(ip link | grep -o "wl[^:]*" | head -n1)
+fi
+
+if [ -z "$WIFI_INTERFACE" ]; then
+    echo "Erreur: Impossible de détecter l'interface WiFi"
+    exit 1
+fi
+
+echo "Interface WiFi détectée: $WIFI_INTERFACE"
+
+# Arrêter NetworkManager/systemd-networkd si présents
+echo "Arrêt des services réseau..."
+systemctl stop NetworkManager 2>/dev/null
+systemctl stop systemd-networkd 2>/dev/null
+killall wpa_supplicant 2>/dev/null
+
+# Désactiver l'interface
+echo "Désactivation de $WIFI_INTERFACE..."
+ip link set $WIFI_INTERFACE down
+
+# Retirer le module WiFi
+echo "Déchargement des modules WiFi..."
+WIFI_MODULE=$(basename $(readlink /sys/class/net/$WIFI_INTERFACE/device/driver/module) 2>/dev/null)
+
+if [ -n "$WIFI_MODULE" ]; then
+    echo "Module détecté: $WIFI_MODULE"
+    modprobe -r $WIFI_MODULE
+    sleep 2
+    echo "Rechargement du module $WIFI_MODULE..."
+    modprobe $WIFI_MODULE
+else
+    # Essayer les modules communs
+    echo "Tentative de rechargement des modules WiFi communs..."
+    for module in iwlwifi ath9k ath10k_pci rtl8192ce rtl8188ee mt76 brcmfmac; do
+        if lsmod | grep -q "^$module"; then
+            modprobe -r $module 2>/dev/null
+            sleep 1
+            modprobe $module 2>/dev/null
+        fi
+    done
+fi
+
+sleep 2
+
+# Réactiver l'interface
+echo "Réactivation de $WIFI_INTERFACE..."
+ip link set $WIFI_INTERFACE up
+sleep 2
+
+# Redémarrer les services
+echo "Redémarrage des services réseau..."
+systemctl start NetworkManager 2>/dev/null || systemctl start systemd-networkd 2>/dev/null
+
+sleep 3
+
+# Vérifier le statut
+echo ""
+echo "=== Statut final ==="
+ip link show $WIFI_INTERFACE
+echo ""
+iw dev $WIFI_INTERFACE scan | grep "SSID:" | head -n5
+
+echo ""
+echo "Redémarrage terminé. Vous pouvez maintenant lancer nmtui."

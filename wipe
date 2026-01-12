@@ -5,5 +5,4 @@ if [ -z "$1" ]; then
     exit 2
 fi
 
-rm "$1"
-touch "$1"
+: > "$1"

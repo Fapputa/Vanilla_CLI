@@ -175,21 +175,55 @@ def _(event):
 @kb.add("c-f")
 def _(event):
     search_input = TextArea(multiline=False, height=1, text=search_state["query"])
-    def do_search():
+    
+    def do_search(next_match=True):
         query = search_input.text
-        search_state["query"] = query
-        matches = [m.start() for m in re.finditer(re.escape(query), editor.text)]
-        if matches:
-            search_state["matches"] = matches
-            editor.buffer.cursor_position = matches[0]
+        if not query:
+            return
+
+        if query != search_state["query"]:
+            search_state["query"] = query
+            search_state["matches"] = [m.start() for m in re.finditer(re.escape(query), editor.text)]
+            search_state["current_index"] = 0
+        elif next_match:
+            if search_state["matches"]:
+                search_state["current_index"] = (search_state["current_index"] + 1) % len(search_state["matches"])
+
+        if search_state["matches"]:
+            idx = search_state["current_index"]
+            pos = search_state["matches"][idx]
+            editor.buffer.cursor_position = pos
             update_search_highlight()
+
+    def close_search():
+        # On vide la requête pour que update_search_highlight ne trouve plus rien
+        search_state["query"] = "" 
+        root_container.floats.pop()
+        # On remet le lexer d'origine (couleurs de code normales)
+        reset_lexer() 
+        layout_main.focus(editor_window)
+
     kb_s = KeyBindings()
+    
     @kb_s.add("enter")
-    def _(e): do_search()
+    def _(e):
+        do_search(next_match=True)
+
     @kb_s.add("escape")
-    def _(e): root_container.floats.pop(); reset_lexer(); layout_main.focus(editor_window)
+    def _(e):
+        close_search()
+
     search_input.control.key_bindings = kb_s
-    dialog = Dialog(title="Search", body=search_input, buttons=[Button(text="OK", handler=on_ok)], width=60)
+    
+    dialog = Dialog(
+        title="Search (Enter: Next | Esc: Close)", 
+        body=search_input, 
+        buttons=[
+            Button(text="Next", handler=lambda: do_search(next_match=True)),
+            Button(text="Close", handler=close_search)
+        ], 
+        width=60
+    )
     root_container.floats.append(Float(content=dialog))
     layout_main.focus(search_input.control)
 

@@ -1,10 +1,10 @@
-# 🌌 Vanilla_CLI Suite
+# Vanilla_CLI Suite
 
 A high-performance, versatile toolkit designed to supercharge the Linux terminal experience. From low-level system monitoring to a high-speed C-engineered text editor, this suite brings efficiency and fun to the command line.
 
 ---
 
-## 📦 Getting Started
+## Getting Started
 
 **1. Clone the repository:**
 
@@ -27,7 +27,7 @@ The installer will automatically:
 
 ---
 
-## 🚀 Abyss – The Evolution of Editing
+## Abyss – The Evolution of Editing
 
 ### Abyss.c (The Pro Version)
 
@@ -63,7 +63,7 @@ The original Python version powered by `prompt_toolkit`. It remains available fo
 
 ---
 
-## 🛠️ Integrated Commands
+## Integrated Commands
 
 | Command | Description |
 |---------|-------------|
@@ -75,7 +75,7 @@ The original Python version powered by `prompt_toolkit`. It remains available fo
 
 ---
 
-## 📊 Monitoring & Network
+## Monitoring & Network
 
 ### `monitoring` & `wifi_monitoring`
 
@@ -88,7 +88,7 @@ A pro-grade dashboard using the `Rich` library to display real-time system diagn
 
 ---
 
-## 🎮 Terminal Games
+## Terminal Games
 
 ### `blackjack`
 
@@ -106,7 +106,7 @@ minesweeper 4 4
 
 ---
 
-## ⌨️ Keybindings (Abyss)
+## Keybindings (Abyss)
 
 | Key | Action |
 |-----|--------|

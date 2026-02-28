@@ -4,6 +4,29 @@ A high-performance, versatile toolkit designed to supercharge the Linux terminal
 
 ---
 
+## 📦 Getting Started
+
+**1. Clone the repository:**
+
+```bash
+git clone https://github.com/your-username/Vanilla_CLI.git
+cd Vanilla_CLI
+```
+
+**2. Make the installer executable and run it:**
+
+```bash
+chmod +x install.sh && ./install.sh
+```
+
+The installer will automatically:
+- Detect your package manager (`apt` or `pacman`) and install system dependencies
+- Install Python dependencies (`rich`, `prompt_toolkit`, `pygments`, `psutil`)
+- Build Abyss with `make clean && make`
+- Deploy all commands to both `~/bin` and `/usr/local/bin`
+
+---
+
 ## 🚀 Abyss – The Evolution of Editing
 
 ### Abyss.c (The Pro Version)
@@ -14,17 +37,13 @@ Engineered for zero-latency, the C version uses a **Gap Buffer** and **Line Inde
 - **Architecture:** Low-level memory management with `ncurses` for a flicker-free UI
 - **Features:** Undo/Redo (`Ctrl+Z` / `Ctrl+Y`), syntax highlighting, and integrated compilation
 
-#### Build
-
-Navigate to the `abyss` directory and run:
+#### Manual Build
 
 ```bash
 make clean && make
 ```
 
-#### System-wide Installation
-
-To use `abyss <filename>` from any directory (instead of `./abyss`):
+#### Manual System-wide Installation
 
 ```bash
 sudo cp abyss /usr/local/bin/
@@ -58,7 +77,7 @@ The original Python version powered by `prompt_toolkit`. It remains available fo
 
 ## 📊 Monitoring & Network
 
-### `monitoring.py` & `wifi`
+### `monitoring` & `wifi_monitoring`
 
 A pro-grade dashboard using the `Rich` library to display real-time system diagnostics:
 
@@ -98,26 +117,3 @@ minesweeper 4 4
 | `Ctrl + B` | Compile & Run (via `compil`) |
 | `Ctrl + N` | Split Screen View |
 | `Ctrl + K` | Kill (Delete) Current Line |
-
----
-
-## 📦 Getting Started
-
-**1. Clone the repository:**
-
-```bash
-git clone https://github.com/your-username/Vanilla_CLI.git
-cd Vanilla_CLI
-```
-
-**2. Build Abyss:**
-
-```bash
-cd abyss && make clean && make
-```
-
-**3. Install dependencies** (required for all `.py` tools):
-
-```bash
-pip install rich prompt_toolkit pygments
-```

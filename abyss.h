@@ -30,41 +30,41 @@
 #define GAP_GROW      8192
 
 typedef struct {
-    char   *buf;        /* raw storage                */
-    size_t  gap_start;  /* index of first gap byte    */
-    size_t  gap_end;    /* index of first post-gap byte */
-    size_t  cap;        /* total allocated bytes      */
+    char   *buf;
+    size_t  gap_start;
+    size_t  gap_end;
+    size_t  cap;
 } GapBuf;
 
 GapBuf *gb_new(size_t cap);
 void    gb_free(GapBuf *g);
-size_t  gb_len(const GapBuf *g);        /* logical length              */
-char    gb_at(const GapBuf *g, size_t i); /* logical index              */
+size_t  gb_len(const GapBuf *g);
+char    gb_at(const GapBuf *g, size_t i);
 void    gb_move_gap(GapBuf *g, size_t pos);
 void    gb_insert_char(GapBuf *g, size_t pos, char c);
 void    gb_insert_str(GapBuf *g, size_t pos, const char *s, size_t n);
 void    gb_delete(GapBuf *g, size_t pos, size_t n);
-char   *gb_to_str(const GapBuf *g);     /* caller frees                */
+char   *gb_to_str(const GapBuf *g);
 void    gb_get_range(const GapBuf *g, size_t start, size_t len, char *out);
 
 /* ─── Line Index ─────────────────────────────────────────────── */
 #define LINE_IDX_CHUNK 1024
 
 typedef struct {
-    size_t *offsets;   /* logical offset of start of each line */
-    size_t  count;     /* number of lines                      */
+    size_t *offsets;
+    size_t  count;
     size_t  cap;
-    bool    dirty;     /* needs rebuild                        */
+    bool    dirty;
 } LineIdx;
 
 LineIdx *li_new(void);
 void     li_free(LineIdx *li);
 void     li_rebuild(LineIdx *li, const GapBuf *g);
-size_t   li_line_start(const LineIdx *li, size_t line);   /* O(1) */
+size_t   li_line_start(const LineIdx *li, size_t line);
 size_t   li_line_count(const LineIdx *li);
 void     li_mark_dirty(LineIdx *li);
 
-/* ─── Piece Table (Undo/Redo) ────────────────────────────────── */
+/* ─── Undo/Redo ──────────────────────────────────────────────── */
 typedef enum { PIECE_ORIG, PIECE_ADD } PieceSource;
 
 typedef struct {
@@ -74,7 +74,7 @@ typedef struct {
 } Piece;
 
 typedef struct UndoAction {
-    GapBuf             *snapshot_buf;  /* full snapshot for simplicity at first */
+    GapBuf             *snapshot_buf;
     size_t              cursor_pos;
     struct UndoAction  *prev;
     struct UndoAction  *next;
@@ -112,15 +112,15 @@ typedef enum {
     LANG_C, LANG_CPP, LANG_PY, LANG_SH,
     LANG_JS, LANG_JSON, LANG_SQL, LANG_ASM,
     LANG_HTML, LANG_CSS, LANG_PHP, LANG_CS,
+    LANG_HEX,
     LANG_NONE
 } Language;
 
-/* Per-line colour cache */
 typedef struct {
-    TokenType *attrs;   /* one per char in the line */
+    TokenType *attrs;
     size_t     len;
     bool       dirty;
-    int        lex_state_start; /* state inherited from line above */
+    int        lex_state_start;
     int        lex_state_end;
 } LineAttr;
 
@@ -138,12 +138,12 @@ void     syn_mark_dirty_from(SynCtx *s, size_t line);
 void     syn_ensure_line(SynCtx *s, size_t line, const GapBuf *g,
                          const LineIdx *li);
 Language lang_from_ext(const char *ext);
-TokenType syn_search_tok(TokenType base); /* returns TOK_SEARCH if search */
+TokenType syn_search_tok(TokenType base);
 
 /* ─── Search ─────────────────────────────────────────────────── */
 typedef struct {
     char    query[256];
-    size_t *matches;    /* logical positions */
+    size_t *matches;
     size_t  count;
     size_t  cap;
     int     current;
@@ -158,6 +158,35 @@ typedef struct {
     size_t len;
 } Clipboard;
 
+typedef enum { HEX_FOCUS_HEX, HEX_FOCUS_ASCII } HexFocus;
+
+typedef struct {
+    uint8_t  *data;
+    size_t    data_len;
+    size_t    data_cap;
+    size_t    cursor;
+    int       nibble;
+    HexFocus  focus;
+    size_t    scroll_row;
+    char      filename[4096];
+    bool      modified;
+    /* Recherche ASCII */
+    char      search_query[256];
+    size_t   *search_results;
+    size_t    search_count;
+    size_t    search_current;
+} HexPane;
+
+HexPane *hex_new(void);
+void     hex_free(HexPane *h);
+bool     hex_load(HexPane *h, const char *path);
+bool     hex_save(HexPane *h, const char *path);
+void     hex_scroll_to_cursor(HexPane *h, int win_h);
+void     hex_search_ascii(HexPane *h, const char *query);
+void     hex_render(HexPane *h, WINDOW *win, int win_h, int win_w);
+bool     hex_handle_key(HexPane *h, int key, int win_h);
+void     hex_colors_init(void);
+
 /* ─── Pane ───────────────────────────────────────────────────── */
 typedef struct {
     GapBuf    *buf;
@@ -171,31 +200,29 @@ typedef struct {
     bool    modified;
     Language lang;
 
-    /* Cursor */
-    size_t  cursor;       /* logical offset */
+    size_t  cursor;
     size_t  cursor_line;
     size_t  cursor_col;
 
-    /* Viewport */
     size_t  scroll_line;
     size_t  scroll_col;
 
-    /* Selection */
     bool    sel_active;
     size_t  sel_anchor;
 
-    /* Display */
     WINDOW *win;
     int     win_y, win_x, win_h, win_w;
 
-    /* Dirty lines for diff-rendering */
-    bool   *line_dirty;         /* per-screen-row */
-    char  **prev_render;        /* previous rendered text per screen row */
-    int     prev_render_rows;   /* number of rows allocated               */
-    size_t  last_cursor_row;    /* screen row of cursor in last frame     */
+    bool   *line_dirty;
+    char  **prev_render;
+    int     prev_render_rows;
+    size_t  last_cursor_row;
 
-    /* Options */
-    bool    show_line_numbers;  /* toggled with Ctrl+R                    */
+    bool    show_line_numbers;
+
+    /* Hex mode */
+    bool      hex_mode;
+    HexPane  *hex;
 } Pane;
 
 Pane *pane_new(void);
@@ -206,7 +233,7 @@ void  pane_set_window(Pane *p, WINDOW *w, int y, int x, int h, int ww);
 void  pane_render(Pane *p, bool force);
 void  pane_insert_char(Pane *p, char c);
 void  pane_insert_str(Pane *p, const char *s, size_t n);
-void  pane_delete_char(Pane *p);   /* backspace */
+void  pane_delete_char(Pane *p);
 void  pane_delete_forward(Pane *p);
 void  pane_move_cursor(Pane *p, int dy, int dx);
 void  pane_move_to_line_col(Pane *p, size_t line, size_t col);
@@ -233,37 +260,34 @@ typedef enum {
     MODE_SEARCH_DIALOG,
     MODE_OPEN_DIALOG,
     MODE_GOTO_LINE,
+    MODE_HEX_JUMP,
+    MODE_HEX_SEARCH,
 } EditorMode;
 
 typedef struct {
     Pane      *panes[MAX_PANES];
     int        npanes;
-    int        active;      /* index of focused pane  */
+    int        active;
     EditorMode mode;
 
-    /* Dialog input buffer */
     char       dialog_buf[4096];
     size_t     dialog_cursor;
-    int        dialog_action; /* 0=save,1=search,2=open,3=goto */
+    int        dialog_action;
 
-    /* Output pane for run results */
     WINDOW    *out_win;
     char      *out_text;
     size_t     out_scroll;
     bool       out_visible;
 
-    /* Status bar */
     WINDOW    *status_win;
     WINDOW    *title_win;
 
-    /* Build / run */
     pid_t      run_pid;
     char       run_output[1<<16];
 
     bool       running;
-    bool       show_shortcuts; /* Ctrl+H toggles shortcut bar */
+    bool       show_shortcuts;
 
-    /* Async save */
     pthread_t  save_thread;
     bool       save_pending;
     char       save_path[4096];
@@ -287,30 +311,46 @@ void run_file(const char *path, Language lang, char *out_buf, size_t out_max);
 void run_async(const char *path, Language lang);
 
 /* ─── Colour pairs ───────────────────────────────────────────── */
-#define COLOR_PAIR_NORMAL   1
-#define COLOR_PAIR_KEYWORD  2
-#define COLOR_PAIR_TYPE     3
-#define COLOR_PAIR_PREPROC  4
-#define COLOR_PAIR_STRING   5
-#define COLOR_PAIR_COMMENT  6
-#define COLOR_PAIR_NUMBER   7
-#define COLOR_PAIR_IDENT    8
-#define COLOR_PAIR_SEARCH   9
-#define COLOR_PAIR_TITLE    10
-#define COLOR_PAIR_STATUS   11
-#define COLOR_PAIR_LINENUM  12
-#define COLOR_PAIR_CURSOR   13
-#define COLOR_PAIR_OPERATOR 14
-#define COLOR_PAIR_ACTIVE_BORDER 15
+#define COLOR_PAIR_NORMAL          1
+#define COLOR_PAIR_KEYWORD         2
+#define COLOR_PAIR_TYPE            3
+#define COLOR_PAIR_PREPROC         4
+#define COLOR_PAIR_STRING          5
+#define COLOR_PAIR_COMMENT         6
+#define COLOR_PAIR_NUMBER          7
+#define COLOR_PAIR_IDENT           8
+#define COLOR_PAIR_SEARCH          9
+#define COLOR_PAIR_TITLE          10
+#define COLOR_PAIR_STATUS         11
+#define COLOR_PAIR_LINENUM        12
+#define COLOR_PAIR_CURSOR         13
+#define COLOR_PAIR_OPERATOR       14
+#define COLOR_PAIR_ACTIVE_BORDER  15
 #define COLOR_PAIR_INACTIVE_BORDER 16
-#define COLOR_PAIR_SELECTION 17
-#define COLOR_PAIR_CHAR     18
+#define COLOR_PAIR_SELECTION      17
+#define COLOR_PAIR_CHAR           18
+/* Hex editor colour pairs */
+#define HEX_CP_OFFSET             19
+#define HEX_CP_ZERO               20
+#define HEX_CP_PRINT              21
+#define HEX_CP_NONPRINT           22
+#define HEX_CP_CURSOR_H           23
+#define HEX_CP_CURSOR_A           24
+#define HEX_CP_PEER               25
+#define HEX_CP_MODIFIED           26
+#define HEX_CP_HEADER             27
 
 void colors_init(void);
 int  tok_to_color_pair(TokenType t);
 
-/* ─── Arena Allocator (small structs) ───────────────────────── */
-typedef struct ArenaBlock { struct ArenaBlock *next; size_t used; size_t cap; char data[]; } ArenaBlock;
+/* ─── Arena Allocator ────────────────────────────────────────── */
+typedef struct ArenaBlock {
+    struct ArenaBlock *next;
+    size_t used;
+    size_t cap;
+    char   data[];
+} ArenaBlock;
+
 typedef struct { ArenaBlock *head; } Arena;
 
 Arena *arena_new(size_t block_size);

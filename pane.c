@@ -10,9 +10,11 @@ Pane *pane_new(void) {
     p->syn  = syn_new(LANG_C);
     p->undo = us_new();
     p->lang = LANG_C;
-    p->show_line_numbers  = false;
-    p->prev_render_rows   = 0;
-    p->last_cursor_row    = 0;
+    p->show_line_numbers = false;
+    p->prev_render_rows  = 0;
+    p->last_cursor_row   = 0;
+    p->hex_mode          = false;
+    p->hex               = NULL;
     return p;
 }
 
@@ -29,11 +31,11 @@ void pane_free(Pane *p) {
         for (int i = 0; i < p->prev_render_rows; i++) free(p->prev_render[i]);
         free(p->prev_render);
     }
+    hex_free(p->hex);
     free(p);
 }
 
 void pane_open_file(Pane *p, const char *path) {
-    /* Resolve to absolute path so the title always shows the full location */
     char resolved[4096];
     if (realpath(path, resolved))
         strncpy(p->filename, resolved, sizeof(p->filename)-1);
@@ -41,22 +43,35 @@ void pane_open_file(Pane *p, const char *path) {
         strncpy(p->filename, path, sizeof(p->filename)-1);
     p->filename[sizeof(p->filename)-1] = '\0';
 
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) return;
-    struct stat st; fstat(fd, &st);
-    size_t sz = (size_t)st.st_size;
-    if (sz > 0) {
-        void *m = mmap(NULL, sz, PROT_READ, MAP_PRIVATE, fd, 0);
-        if (m != MAP_FAILED) { gb_insert_str(p->buf, 0, (const char *)m, sz); munmap(m, sz); }
-    }
-    close(fd);
     const char *ext = strrchr(path, '.');
     p->lang = lang_from_ext(ext ? ext : "");
-    syn_free(p->syn); p->syn = syn_new(p->lang);
+
+    /* Binary file → hex mode, don't load into GapBuf */
+    if (p->lang == LANG_HEX) {
+        if (!p->hex) p->hex = hex_new();
+        hex_load(p->hex, p->filename);
+        p->hex_mode = true;
+        syn_free(p->syn); p->syn = syn_new(LANG_NONE);
+    } else {
+        p->hex_mode = false;
+        int fd = open(path, O_RDONLY);
+        if (fd >= 0) {
+            struct stat st; fstat(fd, &st);
+            size_t sz = (size_t)st.st_size;
+            if (sz > 0) {
+                void *m = mmap(NULL, sz, PROT_READ, MAP_PRIVATE, fd, 0);
+                if (m != MAP_FAILED) { gb_insert_str(p->buf, 0, (const char *)m, sz); munmap(m, sz); }
+            }
+            close(fd);
+        }
+        syn_free(p->syn); p->syn = syn_new(p->lang);
+    }
+
     li_rebuild(p->li, p->buf);
     p->cursor = 0; p->cursor_line = 0; p->cursor_col = 0;
     p->modified = false;
-    pane_push_undo(p);
+    us_free(p->undo);
+    p->undo = us_new();
 }
 
 typedef struct { char path[4096]; char *data; size_t len; } SaveArgs;
@@ -69,11 +84,15 @@ static void *save_thread_fn(void *arg) {
 }
 
 bool pane_save_file(Pane *p, const char *path) {
+    /* In hex mode, delegate to hex_save */
+    if (p->hex_mode && p->hex)
+        return hex_save(p->hex, path);
+
     if (path && path[0]) strncpy(p->filename, path, sizeof(p->filename)-1);
     if (!p->filename[0]) return false;
     char *s = gb_to_str(p->buf);
     SaveArgs *sa = malloc(sizeof *sa);
-    strncpy(sa->path, p->filename, sizeof(sa->path)-1);
+    snprintf(sa->path, sizeof(sa->path), "%s", p->filename);
     sa->data = s; sa->len = strlen(s);
     pthread_t tid;
     pthread_create(&tid, NULL, save_thread_fn, sa);
@@ -124,7 +143,13 @@ void pane_scroll_to_cursor(Pane *p) {
 }
 
 void pane_render(Pane *p, bool force) {
-    (void)force; /* always redraw — ncurses virtual screen handles actual terminal updates */
+    /* If hex mode is active, delegate entirely to hex_render */
+    if (p->hex_mode && p->hex) {
+        hex_render(p->hex, p->win, p->win_h, p->win_w);
+        return;
+    }
+
+    (void)force;
     if (!p->win || p->win_h < 1 || p->win_w < 1) return;
     if (p->li->dirty) li_rebuild(p->li, p->buf);
 
@@ -133,8 +158,6 @@ void pane_render(Pane *p, bool force) {
     size_t nlines = li_line_count(p->li);
     size_t buflen  = gb_len(p->buf);
 
-    /* Pre-pass: propagate lex states for off-screen lines so block comments
-       and strings are correct for the visible viewport */
     for (size_t i = 0; i < p->scroll_line && i < nlines; i++)
         syn_ensure_line(p->syn, i, p->buf, p->li);
 
@@ -155,7 +178,6 @@ void pane_render(Pane *p, bool force) {
         size_t line_end   = (lineno + 1 < nlines) ? li_line_start(p->li, lineno+1)-1 : buflen;
         size_t line_len   = (line_end >= line_start) ? line_end - line_start : 0;
 
-        /* gutter */
         if (p->show_line_numbers) {
             wattron(p->win, is_cur_row ? (A_BOLD|COLOR_PAIR(COLOR_PAIR_LINENUM))
                                        : COLOR_PAIR(COLOR_PAIR_LINENUM));
@@ -166,7 +188,6 @@ void pane_render(Pane *p, bool force) {
             wattroff(p->win, COLOR_PAIR(COLOR_PAIR_OPERATOR));
         }
 
-        /* text */
         LineAttr *la = &p->syn->lines[lineno];
         size_t ci = p->scroll_col;
         for (int col = 0; col < text_w; col++, ci++) {
@@ -191,7 +212,6 @@ void pane_render(Pane *p, bool force) {
             }
             waddch(p->win, ch);
         }
-        /* cursor at EOL */
         wstandend(p->win);
         if (p->cursor == line_end && is_cur_row) {
             wattron(p->win, A_REVERSE); waddch(p->win, ' '); wstandend(p->win);
@@ -252,7 +272,6 @@ void pane_push_undo(Pane *p) { us_push(p->undo, p->buf, p->cursor); }
 
 void pane_insert_char(Pane *p, char c) {
     if (c == '\n') { auto_indent_newline(p); return; }
-    pane_push_undo(p);
     const char *open = "{([\"'", *close = "})]\"'";
     const char *cp = strchr(open, c);
     if (cp) {
@@ -266,6 +285,7 @@ void pane_insert_char(Pane *p, char c) {
             { p->cursor++; goto done; }
         gb_insert_char(p->buf, p->cursor, c); p->cursor++;
     }
+    pane_push_undo(p); /* push APRÈS insertion avec curseur correct */
 done:
     mark_dirty(p);
     li_rebuild(p->li, p->buf);
@@ -282,7 +302,6 @@ void pane_insert_str(Pane *p, const char *s, size_t n) {
 
 void pane_delete_char(Pane *p) {
     if (p->cursor == 0) return;
-    pane_push_undo(p);
     char prev = gb_at(p->buf, p->cursor-1);
     size_t blen = gb_len(p->buf);
     const char *open = "{([\"'", *close = "})]\"'";
@@ -290,6 +309,7 @@ void pane_delete_char(Pane *p) {
     if (cp && p->cursor < blen && gb_at(p->buf, p->cursor) == close[cp-open]) {
         gb_delete(p->buf, p->cursor-1, 2); p->cursor--;
     } else { gb_delete(p->buf, p->cursor-1, 1); p->cursor--; }
+    pane_push_undo(p); /* push APRÈS suppression */
     mark_dirty(p); li_rebuild(p->li, p->buf);
     cursor_update_line_col(p); pane_scroll_to_cursor(p);
 }
@@ -331,15 +351,14 @@ void pane_move_to_line_col(Pane *p, size_t line, size_t col) {
 }
 
 void pane_kill_line(Pane *p) {
-    /* Delete from cursor to end of line content; if at EOL, delete just the \n */
     if (p->li->dirty) li_rebuild(p->li, p->buf);
     size_t nl = li_line_count(p->li);
     size_t le = (p->cursor_line+1 < nl)
                 ? li_line_start(p->li, p->cursor_line+1) - 1
                 : gb_len(p->buf);
     size_t n = 0;
-    if (p->cursor < le)             n = le - p->cursor;      /* delete to EOL content */
-    else if (p->cursor < gb_len(p->buf)) n = 1;              /* delete the \n itself  */
+    if (p->cursor < le)                  n = le - p->cursor;
+    else if (p->cursor < gb_len(p->buf)) n = 1;
     if (!n) return;
     pane_push_undo(p);
     gb_delete(p->buf, p->cursor, n);
@@ -413,13 +432,14 @@ void pane_search_next(Pane *p) {
     if (!p->search.count) return;
     p->search.current = (p->search.current + 1) % (int)p->search.count;
     p->cursor = p->search.matches[p->search.current];
-    li_rebuild(p->li, p->buf); cursor_update_line_col(p); pane_scroll_to_cursor(p);
+    mark_dirty(p); li_rebuild(p->li, p->buf); cursor_update_line_col(p); pane_scroll_to_cursor(p);
 }
+
 void pane_search_prev(Pane *p) {
     if (!p->search.count) return;
     p->search.current = (p->search.current - 1 + (int)p->search.count) % (int)p->search.count;
     p->cursor = p->search.matches[p->search.current];
-    li_rebuild(p->li, p->buf); cursor_update_line_col(p); pane_scroll_to_cursor(p);
+    mark_dirty(p); li_rebuild(p->li, p->buf); cursor_update_line_col(p); pane_scroll_to_cursor(p);
 }
 
 void pane_wipe_file(Pane *p) {

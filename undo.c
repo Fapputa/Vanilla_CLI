@@ -59,10 +59,15 @@ void us_push(UndoStack *us, const GapBuf *g, size_t cursor) {
 }
 
 bool us_undo(UndoStack *us, GapBuf **g_out, size_t *cursor_out) {
-    if (!us->current || !us->current->prev) return false;
+    if (!us->current) return false;
+    if (us->current->prev) {
+        *g_out = gb_clone(us->current->prev->snapshot_buf);
+        *cursor_out = us->current->prev->cursor_pos;
+    } else {
+        *g_out = gb_new(GAP_DEFAULT);
+        *cursor_out = 0;
+    }
     us->current = us->current->prev;
-    *g_out = gb_clone(us->current->snapshot_buf);
-    *cursor_out = us->current->cursor_pos;
     return true;
 }
 

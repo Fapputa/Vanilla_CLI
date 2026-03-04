@@ -23,7 +23,7 @@ void colors_init(void) {
     /* Search highlight: black on yellow */
     init_pair(COLOR_PAIR_SEARCH,    COLOR_BLACK,   COLOR_YELLOW);
     /* Title bar: black on bright blue */
-    init_pair(COLOR_PAIR_TITLE,     COLOR_BLACK,   COLOR_BLUE);
+    init_pair(COLOR_PAIR_TITLE,     COLOR_WHITE,   COLOR_RED);
     /* Status bar: black on white */
     init_pair(COLOR_PAIR_STATUS,    COLOR_BLACK,   COLOR_WHITE);
     /* Line numbers: dark cyan */

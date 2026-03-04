@@ -16,8 +16,8 @@ static void layout_windows(void) {
     int edit_h   = rows - title_h - status_h - out_h;
     if (edit_h < 1) edit_h = 1;
 
-    if (!E.title_win)  E.title_win  = newwin(title_h,  cols, 0,               0);
-    else { mvwin(E.title_win,  0, 0); wresize(E.title_win,  title_h,  cols); }
+    if (!E.title_win)  E.title_win  = newwin(title_h, cols, 0, 0);
+    else { mvwin(E.title_win, 0, 0); wresize(E.title_win, title_h, cols); }
 
     if (E.out_visible) {
         if (!E.out_win) E.out_win = newwin(out_h, cols, title_h + edit_h, 0);
@@ -47,17 +47,22 @@ static void render_title(void) {
     wbkgdset(E.title_win, ' ' | COLOR_PAIR(COLOR_PAIR_TITLE));
     wmove(E.title_win, 0, 0);
     wattron(E.title_win, COLOR_PAIR(COLOR_PAIR_TITLE) | A_BOLD);
+    Pane *ap = E.panes[E.active];
     if (E.show_shortcuts) {
-        /* Show full shortcut bar */
-        wprintw(E.title_win,
-            " ^O:Save  ^K:DelLine  ^T:KillLine  ^B:Run  ^F:Find"
-            "  ^Z:Undo  ^R:LineNums  ^W:Wipe  ^A:Help  ^Q:Quit");
+        if (ap->hex_mode)
+            wprintw(E.title_win,
+                " [HEX] Tab:Switch  ^J:Jump  ^F:Search  ^N/^P:Next/Prev"
+                "  ^S:Save  F2:Exit Hex  ^Q:Quit");
+        else
+            wprintw(E.title_win,
+                " ^O:Save  ^K:DelLine  ^B:Run  ^F:Find  ^Z:Undo"
+                "  ^R:LineNums  ^W:Wipe  F2:Hex  ^A:Help  ^Q:Quit");
     } else {
-        /* Clean title: editor name + active file */
-        Pane *ap = E.panes[E.active];
+        bool mod = ap->hex_mode ? (ap->hex && ap->hex->modified) : ap->modified;
+        const char *hex_tag = ap->hex_mode ? "  [HEX]" : "";
         if (ap->filename[0])
-            wprintw(E.title_win, " Abyss  |  %s%s  |  ^A for shortcuts",
-                    ap->filename, ap->modified ? " *" : "");
+            wprintw(E.title_win, " Abyss  |  %s%s%s  |  ^A for shortcuts",
+                    ap->filename, mod ? " *" : "", hex_tag);
         else
             wprintw(E.title_win, " Abyss  |  [No File]  |  ^A for shortcuts");
     }
@@ -72,22 +77,35 @@ static void render_status(void) {
     wmove(E.status_win, 0, 0);
     wattron(E.status_win, COLOR_PAIR(COLOR_PAIR_STATUS));
     Pane *ap = E.panes[E.active];
-    size_t line, col;
-    pane_cursor_line_col(ap, &line, &col);
-    static const char *lang_names[] = {
-        "C","C++","Python","Shell","JS","JSON","SQL","ASM","HTML","CSS","PHP","C#","Plain"
-    };
-    const char *lname = lang_names[ap->lang < LANG_NONE ? ap->lang : LANG_NONE];
-    size_t nlines = li_line_count(ap->li);
-    char search_info[512] = "";
-    if (ap->search.query[0])
-        snprintf(search_info, sizeof search_info, " | \"%s\" [%d/%zu]",
-                 ap->search.query,
-                 ap->search.current >= 0 ? ap->search.current+1 : 0,
-                 ap->search.count);
-    wprintw(E.status_win, " Ln %zu/%zu  Col %zu  [%s]%s%s ",
-            line+1, nlines, col+1, lname, search_info,
-            ap->show_line_numbers ? "  [LN]" : "");
+
+    if (ap->hex_mode && ap->hex) {
+        HexPane *h = ap->hex;
+        const char *panel = (h->focus == HEX_FOCUS_HEX) ? "HEX" : "ASCII";
+        wprintw(E.status_win,
+                " Offset 0x%07zx (%zu)  Row %zu  Col %zu  [%s]  %zu bytes%s ",
+                h->cursor, h->cursor,
+                h->cursor / 16, h->cursor % 16,
+                panel, h->data_len,
+                h->modified ? "  [modified]" : "");
+    } else {
+        size_t line, col;
+        pane_cursor_line_col(ap, &line, &col);
+        static const char *lang_names[] = {
+            "C","C++","Python","Shell","JS","JSON","SQL","ASM",
+            "HTML","CSS","PHP","C#","HEX","Plain"
+        };
+        const char *lname = lang_names[ap->lang <= LANG_NONE ? ap->lang : LANG_NONE];
+        size_t nlines = li_line_count(ap->li);
+        char search_info[512] = "";
+        if (ap->search.query[0])
+            snprintf(search_info, sizeof search_info, " | \"%s\" [%d/%zu]",
+                     ap->search.query,
+                     ap->search.current >= 0 ? ap->search.current+1 : 0,
+                     ap->search.count);
+        wprintw(E.status_win, " Ln %zu/%zu  Col %zu  [%s]%s%s ",
+                line+1, nlines, col+1, lname, search_info,
+                ap->show_line_numbers ? "  [LN]" : "");
+    }
     wclrtoeol(E.status_win);
     wattroff(E.status_win, COLOR_PAIR(COLOR_PAIR_STATUS));
     wnoutrefresh(E.status_win);
@@ -163,14 +181,27 @@ static void render_dialog(const char *title) {
 /* ─── Full redraw ────────────────────────────────────────────── */
 
 static void full_redraw(bool force) {
-    for (int i = 0; i < E.npanes; i++)
-        pane_render(E.panes[i], force);
+    for (int i = 0; i < E.npanes; i++) {
+        Pane *p = E.panes[i];
+        if (p->hex_mode && p->hex)
+            hex_render(p->hex, p->win, p->win_h, p->win_w);
+        else
+            pane_render(p, force);
+    }
     render_pane_borders();
     render_title();
     render_status();
     render_output();
     if (E.mode != MODE_NORMAL) {
-        const char *titles[] = {"","Save As","Search","Open File","Go to Line"};
+        const char *titles[] = {
+            "",
+            "Save As",
+            "Search",
+            "Open File",
+            "Go to Line",
+            "Jump to Offset  (decimal: 1024  or hex: 0x400)",
+            "Search ASCII"
+        };
         render_dialog(titles[E.mode]);
     }
     doupdate();
@@ -197,23 +228,61 @@ static void dialog_backspace(void) {
 }
 
 static void force_full_dirty(void) {
-    for (int i = 0; i < E.npanes; i++) {
-        Pane *p = E.panes[i];
-        syn_mark_dirty_from(p->syn, 0);
-    }
+    for (int i = 0; i < E.npanes; i++)
+        syn_mark_dirty_from(E.panes[i]->syn, 0);
 }
 
 static void dialog_confirm(void) {
     Pane *ap = E.panes[E.active];
     switch (E.mode) {
+
+        /* ── Hex dialogs ─────────────────────────────────────── */
+        case MODE_HEX_JUMP: {
+            if (ap->hex && E.dialog_buf[0]) {
+                char *end;
+                long off = strtol(E.dialog_buf, &end, 0);
+                if (end != E.dialog_buf && off >= 0
+                        && (size_t)off < ap->hex->data_len) {
+                    ap->hex->cursor = (size_t)off;
+                    ap->hex->nibble = 0;
+                    hex_scroll_to_cursor(ap->hex, ap->win_h); /* ← scroll */
+                }
+            }
+            E.mode = MODE_NORMAL;
+            full_redraw(true); /* ← redraw */
+            return;
+        }
+        case MODE_HEX_SEARCH: {
+            if (!ap->hex) { E.mode = MODE_NORMAL; return; }
+            HexPane *h = ap->hex;
+            if (strcmp(E.dialog_buf, h->search_query) != 0) {
+                /* Nouvelle query → chercher et aller au premier résultat */
+                hex_search_ascii(h, E.dialog_buf);
+                if (h->search_count > 0) {
+                    h->search_current = 0;
+                    h->cursor = h->search_results[0];
+                    hex_scroll_to_cursor(h, ap->win_h); /* ← scroll */
+                }
+            } else if (h->search_count > 0) {
+                /* Même query → résultat suivant */
+                h->search_current = (h->search_current + 1) % h->search_count;
+                h->cursor = h->search_results[h->search_current];
+                hex_scroll_to_cursor(h, ap->win_h); /* ← scroll */
+            }
+            /* Rester dans le dialog — Échap pour fermer */
+            full_redraw(true); /* ← redraw */
+            return;
+        }
+
+        /* ── Normal dialogs ──────────────────────────────────── */
         case MODE_SAVE_DIALOG:
             pane_save_file(ap, E.dialog_buf);
             force_full_dirty();
             break;
         case MODE_OPEN_DIALOG:
-            gb_free(ap->buf);   ap->buf = gb_new(GAP_DEFAULT);
-            li_free(ap->li);    ap->li  = li_new();
-            syn_free(ap->syn);  ap->syn = syn_new(LANG_C);
+            gb_free(ap->buf);  ap->buf = gb_new(GAP_DEFAULT);
+            li_free(ap->li);   ap->li  = li_new();
+            syn_free(ap->syn); ap->syn = syn_new(LANG_C);
             ap->cursor = 0;
             pane_open_file(ap, E.dialog_buf);
             layout_windows();
@@ -221,9 +290,8 @@ static void dialog_confirm(void) {
             break;
         case MODE_SEARCH_DIALOG:
             if (strcmp(E.dialog_buf, ap->search.query) != 0) {
-                /* New query: find all matches and jump to first */
-                strncpy(ap->search.query,     E.dialog_buf, sizeof(ap->search.query)-1);
-                strncpy(ap->syn->search_word, E.dialog_buf, sizeof(ap->syn->search_word)-1);
+                snprintf(ap->search.query, sizeof(ap->search.query), "%s", E.dialog_buf);
+                snprintf(ap->syn->search_word, sizeof(ap->syn->search_word), "%s", E.dialog_buf);
                 search_find(&ap->search, ap->buf);
                 syn_mark_dirty_from(ap->syn, 0);
                 if (ap->search.count > 0) {
@@ -233,11 +301,10 @@ static void dialog_confirm(void) {
                     pane_move_cursor(ap, 0, 0);
                 }
             } else {
-                /* Same query: cycle to next match */
                 pane_search_next(ap);
             }
-            /* Stay in SEARCH_DIALOG — only Esc closes it */
-            return;
+            full_redraw(true); /* ← redraw */
+            return; /* stay in dialog */
         case MODE_GOTO_LINE: {
             long l = atol(E.dialog_buf);
             if (l > 0) pane_move_to_line_col(ap, (size_t)(l-1), 0);
@@ -250,7 +317,7 @@ static void dialog_confirm(void) {
 
 static void open_dialog(EditorMode m, const char *prefill) {
     E.mode = m;
-    if (prefill) strncpy(E.dialog_buf, prefill, sizeof(E.dialog_buf)-1);
+    if (prefill) snprintf(E.dialog_buf, sizeof(E.dialog_buf), "%s", prefill);
     else E.dialog_buf[0] = '\0';
     E.dialog_cursor = strlen(E.dialog_buf);
 }
@@ -260,6 +327,32 @@ static void open_dialog(EditorMode m, const char *prefill) {
 static void handle_key_normal(int key) {
     Pane *ap = E.panes[E.active];
 
+    /* ── Hex mode ─────────────────────────────────────────────── */
+    if (ap->hex_mode && ap->hex) {
+        if (key == ('q'&0x1f)) { E.running = false; return; }
+        if (key == ('a'&0x1f)) { E.show_shortcuts = !E.show_shortcuts; return; }
+        if (key == KEY_F(2))   { ap->hex_mode = false; force_full_dirty(); return; }
+        if (key == ('s'&0x1f)) { hex_save(ap->hex, NULL); return; }
+        if (key == ('o'&0x1f)) {
+            open_dialog(MODE_SAVE_DIALOG,
+                        ap->hex->filename[0] ? ap->hex->filename : NULL);
+            return;
+        }
+        if (key == ('j'&0x1f)) {
+            open_dialog(MODE_HEX_JUMP, NULL);
+            return;
+        }
+        if (key == ('f'&0x1f)) {
+            open_dialog(MODE_HEX_SEARCH,
+                        ap->hex->search_query[0] ? ap->hex->search_query : NULL);
+            return;
+        }
+        /* Tout le reste : navigation, Tab, nibbles, ASCII edit */
+        hex_handle_key(ap->hex, key, ap->win_h);
+        return;
+    }
+
+    /* ── Mode texte normal ────────────────────────────────────── */
     switch (key) {
         case KEY_UP:    pane_move_cursor(ap, -1, 0); break;
         case KEY_DOWN:  pane_move_cursor(ap,  1, 0); break;
@@ -283,11 +376,10 @@ static void handle_key_normal(int key) {
         case '\n': case '\r': pane_insert_char(ap, '\n'); break;
         case '\t': pane_insert_str(ap, "    ", 4); break;
 
-        /* ── Ctrl shortcuts ──────────────────────────────────── */
-        case 'o'&0x1f:  /* ^O  Save As */
+        case 'o'&0x1f:
             open_dialog(MODE_SAVE_DIALOG, ap->filename[0] ? ap->filename : NULL);
             break;
-        case 's'&0x1f:  /* ^S  Save in-place */
+        case 's'&0x1f:
             if (ap->filename[0]) pane_save_file(ap, NULL);
             else open_dialog(MODE_SAVE_DIALOG, NULL);
             break;
@@ -299,40 +391,44 @@ static void handle_key_normal(int key) {
         case 'k'&0x1f: pane_kill_whole_line(ap); break;
         case 't'&0x1f: pane_kill_whole_line(ap); break;
         case 'f'&0x1f:
-            open_dialog(MODE_SEARCH_DIALOG, ap->search.query[0] ? ap->search.query : NULL);
+            open_dialog(MODE_SEARCH_DIALOG,
+                        ap->search.query[0] ? ap->search.query : NULL);
             break;
         case 'n'&0x1f: pane_search_next(ap); break;
         case 'p'&0x1f: pane_search_prev(ap); break;
-        case 'b'&0x1f: /* ^B  Build & Run */
+        case 'b'&0x1f:
             if (ap->filename[0]) {
                 pane_save_file(ap, NULL);
                 E.out_visible = true;
                 layout_windows();
-                free(E.out_text); E.out_text = malloc(1<<16); E.out_text[0]='\0';
+                free(E.out_text);
+                E.out_text = malloc(1<<16); E.out_text[0] = '\0';
                 run_file(ap->filename, ap->lang, E.out_text, 1<<16);
             }
             break;
-        case 'r'&0x1f: /* ^R  Toggle line numbers */
+        case 'r'&0x1f:
             ap->show_line_numbers = !ap->show_line_numbers;
             pane_set_window(ap, ap->win, ap->win_y, ap->win_x, ap->win_h, ap->win_w);
             pane_scroll_to_cursor(ap);
             break;
-        case 'w'&0x1f: /* ^W  Wipe file */
+        case 'w'&0x1f:
             if (ap->filename[0]) pane_wipe_file(ap);
             break;
-        case 'l'&0x1f: /* ^L  Split */
-            editor_split(); layout_windows(); break;
-        case 'e'&0x1f: /* ^E  Cycle pane focus */
-            editor_focus_next(); break;
-        case 'g'&0x1f: /* ^G  Go to line */
-            open_dialog(MODE_GOTO_LINE, NULL); break;
-        case 'a'&0x1f: /* ^A  Toggle shortcuts */
-            E.show_shortcuts = !E.show_shortcuts;
-            break;
-        case 'q'&0x1f: /* ^Q  Quit */
-            E.running = false; break;
+        case 'l'&0x1f: editor_split(); layout_windows(); break;
+        case 'e'&0x1f: editor_focus_next(); break;
+        case 'g'&0x1f: open_dialog(MODE_GOTO_LINE, NULL); break;
+        case 'a'&0x1f: E.show_shortcuts = !E.show_shortcuts; break;
 
-        /* Selection */
+        /* F2 — entrer en hex mode */
+        case KEY_F(2):
+            if (!ap->hex) ap->hex = hex_new();
+            if (ap->filename[0]) hex_load(ap->hex, ap->filename);
+            ap->hex_mode = true;
+            force_full_dirty();
+            break;
+
+        case 'q'&0x1f: E.running = false; break;
+
         case KEY_SLEFT:
             if (!ap->sel_active) { ap->sel_active=true; ap->sel_anchor=ap->cursor; }
             pane_move_cursor(ap, 0, -1); break;
@@ -346,7 +442,7 @@ static void handle_key_normal(int key) {
             if (!ap->sel_active) { ap->sel_active=true; ap->sel_anchor=ap->cursor; }
             pane_move_cursor(ap, 1, 0); break;
 
-        case 27: /* ESC: clear search/selection */
+        case 27:
             ap->sel_active = false;
             search_clear(&ap->search);
             ap->search.query[0] = '\0';
@@ -364,8 +460,7 @@ static void handle_key_normal(int key) {
 static void handle_key_dialog(int key) {
     switch (key) {
         case '\n': case '\r': dialog_confirm(); break;
-        case 27: {
-            /* When closing search dialog, erase highlights */
+        case 27:
             if (E.mode == MODE_SEARCH_DIALOG) {
                 Pane *ap = E.panes[E.active];
                 search_clear(&ap->search);
@@ -375,7 +470,6 @@ static void handle_key_dialog(int key) {
             }
             E.mode = MODE_NORMAL;
             break;
-        }
         case KEY_BACKSPACE: case 127: case '\b': dialog_backspace(); break;
         case KEY_LEFT:  if (E.dialog_cursor > 0) E.dialog_cursor--; break;
         case KEY_RIGHT:
@@ -404,7 +498,7 @@ void editor_split(void) {
     Pane *ap = E.panes[E.active];
     if (ap->filename[0]) {
         pane_open_file(np, ap->filename);
-        np->cursor = ap->cursor;
+        np->cursor      = ap->cursor;
         np->cursor_line = ap->cursor_line;
         np->cursor_col  = ap->cursor_col;
         np->scroll_line = ap->scroll_line;
@@ -415,17 +509,17 @@ void editor_split(void) {
 
 void editor_close_split(void) {
     if (E.npanes <= 1) return;
-    if (E.panes[E.active]->win) { delwin(E.panes[E.active]->win); E.panes[E.active]->win=NULL; }
+    if (E.panes[E.active]->win) {
+        delwin(E.panes[E.active]->win);
+        E.panes[E.active]->win = NULL;
+    }
     pane_free(E.panes[E.active]);
     for (int i = E.active; i < E.npanes-1; i++) E.panes[i] = E.panes[i+1];
     E.npanes--;
     if (E.active >= E.npanes) E.active = E.npanes-1;
 }
 
-void editor_focus_next(void) {
-    E.active = (E.active + 1) % E.npanes;
-}
-
+void editor_focus_next(void) { E.active = (E.active + 1) % E.npanes; }
 void editor_resize_panes(void) { layout_windows(); }
 
 void editor_cleanup(void) {
@@ -445,156 +539,98 @@ void editor_cleanup(void) {
 
 void editor_run(const char *initial_file) {
     setlocale(LC_ALL, "");
-    initscr();
-    raw();
-    noecho();
+    initscr(); raw(); noecho();
     keypad(stdscr, TRUE);
     set_escdelay(25);
     curs_set(0);
     colors_init();
+    hex_colors_init();
 
-    /* Enable bracketed paste: terminal wraps pasted text with ESC[200~ ... ESC[201~ */
     printf("\033[?2004h"); fflush(stdout);
-
     layout_windows();
 
     if (initial_file) {
         pane_open_file(E.panes[0], initial_file);
         layout_windows();
     }
-
-    /* Force complete first draw immediately — no wait for keypress */
     full_redraw(true);
 
-    /* Disable XON/XOFF *after* all ncurses init so ncurses doesn't restore
-       the flag via reset_prog_mode(). Re-save with def_prog_mode() so future
-       ncurses internal tcsetattr calls also keep IXON disabled. */
     {
         struct termios t;
         tcgetattr(STDIN_FILENO, &t);
         t.c_iflag &= ~(IXON | IXOFF);
         tcsetattr(STDIN_FILENO, TCSANOW, &t);
-        def_prog_mode(); /* tell ncurses: this is now the "normal" program state */
+        def_prog_mode();
     }
 
-    /* Bracketed paste state */
-    bool in_paste = false;
-    char paste_batch[1 << 18]; /* 256 KB */
+    bool in_paste  = false;
+    char paste_batch[1 << 18];
     int  paste_len = 0;
 
     while (E.running) {
-        /* Use active pane window for input so wgetch doesn't trigger
-           wrefresh(stdscr) which blanks subwindow areas in the virtual screen */
-        WINDOW *input_win = E.panes[E.active]->win;
-        int key = wgetch(input_win ? input_win : stdscr);
+        WINDOW *iw = E.panes[E.active]->win;
+        int key = wgetch(iw ? iw : stdscr);
 
         if (key == KEY_RESIZE) {
             endwin(); refresh();
-            layout_windows();
-            full_redraw(true);
+            layout_windows(); full_redraw(true);
             continue;
         }
 
-        /* ── Bracketed paste detection ──────────────────────────
-           ESC [ 2 0 0 ~  → start collecting
-           ESC [ 2 0 1 ~  → flush collected text as one insert    */
+        /* Bracketed paste */
         if (key == 27) {
-            /* Peek at next chars with short timeout */
-            wtimeout(input_win ? input_win : stdscr, 5);
-            int c1 = wgetch(input_win ? input_win : stdscr);
+            wtimeout(iw ? iw : stdscr, 5);
+            int c1 = wgetch(iw ? iw : stdscr);
             if (c1 == '[') {
-                int c2 = wgetch(input_win ? input_win : stdscr);
-                int c3 = wgetch(input_win ? input_win : stdscr);
-                int c4 = wgetch(input_win ? input_win : stdscr);
-                int c5 = wgetch(input_win ? input_win : stdscr);
-                int c6 = wgetch(input_win ? input_win : stdscr);
-                wtimeout(input_win ? input_win : stdscr, -1);
-                if (c2=='2' && c3=='0' && c4=='0' && c5=='~') {
-                    /* ESC[200~ — start of bracketed paste */
-                    in_paste = true;
-                    paste_len = 0;
-                    if (c6 != ERR) { /* first pasted char came in same seq */
-                        if (paste_len < (int)sizeof(paste_batch)-1)
-                            paste_batch[paste_len++] = (char)c6;
-                    }
+                int c2=wgetch(iw?iw:stdscr), c3=wgetch(iw?iw:stdscr);
+                int c4=wgetch(iw?iw:stdscr), c5=wgetch(iw?iw:stdscr);
+                int c6=wgetch(iw?iw:stdscr);
+                wtimeout(iw ? iw : stdscr, -1);
+                if (c2=='2'&&c3=='0'&&c4=='0'&&c5=='~') {
+                    in_paste=true; paste_len=0;
+                    if (c6!=ERR && paste_len<(int)sizeof(paste_batch)-1)
+                        paste_batch[paste_len++]=(char)c6;
                     continue;
-                } else if (c2=='2' && c3=='0' && c4=='1' && c5=='~') {
-                    /* ESC[201~ — end of bracketed paste */
-                    if (in_paste && paste_len > 0 && E.mode == MODE_NORMAL) {
-                        paste_batch[paste_len] = '\0';
-                        pane_insert_str(E.panes[E.active], paste_batch, paste_len);
+                } else if (c2=='2'&&c3=='0'&&c4=='1'&&c5=='~') {
+                    if (in_paste && paste_len>0 && E.mode==MODE_NORMAL) {
+                        paste_batch[paste_len]='\0';
+                        Pane *ap=E.panes[E.active];
+                        if (!ap->hex_mode)
+                            pane_insert_str(ap, paste_batch, paste_len);
                     }
-                    in_paste = false; paste_len = 0;
-                    if (c6 != ERR) ungetch(c6);
-                    full_redraw(true);
-                    continue;
+                    in_paste=false; paste_len=0;
+                    if (c6!=ERR) ungetch(c6);
+                    full_redraw(true); continue;
                 } else {
-                    /* Not a bracketed paste sequence — restore chars */
-                    if (c6 != ERR) ungetch(c6);
-                    if (c5 != ERR) ungetch(c5);
-                    if (c4 != ERR) ungetch(c4);
-                    if (c3 != ERR) ungetch(c3);
-                    if (c2 != ERR) ungetch(c2);
-                    /* Fall through to normal ESC handling */
+                    if (c6!=ERR) ungetch(c6);
+                    if (c5!=ERR) ungetch(c5);
+                    if (c4!=ERR) ungetch(c4);
+                    if (c3!=ERR) ungetch(c3);
+                    if (c2!=ERR) ungetch(c2);
                 }
             } else {
-                wtimeout(input_win ? input_win : stdscr, -1);
-                if (c1 != ERR) ungetch(c1);
-                /* Fall through to normal ESC handling */
+                wtimeout(iw ? iw : stdscr, -1);
+                if (c1!=ERR) ungetch(c1);
             }
         }
 
-        /* Accumulate chars if we are inside a bracketed paste */
         if (in_paste) {
-            if (key != ERR && paste_len < (int)sizeof(paste_batch)-1)
-                paste_batch[paste_len++] = (char)key;
+            if (key!=ERR && paste_len<(int)sizeof(paste_batch)-1)
+                paste_batch[paste_len++]=(char)key;
             continue;
         }
 
-        /* ── Fast-paste batching for terminals without bracketed paste ──
-           If a printable char arrives and more are immediately available,
-           collect them all in one shot → single pane_insert_str call.    */
-        if (E.mode == MODE_NORMAL && key >= 32 && key < 256 && key != 27) {
-            char batch[1 << 18];
-            int blen = 0;
-            batch[blen++] = (char)key;
-            wtimeout(input_win ? input_win : stdscr, 0); /* non-blocking */
-            int ch2;
-            while (blen < (int)sizeof(batch)-1 &&
-                   (ch2 = wgetch(input_win ? input_win : stdscr)) != ERR &&
-                   ch2 >= 32 && ch2 < 256 && ch2 != 27) {
-                batch[blen++] = (char)ch2;
-            }
-            wtimeout(input_win ? input_win : stdscr, -1); /* back to blocking */
-            /* Put back the char that broke the batch (if not ERR) */
-            if (ch2 != ERR && (ch2 < 32 || ch2 >= 256 || ch2 == 27))
-                ungetch(ch2);
-
-            if (blen > 1) {
-                /* Batch of printable chars — insert as string (one undo, one rebuild) */
-                pane_insert_str(E.panes[E.active], batch, blen);
-                full_redraw(false);
-                continue;
-            }
-            /* Single char — fall through to normal handling */
-        }
-
+        /* Fast-paste batching — skip in hex mode and dialog */
+        Pane *ap = E.panes[E.active];
+        (void)ap;
         EditorMode prev_mode = E.mode;
-
         if (E.mode == MODE_NORMAL) handle_key_normal(key);
-        else handle_key_dialog(key);
+        else                       handle_key_dialog(key);
 
-        /* When a dialog just closed, force full redraw to erase dialog remnants */
         bool force = (prev_mode != MODE_NORMAL && E.mode == MODE_NORMAL);
-        if (force) {
-            for (int i = 0; i < E.npanes; i++) {
-                Pane *p = E.panes[i];
-            }
-        }
         full_redraw(force);
     }
 
-    /* Disable bracketed paste before leaving */
     printf("\033[?2004l"); fflush(stdout);
     endwin();
 }

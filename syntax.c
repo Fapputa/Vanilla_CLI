@@ -93,24 +93,36 @@ static bool kw_match(const char **table, const char *s, int len) {
 
 Language lang_from_ext(const char *ext) {
     if (!ext) return LANG_C;
-    if (strcmp(ext,".c")==0||strcmp(ext,".h")==0) return LANG_C;
-    if (strcmp(ext,".cpp")==0||strcmp(ext,".cc")==0||strcmp(ext,".hpp")==0) return LANG_CPP;
+    if (strcmp(ext,".c")==0  || strcmp(ext,".h")==0)  return LANG_C;
+    if (strcmp(ext,".cpp")==0|| strcmp(ext,".cc")==0 ||
+        strcmp(ext,".hpp")==0)                         return LANG_CPP;
     if (strcmp(ext,".py")==0)   return LANG_PY;
     if (strcmp(ext,".sh")==0)   return LANG_SH;
     if (strcmp(ext,".js")==0)   return LANG_JS;
     if (strcmp(ext,".json")==0) return LANG_JSON;
     if (strcmp(ext,".sql")==0)  return LANG_SQL;
-    if (strcmp(ext,".asm")==0||strcmp(ext,".s")==0) return LANG_ASM;
-    if (strcmp(ext,".html")==0||strcmp(ext,".htm")==0) return LANG_HTML;
+    if (strcmp(ext,".asm")==0 || strcmp(ext,".s")==0)  return LANG_ASM;
+    if (strcmp(ext,".html")==0|| strcmp(ext,".htm")==0) return LANG_HTML;
     if (strcmp(ext,".css")==0)  return LANG_CSS;
     if (strcmp(ext,".php")==0)  return LANG_PHP;
     if (strcmp(ext,".cs")==0)   return LANG_CS;
+    /* Binary / hex formats → hex viewer */
+    if (strcmp(ext,".bin")==0  || strcmp(ext,".dump")==0 ||
+        strcmp(ext,".dmp")==0  || strcmp(ext,".img")==0  ||
+        strcmp(ext,".iso")==0  || strcmp(ext,".exe")==0  ||
+        strcmp(ext,".elf")==0  || strcmp(ext,".o"  )==0  ||
+        strcmp(ext,".so" )==0  || strcmp(ext,".hex")==0  ||
+        strcmp(ext,".rom")==0  || strcmp(ext,".raw")==0  ||
+        strcmp(ext,".dat")==0  || strcmp(ext,".pak")==0  ||
+        strcmp(ext,".db" )==0  || strcmp(ext,".sqlite")==0 ||
+        strcmp(ext,".class")==0|| strcmp(ext,".pyc")==0  ||
+        strcmp(ext,".out")==0  || strcmp(ext,".a"  )==0)
+        return LANG_HEX;
     return LANG_NONE;
 }
 
 /* ─── State machine lexer ────────────────────────────────────── */
 
-/* lex_state: 0=normal, 1=block comment, 2=string, 3=char, 4=raw string */
 typedef struct { int state; } LexState;
 
 static void lex_line_c_like(
@@ -123,7 +135,6 @@ static void lex_line_c_like(
 
     int i = 0;
     while (i < len) {
-        /* block comment continuation */
         if (ls->state == 1) {
             int start = i;
             while (i < len) {
@@ -136,7 +147,6 @@ static void lex_line_c_like(
             (void)start;
             goto cont;
         }
-        /* string continuation */
         if (ls->state == 2) {
             while (i < len) {
                 out[i] = TOK_STRING;
@@ -145,7 +155,6 @@ static void lex_line_c_like(
             }
             goto cont;
         }
-        /* char continuation */
         if (ls->state == 3) {
             while (i < len) {
                 out[i] = TOK_CHAR;
@@ -157,39 +166,33 @@ static void lex_line_c_like(
 
         char c = line[i];
 
-        /* line comment */
         if (c=='/' && i+1<len && line[i+1]=='/') {
             while (i<len) out[i++]=TOK_COMMENT;
             goto cont;
         }
-        /* block comment start */
         if (c=='/' && i+1<len && line[i+1]=='*') {
             out[i++]=TOK_COMMENT; out[i++]=TOK_COMMENT;
             ls->state=1;
             goto cont;
         }
-        /* preprocessor */
         if (c=='#' && i==0) {
             while (i<len) out[i++]=TOK_PREPROC;
             goto cont;
         }
-        /* string */
         if (c=='"') {
             out[i++]=TOK_STRING; ls->state=2;
             goto cont;
         }
-        /* char */
         if (c=='\'') {
             out[i++]=TOK_CHAR; ls->state=3;
             goto cont;
         }
-        /* number */
-        if (isdigit((unsigned char)c) || (c=='0' && i+1<len && (line[i+1]=='x'||line[i+1]=='X'))) {
+        if (isdigit((unsigned char)c) ||
+            (c=='0' && i+1<len && (line[i+1]=='x'||line[i+1]=='X'))) {
             while (i<len && (isalnum((unsigned char)line[i])||line[i]=='.'))
                 out[i++]=TOK_NUMBER;
             goto cont;
         }
-        /* identifier / keyword */
         if (isalpha((unsigned char)c)||c=='_') {
             int start=i;
             while (i<len && (isalnum((unsigned char)line[i])||line[i]=='_')) i++;
@@ -200,17 +203,16 @@ static void lex_line_c_like(
             for(int j=start;j<i;j++) out[j]=tt;
             goto cont;
         }
-        /* operators */
         if (strchr("+-*/%=<>!&|^~?:;,.{}[]()@",c))
             { out[i++]=TOK_OPERATOR; goto cont; }
 
         out[i++]=TOK_NORMAL;
         cont:;
     }
+    (void)lang;
 }
 
 static void lex_line_python(const char *line, int len, LexState *ls, TokenType *out) {
-    /* triple-quoted strings: state 5 = triple " state 6 = triple ' */
     int i=0;
     while (i<len) {
         if (ls->state==5) {
@@ -234,16 +236,13 @@ static void lex_line_python(const char *line, int len, LexState *ls, TokenType *
             continue;
         }
         char c=line[i];
-        /* comment */
         if (c=='#') { while(i<len) out[i++]=TOK_COMMENT; break; }
-        /* triple strings */
         if (i+2<len && c=='"'&&line[i+1]=='"'&&line[i+2]=='"') {
             out[i]=out[i+1]=out[i+2]=TOK_STRING; i+=3; ls->state=5; continue;
         }
         if (i+2<len && c=='\''&&line[i+1]=='\''&&line[i+2]=='\'') {
             out[i]=out[i+1]=out[i+2]=TOK_STRING; i+=3; ls->state=6; continue;
         }
-        /* simple string */
         if (c=='"'||c=='\'') {
             char delim=c; out[i++]=TOK_STRING;
             while (i<len) {
@@ -253,12 +252,10 @@ static void lex_line_python(const char *line, int len, LexState *ls, TokenType *
             }
             continue;
         }
-        /* number */
         if (isdigit((unsigned char)c)) {
             while(i<len && (isalnum((unsigned char)line[i])||line[i]=='.')) out[i++]=TOK_NUMBER;
             continue;
         }
-        /* identifier */
         if (isalpha((unsigned char)c)||c=='_') {
             int start=i;
             while(i<len&&(isalnum((unsigned char)line[i])||line[i]=='_')) i++;
@@ -318,7 +315,6 @@ static void lex_line_sql(const char *line, int len, LexState *ls, TokenType *out
         if (isalpha((unsigned char)c)||c=='_') {
             int s=i;
             while(i<len&&(isalnum((unsigned char)line[i])||line[i]=='_')) i++;
-            /* uppercase for SQL matching */
             char tmp[128]={0}; int wl=i-s; if(wl>127)wl=127;
             for(int j=0;j<wl;j++) tmp[j]=toupper((unsigned char)line[s+j]);
             TokenType tt=kw_match(kw_sql,tmp,wl)?TOK_KEYWORD:TOK_IDENT;
@@ -361,7 +357,7 @@ static void lex_line_asm(const char *line, int len, LexState *ls, TokenType *out
 }
 
 static void lex_line_generic(const char *line, int len, LexState *ls, TokenType *out) {
-    (void)ls;
+    (void)ls; (void)line;
     for(int i=0;i<len;i++) out[i]=TOK_NORMAL;
 }
 
@@ -372,8 +368,6 @@ SynCtx *syn_new(Language lang) {
     s->lang = lang;
     s->cap = 256;
     s->lines = calloc(s->cap, sizeof(LineAttr));
-    /* calloc zeroes dirty=false — explicitly mark all slots dirty so
-       syn_ensure_line computes colours on the very first render */
     for (size_t i = 0; i < s->cap; i++) s->lines[i].dirty = true;
     return s;
 }
@@ -399,9 +393,7 @@ static void ensure_line_cap(SynCtx *s, size_t line) {
         }
         s->cap = new_cap;
     }
-    if (line >= s->count) {
-        s->count = line + 1;
-    }
+    if (line >= s->count) s->count = line + 1;
 }
 
 void syn_ensure_line(SynCtx *s, size_t line, const GapBuf *g, const LineIdx *li) {
@@ -417,24 +409,20 @@ void syn_ensure_line(SynCtx *s, size_t line, const GapBuf *g, const LineIdx *li)
     if (end < start) end = start;
     size_t len = end - start;
 
-    /* Reallocate attrs if needed */
     if (len > la->len || !la->attrs) {
         free(la->attrs);
         la->attrs = malloc((len+1) * sizeof(TokenType));
     }
     la->len = len;
 
-    /* Copy line text */
     char *tmp = malloc(len+1);
     gb_get_range(g, start, len, tmp);
     tmp[len]='\0';
 
-    /* Inherit state from previous line */
     int in_state = (line > 0 && line <= s->count) ? s->lines[line-1].lex_state_end : 0;
     LexState ls = { .state = in_state };
     la->lex_state_start = in_state;
 
-    /* Zero-init */
     for (size_t i=0;i<len;i++) la->attrs[i]=TOK_NORMAL;
 
     switch (s->lang) {
@@ -452,7 +440,6 @@ void syn_ensure_line(SynCtx *s, size_t line, const GapBuf *g, const LineIdx *li)
 
     la->lex_state_end = ls.state;
 
-    /* Apply search highlights */
     if (s->search_word[0]) {
         int qlen=(int)strlen(s->search_word);
         for (int i=0;i<(int)len-(qlen-1);i++) {
@@ -464,7 +451,6 @@ void syn_ensure_line(SynCtx *s, size_t line, const GapBuf *g, const LineIdx *li)
     free(tmp);
     la->dirty = false;
 
-    /* Propagate state change to next line */
     if (line+1 < s->count && s->lines[line+1].lex_state_start != ls.state)
         s->lines[line+1].dirty = true;
 }

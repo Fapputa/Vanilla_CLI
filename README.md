@@ -10,7 +10,7 @@ A high-performance, versatile toolkit designed to supercharge the Linux terminal
 **1. Clone the repository:**
 
 ```bash
-git clone https://github.com/your-username/Vanilla_CLI.git
+git clone https://github.com/Fapputa/Vanilla_CLI.git
 cd Vanilla_CLI
 ```
 

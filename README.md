@@ -28,7 +28,7 @@ The installer will automatically:
 
 ---
 
-## Abyss – The Evolution of Editing
+## Abyss – The Evolution
 
 ### Abyss.c (The Pro Version)
 

@@ -36,7 +36,7 @@ Engineered for zero-latency, the C version uses a **Gap Buffer** and **Line Inde
 
 - **Performance:** Instant $O(1)$ insertions/deletions
 - **Architecture:** Low-level memory management with `ncurses` for a flicker-free UI
-- **Features:** Undo/Redo (`Ctrl+Z` / `Ctrl+Y`), syntax highlighting, and integrated compilation
+- **Features:** Undo/Redo (`Ctrl+Z` / `Ctrl+Y`), syntax highlighting, and integrated compilation, Hex view of any file
 
 #### Manual Build
 
@@ -118,3 +118,4 @@ minesweeper 4 4
 | `Ctrl + B` | Compile & Run (via `compil`) |
 | `Ctrl + N` | Split Screen View |
 | `Ctrl + K` | Kill (Delete) Current Line |
+| `f2` | Hex view of the code |

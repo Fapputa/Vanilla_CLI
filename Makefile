@@ -11,6 +11,7 @@ SRC     = gap_buf.c  \
           colors.c   \
           pane.c     \
           run.c      \
+          hex.c      \
           editor.c
 
 OBJ     = $(SRC:.c=.o)

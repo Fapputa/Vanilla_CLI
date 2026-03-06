@@ -198,11 +198,13 @@ typedef struct {
 
     char    filename[4096];
     bool    modified;
+    bool    crlf;         /* file used CRLF line endings */
     Language lang;
 
     size_t  cursor;
     size_t  cursor_line;
     size_t  cursor_col;
+    size_t  preferred_col;   /* sticky column for vertical navigation */
 
     size_t  scroll_line;
     size_t  scroll_col;

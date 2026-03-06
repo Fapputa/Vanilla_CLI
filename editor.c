@@ -362,7 +362,9 @@ static void handle_key_normal(int key) {
         case KEY_NPAGE: pane_move_cursor(ap,  (ap->win_h/2), 0); break;
         case KEY_HOME: {
             size_t ls = li_line_start(ap->li, ap->cursor_line);
-            ap->cursor = ls; pane_move_cursor(ap, 0, 0); break;
+            ap->cursor = ls;
+            ap->scroll_col = 0;   /* always reset horizontal scroll */
+            pane_move_cursor(ap, 0, 0); break;
         }
         case KEY_END: {
             size_t nl = li_line_count(ap->li);

@@ -1,7 +1,79 @@
 #include "abyss.h"
+#include "utf8.h"
 #include <string.h>
 
 GapBuf *gb_clone(const GapBuf *g);
+
+/* ── UTF-8 helpers on GapBuf ──────────────────────────────────────── */
+
+/* Read up to 4 bytes from GapBuf at byte offset pos into tmp[], decode. */
+static int gb_decode_cp(const GapBuf *g, size_t pos, uint32_t *cp) {
+    size_t len = gb_len(g);
+    if (pos >= len) { *cp = 0; return 0; }
+    char tmp[4];
+    int n = utf8_byte_len((unsigned char)gb_at(g, pos));
+    if ((size_t)n > len - pos) n = (int)(len - pos);
+    for (int i = 0; i < n; i++) tmp[i] = gb_at(g, pos + i);
+    return utf8_decode(tmp, (size_t)n, cp);
+}
+
+/* Visual width of the character at byte offset pos in GapBuf. */
+static int gb_char_vis_width(const GapBuf *g, size_t pos) {
+    uint32_t cp; gb_decode_cp(g, pos, &cp);
+    if (cp == '\t') return 4; /* treat tab as 4 spaces */
+    return utf8_cp_width(cp);
+}
+
+/* Move one codepoint forward (returns bytes advanced). */
+static size_t gb_next_cp(const GapBuf *g, size_t pos) {
+    size_t len = gb_len(g);
+    if (pos >= len) return 0;
+    int n = utf8_byte_len((unsigned char)gb_at(g, pos));
+    if (pos + (size_t)n > len) n = (int)(len - pos);
+    return (size_t)n;
+}
+
+/* Move one codepoint backward (returns bytes retreated). */
+static size_t gb_prev_cp(const GapBuf *g, size_t pos) {
+    if (pos == 0) return 0;
+    size_t back = 1;
+    /* skip continuation bytes */
+    while (back < 4 && back < pos &&
+           utf8_is_continuation((unsigned char)gb_at(g, pos - back - 1)))
+        back++;
+    return back;
+}
+
+/* Compute visual column of byte offset within a line (line_start in bytes). */
+static size_t byte_offset_to_vis_col(const GapBuf *g, size_t line_start, size_t byte_offset) {
+    size_t vis = 0;
+    size_t pos = line_start;
+    while (pos < byte_offset) {
+        uint32_t cp; int n = gb_decode_cp(g, pos, &cp);
+        if (n <= 0) break;
+        if (cp == '\t') vis = (vis / 4 + 1) * 4;
+        else vis += (size_t)utf8_cp_width(cp);
+        pos += (size_t)n;
+    }
+    return vis;
+}
+
+/* Find the byte offset whose visual column is >= target_vis_col.
+   Returns byte offset from line_start. line_len is in bytes. */
+static size_t vis_col_to_byte_offset(const GapBuf *g, size_t line_start,
+                                      size_t line_len, size_t target_vis) {
+    size_t vis = 0, pos = 0;
+    while (pos < line_len) {
+        if (vis >= target_vis) break;
+        uint32_t cp; int n = gb_decode_cp(g, line_start + pos, &cp);
+        if (n <= 0) break;
+        int w = (cp == '\t') ? (int)(((vis/4)+1)*4 - vis) : utf8_cp_width(cp);
+        if (vis + (size_t)w > target_vis) break;
+        vis += (size_t)w;
+        pos += (size_t)n;
+    }
+    return pos;
+}
 
 Pane *pane_new(void) {
     Pane *p = calloc(1, sizeof *p);
@@ -43,6 +115,14 @@ void pane_open_file(Pane *p, const char *path) {
         strncpy(p->filename, path, sizeof(p->filename)-1);
     p->filename[sizeof(p->filename)-1] = '\0';
 
+    /* Vider le buffer précédent avant de charger */
+    gb_free(p->buf); p->buf = gb_new(GAP_DEFAULT);
+    p->cursor = 0; p->cursor_line = 0; p->cursor_col = 0;
+    p->scroll_line = 0; p->scroll_col = 0; p->preferred_col = 0;
+    p->sel_active = false;
+    p->modified = false;
+    us_free(p->undo); p->undo = us_new();
+
     const char *ext = strrchr(path, '.');
     p->lang = lang_from_ext(ext ? ext : "");
 
@@ -60,7 +140,27 @@ void pane_open_file(Pane *p, const char *path) {
             size_t sz = (size_t)st.st_size;
             if (sz > 0) {
                 void *m = mmap(NULL, sz, PROT_READ, MAP_PRIVATE, fd, 0);
-                if (m != MAP_FAILED) { gb_insert_str(p->buf, 0, (const char *)m, sz); munmap(m, sz); }
+                if (m != MAP_FAILED) {
+                    const char *src = (const char *)m;
+                    /* Detect and strip \r\n → \n (CRLF files) */
+                    p->crlf = false;
+                    for (size_t i = 0; i + 1 < sz; i++) {
+                        if (src[i] == '\r' && src[i+1] == '\n') { p->crlf = true; break; }
+                    }
+                    if (p->crlf) {
+                        char *buf = malloc(sz);
+                        size_t j = 0;
+                        for (size_t i = 0; i < sz; i++) {
+                            if (src[i] == '\r' && i + 1 < sz && src[i+1] == '\n') continue;
+                            buf[j++] = src[i];
+                        }
+                        gb_insert_str(p->buf, 0, buf, j);
+                        free(buf);
+                    } else {
+                        gb_insert_str(p->buf, 0, src, sz);
+                    }
+                    munmap(m, sz);
+                }
             }
             close(fd);
         }
@@ -68,10 +168,6 @@ void pane_open_file(Pane *p, const char *path) {
     }
 
     li_rebuild(p->li, p->buf);
-    p->cursor = 0; p->cursor_line = 0; p->cursor_col = 0;
-    p->modified = false;
-    us_free(p->undo);
-    p->undo = us_new();
 }
 
 typedef struct { char path[4096]; char *data; size_t len; } SaveArgs;
@@ -91,9 +187,27 @@ bool pane_save_file(Pane *p, const char *path) {
     if (path && path[0]) strncpy(p->filename, path, sizeof(p->filename)-1);
     if (!p->filename[0]) return false;
     char *s = gb_to_str(p->buf);
+    size_t slen = strlen(s);
+
+    /* Re-add \r\n if file originally used CRLF */
+    char *out = s; size_t outlen = slen;
+    if (p->crlf) {
+        /* Count \n to know how much space we need */
+        size_t newlines = 0;
+        for (size_t i = 0; i < slen; i++) if (s[i] == '\n') newlines++;
+        out = malloc(slen + newlines + 1);
+        size_t j = 0;
+        for (size_t i = 0; i < slen; i++) {
+            if (s[i] == '\n') out[j++] = '\r';
+            out[j++] = s[i];
+        }
+        out[j] = '\0'; outlen = j;
+        free(s);
+    }
+
     SaveArgs *sa = malloc(sizeof *sa);
     snprintf(sa->path, sizeof(sa->path), "%s", p->filename);
-    sa->data = s; sa->len = strlen(s);
+    sa->data = out; sa->len = outlen;
     pthread_t tid;
     pthread_create(&tid, NULL, save_thread_fn, sa);
     pthread_detach(tid);
@@ -114,6 +228,10 @@ void pane_set_window(Pane *p, WINDOW *w, int y, int x, int h, int ww) {
     p->win = w; p->win_y = y; p->win_x = x; p->win_h = h; p->win_w = ww;
     p->prev_render_rows = 0;
     keypad(w, TRUE);
+    /* Prevent ncurses from wrapping long lines onto the next row,
+       which would shift all subsequent lines and cause them to disappear */
+    scrollok(w, FALSE);
+    idlok(w, FALSE);
 }
 
 static void cursor_update_line_col(Pane *p) {
@@ -123,23 +241,33 @@ static void cursor_update_line_col(Pane *p) {
         if (li_line_start(p->li, mid) <= p->cursor) lo = mid; else hi = mid;
     }
     p->cursor_line = lo;
-    p->cursor_col  = p->cursor - li_line_start(p->li, lo);
+    /* cursor_col = visual column, not byte offset */
+    size_t line_start = li_line_start(p->li, lo);
+    p->cursor_col = byte_offset_to_vis_col(p->buf, line_start, p->cursor);
 }
 
 void pane_scroll_to_cursor(Pane *p) {
     int margin = 3;
     int gutter = p->show_line_numbers ? 6 : 0;
     int text_w = p->win_w - gutter; if (text_w < 1) text_w = 1;
+
+    /* Vertical scroll */
     if (p->win_h > 0) {
-        if ((int)p->cursor_line < (int)p->scroll_line + margin)
-            p->scroll_line = p->cursor_line > (size_t)margin ? p->cursor_line - margin : 0;
-        if ((int)p->cursor_line >= (int)p->scroll_line + p->win_h - margin)
-            p->scroll_line = p->cursor_line - p->win_h + margin + 1;
+        long cl = (long)p->cursor_line;
+        long sl = (long)p->scroll_line;
+        if (cl < sl + margin)
+            p->scroll_line = cl > margin ? (size_t)(cl - margin) : 0;
+        if (cl >= sl + p->win_h - margin)
+            p->scroll_line = (size_t)(cl - p->win_h + margin + 1);
     }
-    if ((int)p->cursor_col < (int)p->scroll_col)
-        p->scroll_col = p->cursor_col;
-    if ((int)p->cursor_col >= (int)p->scroll_col + text_w)
-        p->scroll_col = p->cursor_col - text_w + 1;
+
+    /* Horizontal scroll — use signed arithmetic to avoid size_t wrap bugs */
+    long cc = (long)p->cursor_col;
+    long sc = (long)p->scroll_col;
+    if (cc < sc)
+        p->scroll_col = (size_t)cc;
+    else if (cc >= sc + text_w)
+        p->scroll_col = (size_t)(cc - text_w + 1);
 }
 
 void pane_render(Pane *p, bool force) {
@@ -189,31 +317,89 @@ void pane_render(Pane *p, bool force) {
         }
 
         LineAttr *la = &p->syn->lines[lineno];
-        size_t ci = p->scroll_col;
-        for (int col = 0; col < text_w; col++, ci++) {
-            if (ci >= line_len) break;
-            size_t abs = line_start + ci;
-            char ch = gb_at(p->buf, abs); if (ch == '\t') ch = ' ';
+
+        /* UTF-8 aware rendering:
+           - iterate by codepoint (byte pos), track visual column
+           - scroll_col and text_w are in visual columns */
+        size_t byte_pos = line_start; /* current byte position in buffer */
+        size_t vis_col  = 0;          /* current visual column on this line */
+
+        /* Skip characters that are scrolled off to the left */
+        while (byte_pos < line_start + line_len) {
+            uint32_t cp; char tmp[4];
+            int blen_cp = utf8_byte_len((unsigned char)gb_at(p->buf, byte_pos));
+            int avail = (int)(line_start + line_len - byte_pos);
+            if (blen_cp > avail) blen_cp = avail;
+            for (int i = 0; i < blen_cp; i++) tmp[i] = gb_at(p->buf, byte_pos + i);
+            utf8_decode(tmp, (size_t)blen_cp, &cp);
+            int w = (cp == '\t') ? (int)(((vis_col/4)+1)*4 - vis_col) : utf8_cp_width(cp);
+            if (vis_col + (size_t)w > p->scroll_col) break;
+            vis_col += (size_t)w;
+            byte_pos += (size_t)blen_cp;
+        }
+
+        /* Render visible characters */
+        int screen_col = 0; /* columns written to screen so far */
+        while (byte_pos < line_start + line_len && screen_col < text_w - 1) {
+            /* Decode codepoint */
+            char tmp[4]; uint32_t cp;
+            int blen_cp = utf8_byte_len((unsigned char)gb_at(p->buf, byte_pos));
+            int avail = (int)(line_start + line_len - byte_pos);
+            if (blen_cp > avail) blen_cp = avail;
+            for (int i = 0; i < blen_cp; i++) tmp[i] = gb_at(p->buf, byte_pos + i);
+            utf8_decode(tmp, (size_t)blen_cp, &cp);
+
+            int w; /* visual width of this char */
+            if (cp == '\t') {
+                /* Compute actual tab width from absolute visual col */
+                size_t abs_vis = vis_col;
+                w = (int)(((abs_vis/4)+1)*4 - abs_vis);
+                if (screen_col + w > text_w) w = text_w - screen_col;
+            } else {
+                w = utf8_cp_width(cp);
+            }
+
+            /* Don't overflow the line width */
+            if (screen_col + w > text_w) break;
+
+            /* Determine token type using byte offset into line attrs */
+            size_t ci = byte_pos - line_start; /* byte offset within line */
             TokenType tok = (la->attrs && ci < la->len) ? la->attrs[ci] : TOK_NORMAL;
+
             bool sel = false;
             if (p->sel_active) {
                 size_t s0 = min_sz(p->sel_anchor, p->cursor);
                 size_t s1 = max_sz(p->sel_anchor, p->cursor);
-                sel = (abs >= s0 && abs < s1);
+                sel = (byte_pos >= s0 && byte_pos < s1);
             }
-            bool cur = (abs == p->cursor);
+            bool cur = (byte_pos == p->cursor);
+
             wstandend(p->win);
             if      (cur) wattron(p->win, A_REVERSE);
             else if (sel) wattron(p->win, COLOR_PAIR(COLOR_PAIR_SELECTION));
             else {
-                int cp = tok_to_color_pair(tok);
-                wattron(p->win, COLOR_PAIR(cp));
+                int color_pair = tok_to_color_pair(tok);
+                wattron(p->win, COLOR_PAIR(color_pair));
                 if (tok == TOK_KEYWORD || tok == TOK_TYPE) wattron(p->win, A_BOLD);
             }
-            waddch(p->win, ch);
+
+            if (cp == '\t') {
+                for (int i = 0; i < w; i++) waddch(p->win, ' ');
+            } else if (cp < 0x80) {
+                waddch(p->win, (chtype)cp);
+            } else {
+                /* Multi-byte: write raw UTF-8 bytes */
+                tmp[blen_cp] = '\0';
+                waddstr(p->win, tmp);
+            }
+
+            vis_col    += (size_t)w;
+            screen_col += w;
+            byte_pos   += (size_t)blen_cp;
         }
         wstandend(p->win);
-        if (p->cursor == line_end && is_cur_row) {
+        /* Cursor at end of line */
+        if (byte_pos == p->cursor && is_cur_row && screen_col < text_w) {
             wattron(p->win, A_REVERSE); waddch(p->win, ' '); wstandend(p->win);
         }
         wclrtoeol(p->win);
@@ -265,6 +451,7 @@ static void auto_indent_newline(Pane *p) {
     mark_dirty(p);
     li_rebuild(p->li, p->buf);
     cursor_update_line_col(p);
+    p->preferred_col = p->cursor_col;
     pane_scroll_to_cursor(p);
 }
 
@@ -297,46 +484,71 @@ void pane_insert_str(Pane *p, const char *s, size_t n) {
     pane_push_undo(p);
     gb_insert_str(p->buf, p->cursor, s, n); p->cursor += n;
     mark_dirty(p); li_rebuild(p->li, p->buf);
-    cursor_update_line_col(p); pane_scroll_to_cursor(p);
+    cursor_update_line_col(p); p->preferred_col = p->cursor_col; pane_scroll_to_cursor(p);
 }
 
 void pane_delete_char(Pane *p) {
     if (p->cursor == 0) return;
-    char prev = gb_at(p->buf, p->cursor-1);
     size_t blen = gb_len(p->buf);
+    /* Find start of previous codepoint */
+    size_t back = gb_prev_cp(p->buf, p->cursor);
+    size_t prev_pos = p->cursor - back;
+    char prev = gb_at(p->buf, prev_pos);
     const char *open = "{([\"'", *close = "})]\"'";
     const char *cp = strchr(open, prev);
-    if (cp && p->cursor < blen && gb_at(p->buf, p->cursor) == close[cp-open]) {
-        gb_delete(p->buf, p->cursor-1, 2); p->cursor--;
-    } else { gb_delete(p->buf, p->cursor-1, 1); p->cursor--; }
-    pane_push_undo(p); /* push APRÈS suppression */
+    if (back == 1 && cp && p->cursor < blen && gb_at(p->buf, p->cursor) == close[cp-open]) {
+        gb_delete(p->buf, prev_pos, 2); p->cursor = prev_pos;
+    } else {
+        gb_delete(p->buf, prev_pos, back); p->cursor = prev_pos;
+    }
+    pane_push_undo(p);
     mark_dirty(p); li_rebuild(p->li, p->buf);
-    cursor_update_line_col(p); pane_scroll_to_cursor(p);
+    cursor_update_line_col(p); p->preferred_col = p->cursor_col; pane_scroll_to_cursor(p);
 }
 
 void pane_delete_forward(Pane *p) {
-    if (p->cursor >= gb_len(p->buf)) return;
+    size_t len = gb_len(p->buf);
+    if (p->cursor >= len) return;
     pane_push_undo(p);
-    gb_delete(p->buf, p->cursor, 1);
+    size_t adv = gb_next_cp(p->buf, p->cursor);
+    if (adv == 0) adv = 1;
+    gb_delete(p->buf, p->cursor, adv);
     mark_dirty(p); li_rebuild(p->li, p->buf);
-    cursor_update_line_col(p); pane_scroll_to_cursor(p);
+    cursor_update_line_col(p); p->preferred_col = p->cursor_col; pane_scroll_to_cursor(p);
 }
 
 void pane_move_cursor(Pane *p, int dy, int dx) {
     if (p->li->dirty) li_rebuild(p->li, p->buf);
     if (dy != 0) {
+        /* Vertical: use preferred_col (visual), find closest byte offset */
         size_t nl = li_line_count(p->li);
         long tl = (long)p->cursor_line + dy;
         if (tl < 0) tl = 0;
-        if ((size_t)tl >= nl) tl = (long)nl-1;
+        if ((size_t)tl >= nl) tl = (long)nl - 1;
         size_t ls  = li_line_start(p->li, (size_t)tl);
-        size_t nls = ((size_t)tl+1 < nl) ? li_line_start(p->li,(size_t)tl+1)-1 : gb_len(p->buf);
-        size_t ll  = nls >= ls ? nls-ls : 0;
-        p->cursor  = ls + min_sz(p->cursor_col, ll);
+        size_t nls = ((size_t)tl+1 < nl)
+                     ? li_line_start(p->li, (size_t)tl+1) - 1
+                     : gb_len(p->buf);
+        size_t ll  = nls >= ls ? nls - ls : 0;
+        size_t byte_off = vis_col_to_byte_offset(p->buf, ls, ll, p->preferred_col);
+        p->cursor = ls + byte_off;
     }
-    if (dx > 0) { if (p->cursor < gb_len(p->buf)) p->cursor++; }
-    else if (dx < 0) { if (p->cursor > 0) p->cursor--; }
-    cursor_update_line_col(p); pane_scroll_to_cursor(p);
+    if (dx > 0) {
+        size_t adv = gb_next_cp(p->buf, p->cursor);
+        if (adv > 0) p->cursor += adv;
+        cursor_update_line_col(p);
+        p->preferred_col = p->cursor_col;
+        pane_scroll_to_cursor(p);
+        return;
+    } else if (dx < 0) {
+        size_t back = gb_prev_cp(p->buf, p->cursor);
+        if (back > 0) p->cursor -= back;
+        cursor_update_line_col(p);
+        p->preferred_col = p->cursor_col;
+        pane_scroll_to_cursor(p);
+        return;
+    }
+    cursor_update_line_col(p); p->preferred_col = p->cursor_col; pane_scroll_to_cursor(p);
 }
 
 void pane_move_to_line_col(Pane *p, size_t line, size_t col) {
@@ -347,7 +559,7 @@ void pane_move_to_line_col(Pane *p, size_t line, size_t col) {
     p->cursor = ls + col;
     size_t blen = gb_len(p->buf);
     if (p->cursor > blen) p->cursor = blen;
-    cursor_update_line_col(p); pane_scroll_to_cursor(p);
+    cursor_update_line_col(p); p->preferred_col = p->cursor_col; pane_scroll_to_cursor(p);
 }
 
 void pane_kill_line(Pane *p) {
@@ -376,7 +588,7 @@ void pane_kill_whole_line(Pane *p) {
     pane_push_undo(p);
     gb_delete(p->buf, ls, le-ls); p->cursor = ls;
     mark_dirty(p); li_rebuild(p->li, p->buf);
-    cursor_update_line_col(p); pane_scroll_to_cursor(p);
+    cursor_update_line_col(p); p->preferred_col = p->cursor_col; pane_scroll_to_cursor(p);
 }
 
 void pane_undo(Pane *p) {
@@ -384,7 +596,7 @@ void pane_undo(Pane *p) {
     if (us_undo(p->undo, &nb, &nc)) {
         gb_free(p->buf); p->buf = nb; p->cursor = nc;
         mark_dirty(p); li_rebuild(p->li, p->buf);
-        cursor_update_line_col(p); pane_scroll_to_cursor(p);
+        cursor_update_line_col(p); p->preferred_col = p->cursor_col; pane_scroll_to_cursor(p);
     }
 }
 void pane_redo(Pane *p) {
@@ -392,7 +604,7 @@ void pane_redo(Pane *p) {
     if (us_redo(p->undo, &nb, &nc)) {
         gb_free(p->buf); p->buf = nb; p->cursor = nc;
         mark_dirty(p); li_rebuild(p->li, p->buf);
-        cursor_update_line_col(p); pane_scroll_to_cursor(p);
+        cursor_update_line_col(p); p->preferred_col = p->cursor_col; pane_scroll_to_cursor(p);
     }
 }
 
@@ -425,21 +637,21 @@ void pane_paste(Pane *p) {
     gb_insert_str(p->buf, p->cursor, p->clip.text, p->clip.len);
     p->cursor += p->clip.len;
     mark_dirty(p); li_rebuild(p->li, p->buf);
-    cursor_update_line_col(p); pane_scroll_to_cursor(p);
+    cursor_update_line_col(p); p->preferred_col = p->cursor_col; pane_scroll_to_cursor(p);
 }
 
 void pane_search_next(Pane *p) {
     if (!p->search.count) return;
     p->search.current = (p->search.current + 1) % (int)p->search.count;
     p->cursor = p->search.matches[p->search.current];
-    mark_dirty(p); li_rebuild(p->li, p->buf); cursor_update_line_col(p); pane_scroll_to_cursor(p);
+    mark_dirty(p); li_rebuild(p->li, p->buf); cursor_update_line_col(p); p->preferred_col = p->cursor_col; pane_scroll_to_cursor(p);
 }
 
 void pane_search_prev(Pane *p) {
     if (!p->search.count) return;
     p->search.current = (p->search.current - 1 + (int)p->search.count) % (int)p->search.count;
     p->cursor = p->search.matches[p->search.current];
-    mark_dirty(p); li_rebuild(p->li, p->buf); cursor_update_line_col(p); pane_scroll_to_cursor(p);
+    mark_dirty(p); li_rebuild(p->li, p->buf); cursor_update_line_col(p); p->preferred_col = p->cursor_col; pane_scroll_to_cursor(p);
 }
 
 void pane_wipe_file(Pane *p) {
@@ -461,7 +673,9 @@ void pane_wipe_file(Pane *p) {
         close(fd);
     }
     li_rebuild(p->li, p->buf);
-    p->cursor = 0; p->cursor_line = 0; p->cursor_col = 0; p->modified = false;
+    p->cursor = 0; p->cursor_line = 0; p->cursor_col = 0;
+    p->scroll_line = 0; p->scroll_col = 0; p->preferred_col = 0;
+    p->modified = false;
     pane_push_undo(p); mark_dirty(p);
 }
 

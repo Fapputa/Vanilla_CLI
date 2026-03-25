@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import os
 import time
+import subprocess
 import psutil
 from rich.console import Console
 from rich.layout import Layout
@@ -10,6 +11,262 @@ from rich.text import Text
 from rich.live import Live
 
 console = Console()
+
+# Historique utilisation GPU pour graphique défilant
+GRAPH_SIZE = 28
+_latency_history = []
+
+def get_system_volume():
+    """Récupère le volume système via amixer ou pactl"""
+    try:
+        result = subprocess.run(
+            ['pactl', 'get-sink-volume', '@DEFAULT_SINK@'],
+            capture_output=True, text=True, timeout=0.3
+        )
+        if result.returncode == 0:
+            for part in result.stdout.split():
+                if part.endswith('%'):
+                    return float(part.replace('%', ''))
+    except:
+        pass
+    try:
+        result = subprocess.run(
+            ['amixer', 'get', 'Master'],
+            capture_output=True, text=True, timeout=0.3
+        )
+        for line in result.stdout.split('\n'):
+            if '%' in line and ('Playback' in line or 'Front Left' in line):
+                import re
+                m = re.search(r'\[(\d+)%\]', line)
+                if m:
+                    return float(m.group(1))
+    except:
+        pass
+    return 0.0
+
+def get_network_latency():
+    """Mesure la latence réseau : ping ICMP en priorité, fallback TCP socket"""
+    import re, socket, time as _time
+
+    # 1) ping ICMP classique
+    try:
+        result = subprocess.run(
+            ['ping', '-c', '1', '-W', '1', '1.1.1.1'],
+            capture_output=True, text=True, timeout=3
+        )
+        output = result.stdout + result.stderr
+        for line in output.split('\n'):
+            if 'time=' in line:
+                m = re.search(r'time=([0-9]+\.?[0-9]*)\s*ms', line)
+                if m:
+                    val = float(m.group(1))
+                    if val > 0:
+                        return val
+    except Exception:
+        pass
+
+    # 2) Fallback : connexion TCP sur le port 80/443 de plusieurs cibles
+    targets = [
+        ('1.1.1.1',   80),
+        ('8.8.8.8',   53),
+        ('9.9.9.9',   53),
+        ('208.67.222.222', 53),
+    ]
+    for host, port in targets:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(1)
+            t0 = _time.monotonic()
+            s.connect((host, port))
+            ms = (_time.monotonic() - t0) * 1000
+            s.close()
+            if ms > 0:
+                return ms
+        except Exception:
+            pass
+
+    return -1.0
+
+def volume_to_bars(volume_pct):
+    """Convertit un % volume en chaîne de barres ▁▂▃▄▅▆▇█"""
+    chars = "▁▂▃▄▅▆▇█"
+    total = 16  # largeur fixe
+    filled = round(volume_pct / 100 * total)
+    filled = max(0, min(filled, total))
+    if filled == 0:
+        return "─" * total
+    result = ""
+    for i in range(filled):
+        # chaque position prend le char selon sa hauteur relative
+        idx = min(int(i / total * len(chars)), len(chars) - 1)
+        result += chars[idx]
+    return result
+
+BAR_CHARS = " ▁▂▃▄▅▆▇█"
+
+def pct_to_bar_char(pct):
+    """Convertit un pourcentage en caractère de barre"""
+    idx = int(pct / 100 * (len(BAR_CHARS) - 1))
+    idx = max(0, min(idx, len(BAR_CHARS) - 1))
+    return BAR_CHARS[idx]
+
+def build_graph(history, max_val=100):
+    bars = ""
+    for val in history:
+        pct = min(100, (val / max_val * 100)) if max_val > 0 else 0
+        bars += pct_to_bar_char(pct)
+    return bars.rjust(GRAPH_SIZE)
+
+def get_gpu_info():
+    """Récupère utilisation, fréquence et température GPU - priorité NVIDIA"""
+    # NVIDIA
+    try:
+        result = subprocess.run(
+            ['nvidia-smi', '--query-gpu=utilization.gpu,clocks.current.graphics,temperature.gpu',
+             '--format=csv,noheader,nounits'],
+            capture_output=True, text=True, timeout=0.5
+        )
+        if result.returncode == 0:
+            parts = result.stdout.strip().split(',')
+            if len(parts) >= 3:
+                return float(parts[0].strip()), float(parts[1].strip()), float(parts[2].strip())
+    except:
+        pass
+
+    # AMD via sysfs
+    try:
+        base = '/sys/class/drm/card0/device'
+        usage, freq, temp = 0.0, 0.0, 0.0
+        if os.path.exists(f'{base}/gpu_busy_percent'):
+            with open(f'{base}/gpu_busy_percent') as f:
+                usage = float(f.read().strip())
+        if os.path.exists(f'{base}/pp_dpm_sclk'):
+            with open(f'{base}/pp_dpm_sclk') as f:
+                for line in f:
+                    if '*' in line:
+                        freq = float(line.split()[1].replace('Mhz','').replace('MHz','').strip())
+        if os.path.exists(f'{base}/hwmon/hwmon0/temp1_input'):
+            with open(f'{base}/hwmon/hwmon0/temp1_input') as f:
+                temp = int(f.read().strip()) / 1000.0
+        if usage > 0 or freq > 0 or temp > 0:
+            return usage, freq, temp
+    except:
+        pass
+
+    return 0.0, 0.0, 0.0
+
+
+def latency_to_bars(ms):
+    """
+    Convertit une latence en barres visuelles progressives (ordre ▂▅█).
+      ≤ 20ms  → ▂▅█
+      ≤ 100ms → ▂▅
+      ≤ 500ms → ▂
+      > 500ms → (vide)
+    """
+    result = ""
+    if ms <= 500:
+        result += "▂"
+    if ms <= 100:
+        result += "▅"
+    if ms <= 20:
+        result += "█"
+    return result if result else " "
+
+
+def create_gpu_cpu_display():
+    """GPU°C + CPU°C + volume statique + latence réseau défilante"""
+    global _latency_history
+
+    gpu_usage, gpu_freq, gpu_temp = get_gpu_info()
+    cpu_temp = get_cpu_temp()
+
+    volume = get_system_volume()
+    latency = get_network_latency()
+
+    if latency >= 0:
+        _latency_history.append(latency)
+    if len(_latency_history) > GRAPH_SIZE:
+        _latency_history = _latency_history[-GRAPH_SIZE:]
+
+    text = Text()
+    text.append("GPU ", style="bold bright_red")
+    text.append(f"{gpu_temp:.1f}°C", style="bright_yellow")
+    text.append("  CPU ", style="bold bright_red")
+    text.append(f"{cpu_temp:.1f}°C\n\n", style="bright_yellow")
+
+    # Volume - affichage statique
+    text.append("VOL ", style="bold bright_red")
+    text.append(f"{volume:.0f}%\n", style="bright_white")
+    text.append(volume_to_bars(volume) + "\n\n", style="bright_cyan")
+
+    # Latence réseau - barres + ms sur la même ligne, en jaune
+    text.append("PING\n", style="bold bright_red")
+    if latency >= 0:
+        text.append(latency_to_bars(latency) + f"    {latency:.0f}ms\n", style="bright_yellow")
+    else:
+        text.append("N/A\n", style="dim white")
+
+    return text
+    """Récupère utilisation, fréquence et température GPU via nvidia-smi ou sysfs AMD/Intel"""
+    # NVIDIA
+    try:
+        result = subprocess.run(
+            ['nvidia-smi', '--query-gpu=utilization.gpu,clocks.current.graphics,temperature.gpu',
+             '--format=csv,noheader,nounits'],
+            capture_output=True, text=True, timeout=0.5
+        )
+        if result.returncode == 0:
+            parts = result.stdout.strip().split(',')
+            if len(parts) >= 3:
+                usage = float(parts[0].strip())
+                freq = float(parts[1].strip())
+                temp = float(parts[2].strip())
+                return usage, freq, temp
+    except:
+        pass
+
+    # AMD via sysfs
+    try:
+        base = '/sys/class/drm/card0/device'
+        usage_path = f'{base}/gpu_busy_percent'
+        freq_path = f'{base}/pp_dpm_sclk'
+        temp_path = f'{base}/hwmon/hwmon0/temp1_input'
+
+        usage = 0.0
+        if os.path.exists(usage_path):
+            with open(usage_path) as f:
+                usage = float(f.read().strip())
+
+        freq = 0.0
+        if os.path.exists(freq_path):
+            with open(freq_path) as f:
+                for line in f:
+                    if '*' in line:
+                        freq = float(line.split()[1].replace('Mhz','').replace('MHz','').strip())
+
+        temp = 0.0
+        if os.path.exists(temp_path):
+            with open(temp_path) as f:
+                temp = int(f.read().strip()) / 1000.0
+
+        if usage > 0 or freq > 0 or temp > 0:
+            return usage, freq, temp
+    except:
+        pass
+
+    # Intel via sysfs
+    try:
+        for card in os.listdir('/sys/class/drm'):
+            freq_path = f'/sys/class/drm/{card}/device/drm/{card}/gt_cur_freq_mhz'
+            if os.path.exists(freq_path):
+                with open(freq_path) as f:
+                    freq = float(f.read().strip())
+                return 0.0, freq, 0.0
+    except:
+        pass
+
+    return 0.0, 0.0, 0.0
 
 def get_cpu_temp():
     """Récupère la température CPU"""
@@ -31,28 +288,6 @@ def get_cpu_temp():
             return temp
     except:
         return 0
-
-def get_ram_info():
-    """Récupère infos RAM (fréquence et capacité)"""
-    freq = 0
-    try:
-        # Lire la fréquence depuis dmidecode si disponible
-        with open('/proc/meminfo', 'r') as f:
-            for line in f:
-                if 'MemTotal' in line:
-                    # Pas de fréquence directement accessible sans dmidecode
-                    break
-        
-        # Tenter de lire depuis /sys (estimation)
-        freq = 2400  # Valeur par défaut approximative
-    except:
-        freq = 0
-    
-    mem = psutil.virtual_memory()
-    total_gb = mem.total // (1024**3)
-    used_gb = mem.used // (1024**3)
-    
-    return freq, used_gb, total_gb
 
 def get_ssid():
     """Récupère le SSID du réseau WiFi"""
@@ -88,69 +323,6 @@ def get_ssid():
     
     return "NULL"
 
-def create_vertical_bar(pct, height=5):
-    """Crée une barre verticale avec ░▒▓"""
-    lines = []
-    filled = int((pct * height) / 100)
-    
-    for i in range(height):
-        level = height - i - 1
-        if level < filled:
-            if level < height * 0.3:
-                lines.append("▓")
-            elif level < height * 0.6:
-                lines.append("▒")
-            else:
-                lines.append("░")
-        else:
-            lines.append(" ")
-    
-    return lines
-
-def create_cache_display():
-    """Cache CPU avec température"""
-    try:
-        cache_size = 0
-        with open('/proc/cpuinfo', 'r') as f:
-            for line in f:
-                if 'cache size' in line.lower():
-                    parts = line.split(':')
-                    if len(parts) > 1:
-                        cache_str = parts[1].strip().split()[0]
-                        cache_size = int(cache_str)
-                        break
-        
-        temp = get_cpu_temp()
-        
-        text = Text()
-        text.append("CPU CACHE\n", style="bold bright_red")
-        text.append(f"{cache_size} KB\n", style="bright_white")
-        text.append(f"TEMP: ", style="bold bright_red")
-        text.append(f"{temp:.1f}°C\n\n", style="bright_yellow")
-        
-        # Grille 5x5 avec ░▒▓
-        usage = (cache_size % 100)
-        grid_size = 25
-        filled = int((usage * grid_size) / 100)
-        
-        for i in range(5):
-            for j in range(5):
-                idx = i * 5 + j
-                if idx < filled * 0.6:
-                    text.append("▓", style="bright_red")
-                elif idx < filled * 0.8:
-                    text.append("▒", style="yellow")
-                elif idx < filled:
-                    text.append("░", style="bright_white")
-                else:
-                    text.append("░", style="dim white")
-                text.append(" ")
-            text.append("\n")
-        
-        return text
-    except:
-        return Text("CACHE\nN/A", style="bold bright_red")
-
 def create_bar_horizontal(pct, width=10):
     """Barre horizontale avec ■□"""
     filled = int((pct * width) / 100)
@@ -167,8 +339,8 @@ def create_system_info():
     text.append(create_bar_horizontal(cpu_pct, 10), style="bright_yellow")
     text.append("\n\n")
     
-    # GPU (simulation)
-    gpu_pct = 0
+    # GPU
+    gpu_pct, gpu_freq, gpu_temp = get_gpu_info()
     text.append("GPU ", style="bold bright_red")
     text.append(f"{gpu_pct:5.1f}% ", style="bright_white")
     text.append(create_bar_horizontal(gpu_pct, 10), style="bright_yellow")
@@ -193,10 +365,9 @@ def create_system_info():
     text.append(create_bar_horizontal(bat_pct, 10), style="bright_green")
     text.append("\n\n")
     
-    # RAM Info détaillée (CORRECTION: suppression de la barre CPU parasite)
-    freq, used_gb, total_gb = get_ram_info()
-    text.append("RAM FREQ: ", style="bold bright_red")
-    text.append(f"{freq}MHz\n", style="bright_yellow")
+    # GPU FREQ (réutilise les données déjà récupérées)
+    text.append("GPU FREQ: ", style="bold bright_red")
+    text.append(f"{gpu_freq:.0f}MHz\n", style="bright_yellow")
     
     # CPU FREQ (directement en dessous, sans espace)
     cpu_freq = psutil.cpu_freq()
@@ -204,6 +375,9 @@ def create_system_info():
         text.append("CPU FREQ: ", style="bold bright_red")
         text.append(f"{cpu_freq.current:.0f}MHz\n\n", style="bright_yellow")
     
+    mem = psutil.virtual_memory()
+    used_gb = mem.used // (1024**3)
+    total_gb = mem.total // (1024**3)
     text.append("RAM SIZE: ", style="bold bright_red")
     text.append(f"{used_gb}GB / {total_gb}GB\n", style="bright_yellow")
     text.append("    ", style="")
@@ -212,14 +386,8 @@ def create_system_info():
     
     return text
 
-# Variables globales pour calculer les vitesses
-last_net_io = None
-last_time = None
-
 def create_disk_network():
-    """Disque + Réseau avec équaliseur ░▒▓ étendu"""
-    global last_net_io, last_time
-    
+    """Disque + Réseau"""
     text = Text()
     
     # DISK USAGE
@@ -248,57 +416,7 @@ def create_disk_network():
     text.append(f"IF: ", style="bright_white")
     text.append(f"{active_if:8s} ", style="bright_yellow")
     text.append(f"SSID: ", style="bright_white")
-    text.append(f"{ssid}\n\n", style="bright_yellow")
-    
-    # Calculer vitesse réseau
-    net_io = psutil.net_io_counters()
-    current_time = time.time()
-    
-    in_speed = 0
-    out_speed = 0
-    
-    if last_net_io and last_time:
-        time_delta = current_time - last_time
-        if time_delta > 0:
-            in_speed = (net_io.bytes_recv - last_net_io.bytes_recv) / time_delta / 1024
-            out_speed = (net_io.bytes_sent - last_net_io.bytes_sent) / time_delta / 1024
-    
-    last_net_io = net_io
-    last_time = current_time
-    
-    # Équaliseur IN - 10 barres
-    text.append("IN  ", style="bright_white")
-    text.append(f"{int(in_speed):5d}KB/s ", style="bright_yellow")
-    
-    for i in range(10):
-        bars = create_vertical_bar(min(100, in_speed / (10 * (i + 1))), 5)
-        for char in bars:
-            if char == "▓":
-                text.append(char, style="bright_green")
-            elif char == "▒":
-                text.append(char, style="yellow")
-            elif char == "░":
-                text.append(char, style="bright_white")
-            else:
-                text.append(char)
-        text.append(" ")
-    
-    text.append("\nOUT ", style="bright_white")
-    text.append(f"{int(out_speed):5d}KB/s ", style="bright_yellow")
-    
-    # Équaliseur OUT - 10 barres
-    for i in range(10):
-        bars = create_vertical_bar(min(100, out_speed / (10 * (i + 1))), 5)
-        for char in bars:
-            if char == "▓":
-                text.append(char, style="bright_red")
-            elif char == "▒":
-                text.append(char, style="yellow")
-            elif char == "░":
-                text.append(char, style="bright_white")
-            else:
-                text.append(char)
-        text.append(" ")
+    text.append(f"{ssid}\n", style="bright_yellow")
     
     return text
 
@@ -344,7 +462,7 @@ def create_process_table():
 def generate_layout():
     """Layout complet"""
     cache_panel = Panel(
-        create_cache_display(),
+        create_gpu_cpu_display(),
         border_style="bold bright_red",
         padding=(0, 1)
     )

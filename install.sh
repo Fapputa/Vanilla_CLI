@@ -86,10 +86,10 @@ install_python_deps() {
 }
 
 # =============================================================================
-#  4. Build Abyss (C)
+#  4. Build Abyss (C) + lsc + lsc-config
 # =============================================================================
-build_abyss() {
-    info "Building Abyss (C)..."
+build_all() {
+    info "Building all C binaries..."
 
     if [ ! -f "$SCRIPT_DIR/Makefile" ]; then
         fail "No Makefile found in $SCRIPT_DIR."
@@ -98,7 +98,7 @@ build_abyss() {
     cd "$SCRIPT_DIR"
     make clean && make
 
-    ok "Abyss built successfully."
+    ok "All binaries built successfully."
 }
 
 # =============================================================================
@@ -121,6 +121,24 @@ install_to() {
         warn "abyss binary not found after build, skipping."
     fi
 
+    # ── lsc ───────────────────────────────────────────────────────────────────
+    if [ -f "$SCRIPT_DIR/lsc/lsc" ]; then
+        $cp_cmd "$SCRIPT_DIR/lsc/lsc" "$dest/lsc"
+        [ "$use_sudo" = "sudo" ] && sudo chmod +x "$dest/lsc" || chmod +x "$dest/lsc"
+        ok "lsc              → $dest/lsc"
+    else
+        warn "lsc binary not found, skipping."
+    fi
+
+    # ── lsc-config ────────────────────────────────────────────────────────────
+    if [ -f "$SCRIPT_DIR/lsc/lsc-config" ]; then
+        $cp_cmd "$SCRIPT_DIR/lsc/lsc-config" "$dest/lsc-config"
+        [ "$use_sudo" = "sudo" ] && sudo chmod +x "$dest/lsc-config" || chmod +x "$dest/lsc-config"
+        ok "lsc-config       → $dest/lsc-config"
+    else
+        warn "lsc-config binary not found, skipping."
+    fi
+
     # ── Python script wrappers ────────────────────────────────────────────────
     declare -A PY_SCRIPTS=(
         ["monitoring"]="monitoring.py"
@@ -131,16 +149,16 @@ install_to() {
         abs_path="$SCRIPT_DIR/${PY_SCRIPTS[$cmd]}"
         if [ -f "$abs_path" ]; then
             if [ "$use_sudo" = "sudo" ]; then
-                sudo tee "$dest/$cmd" > /dev/null <<EOF
+                sudo tee "$dest/$cmd" > /dev/null <<WRAPPER
 #!/usr/bin/env bash
 exec python3 "$abs_path" "\$@"
-EOF
+WRAPPER
                 sudo chmod +x "$dest/$cmd"
             else
-                tee "$dest/$cmd" > /dev/null <<EOF
+                tee "$dest/$cmd" > /dev/null <<WRAPPER
 #!/usr/bin/env bash
 exec python3 "$abs_path" "\$@"
-EOF
+WRAPPER
                 chmod +x "$dest/$cmd"
             fi
             ok "$cmd  → $dest/$cmd"
@@ -163,7 +181,6 @@ EOF
 }
 
 install_binaries() {
-    # Ensure ~/bin exists and is in PATH
     mkdir -p "$USER_BIN"
     if [[ ":$PATH:" != *":$USER_BIN:"* ]]; then
         warn "$USER_BIN is not in your PATH. Add the following to your ~/.bashrc or ~/.zshrc:"
@@ -199,10 +216,16 @@ print_summary() {
     echo -e "  ${CYAN}wifi_monitoring${NC}  — Network monitor"
     echo -e "  ${CYAN}blackjack${NC}        — Blackjack game"
     echo -e "  ${CYAN}minesweeper${NC}      — Minesweeper game"
+    echo -e "  ${CYAN}lsc${NC}              — ls with custom colors (~/.colorrc)"
+    echo -e "  ${CYAN}lsc-config${NC}       — TUI editor for lsc color rules"
     echo ""
     echo -e "  Installed to:"
     echo -e "  ${CYAN}~/bin${NC}            (user-local)"
     echo -e "  ${CYAN}/usr/local/bin${NC}   (system-wide)"
+    echo ""
+    echo -e "  Tip — add to your ~/.bashrc to replace ls:"
+    echo -e "  ${CYAN}alias ls='lsc'${NC}"
+    echo -e "  ${CYAN}alias lsconfig='lsc-config'${NC}"
     echo ""
 }
 
@@ -217,6 +240,6 @@ echo ""
 detect_pkg_manager
 install_system_deps
 install_python_deps
-build_abyss
+build_all
 install_binaries
 print_summary

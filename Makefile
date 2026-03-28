@@ -17,9 +17,15 @@ SRC     = gap_buf.c  \
 OBJ     = $(SRC:.c=.o)
 TARGET  = abyss
 
-.PHONY: all clean install debug
+LSC_SRC = lsc/lsc.c
+LSC_BIN = lsc/lsc
 
-all: $(TARGET)
+LSC_CFG_SRC = lsc/lsc-config.c
+LSC_CFG_BIN = lsc/lsc-config
+
+.PHONY: all clean install debug lsc lsc-config
+
+all: $(TARGET) lsc lsc-config
 
 $(TARGET): $(OBJ)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
@@ -27,11 +33,19 @@ $(TARGET): $(OBJ)
 %.o: %.c abyss.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+lsc: $(LSC_SRC)
+	$(CC) -O2 -Wall -Wextra -o $(LSC_BIN) $(LSC_SRC)
+
+lsc-config: $(LSC_CFG_SRC)
+	$(CC) -O2 -Wall -Wextra -o $(LSC_CFG_BIN) $(LSC_CFG_SRC) -lncurses
+
 debug: CFLAGS += -g -DDEBUG -fsanitize=address -fno-omit-frame-pointer
 debug: $(TARGET)
 
 clean:
-	rm -f $(OBJ) $(TARGET) ./temp_bin
+	rm -f $(OBJ) $(TARGET) ./temp_bin $(LSC_BIN) $(LSC_CFG_BIN)
 
-install: $(TARGET)
-	install -m 755 $(TARGET) /usr/local/bin/abyss
+install: all
+	install -m 755 $(TARGET)     /usr/local/bin/abyss
+	install -m 755 $(LSC_BIN)    /usr/local/bin/lsc
+	install -m 755 $(LSC_CFG_BIN) /usr/local/bin/lsc-config

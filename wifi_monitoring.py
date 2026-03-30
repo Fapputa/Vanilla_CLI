@@ -10,18 +10,15 @@ import subprocess
 from rich.console import Console
 from rich.layout import Layout
 from rich.panel import Panel
-from rich.table import Table
 from rich.text import Text
 from rich.live import Live
 
 console = Console()
 
-# Cache global pour les données statiques uniquement
 _static_cache = {}
 
 
 def get_screen_info():
-    """Récupère résolution et fréquence via xrandr - CACHED"""
     if 'screen' in _static_cache:
         return _static_cache['screen']
 
@@ -36,7 +33,6 @@ def get_screen_info():
                 continue
 
             if in_connected:
-                # Ligne de mode : "   1920x1080     60.03*+  50.00  ..."
                 if line.startswith('   ') or line.startswith('\t'):
                     parts = line.split()
                     if not parts:
@@ -46,9 +42,8 @@ def get_screen_info():
                         for hz_part in parts[1:]:
                             clean = hz_part.replace('*', '').replace('+', '').strip()
                             if re.match(r'^\d+(\.\d+)?$', clean) and '*' in hz_part:
-                                hz = clean
-                                _static_cache['screen'] = (res_candidate, hz)
-                                return res_candidate, hz
+                                _static_cache['screen'] = (res_candidate, clean)
+                                return res_candidate, clean
                 else:
                     in_connected = False
 
@@ -60,7 +55,6 @@ def get_screen_info():
 
 
 def create_network_blocks():
-    """Affiche les connexions réseau actives en blocs avec bordures"""
     text = Text()
     text.append("NETWORK CONNECTIONS\n\n", style="bold bright_red")
 
@@ -90,7 +84,6 @@ def create_network_blocks():
             remote_ip = remote_parts[0].split('%')[0] if remote_parts else "N/A"
             remote_port = int(remote_parts[1]) if len(remote_parts) > 1 else 0
 
-            # Ignorer IPv6
             if ':' in local_ip or ':' in remote_ip or '[' in local_ip:
                 continue
 
@@ -135,7 +128,6 @@ def create_network_blocks():
 
 
 def get_disk_info():
-    """Récupère les informations sur les disques (temps réel, non caché)"""
     disks = []
     try:
         if not os.path.exists('/sys/block'):
@@ -183,7 +175,6 @@ def get_disk_info():
 
 
 def get_installed_packages():
-    """Compte les paquets installés - CACHED"""
     if 'packages' in _static_cache:
         return _static_cache['packages']
 
@@ -221,12 +212,10 @@ def get_desktop_environment():
 
 
 def get_shell():
-    shell = os.environ.get('SHELL', 'Unknown')
-    return os.path.basename(shell)
+    return os.path.basename(os.environ.get('SHELL', 'Unknown'))
 
 
 def get_cpu_model():
-    """Récupère le modèle CPU - CACHED"""
     if 'cpu_model' in _static_cache:
         return _static_cache['cpu_model']
 
@@ -245,7 +234,6 @@ def get_cpu_model():
 
 
 def get_os_name():
-    """Récupère le nom de l'OS - CACHED"""
     if 'os_name' in _static_cache:
         return _static_cache['os_name']
 
@@ -265,22 +253,19 @@ def get_os_name():
 
 
 def fmt(text, width=40):
-    """Tronque et padde un texte à la largeur donnée"""
     if len(text) > width:
         text = text[:width - 3] + "..."
     return text + " " * max(0, width - len(text))
 
 
 def create_system_info():
-    """Infos système détaillées"""
     text = Text()
     text.append("SYSTEM INFORMATION\n\n", style="bold bright_red")
 
     W = 40
 
     def row(label, value, style="bright_white"):
-        line = f"{label:<13s}{value}"
-        text.append(fmt(line, W) + "\n", style=style)
+        text.append(fmt(f"{label:<13s}{value}", W) + "\n", style=style)
 
     pkg_count, pkg_manager = get_installed_packages()
     row("Packages:", f"{pkg_count} ({pkg_manager})")
@@ -298,14 +283,10 @@ def create_system_info():
     term = os.environ.get('TERM_PROGRAM', os.environ.get('TERM', 'Unknown'))
     row("Terminal:", term)
 
-    boot_time = psutil.boot_time()
-    uptime_seconds = time.time() - boot_time
-    uptime_hours = int(uptime_seconds // 3600)
-    uptime_minutes = int((uptime_seconds % 3600) // 60)
-    row("Uptime:", f"{uptime_hours}h {uptime_minutes}m")
+    uptime_seconds = time.time() - psutil.boot_time()
+    row("Uptime:", f"{int(uptime_seconds // 3600)}h {int((uptime_seconds % 3600) // 60)}m")
 
-    cpu_model = get_cpu_model()
-    row("CPU:", cpu_model[:25])
+    row("CPU:", get_cpu_model()[:25])
 
     cpu_count = psutil.cpu_count(logical=False)
     cpu_threads = psutil.cpu_count(logical=True)
@@ -363,7 +344,6 @@ def create_system_info():
 
 
 def generate_layout():
-    """Génère le layout complet (réseau + système)"""
     net_panel = Panel(
         create_network_blocks(),
         border_style="bold bright_red",
@@ -387,7 +367,7 @@ def generate_layout():
 
 def main():
     os.system('clear')
-    print("\033[?25l", end='', flush=True)  # Cacher le curseur
+    print("\033[?25l", end='', flush=True)
 
     try:
         with Live(generate_layout(), refresh_per_second=0.5, screen=False) as live:
@@ -397,7 +377,7 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        print("\033[?25h", end='', flush=True)  
+        print("\033[?25h", end='', flush=True)
         os.system('clear')
 
 

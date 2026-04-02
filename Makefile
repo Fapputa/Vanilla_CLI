@@ -17,11 +17,11 @@ SRC     = gap_buf.c  \
 OBJ     = $(SRC:.c=.o)
 TARGET  = abyss
 
-LSC_SRC = lsc/lsc.c
-LSC_BIN = lsc/lsc
+LSC_SRC = lsc.c
+LSC_BIN = lsc
 
-LSC_CFG_SRC = lsc/lsc-config.c
-LSC_CFG_BIN = lsc/lsc-config
+LSC_CFG_SRC = lsc-config.c
+LSC_CFG_BIN = lsc-config
 
 .PHONY: all clean install debug lsc lsc-config
 

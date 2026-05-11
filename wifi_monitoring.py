@@ -133,14 +133,19 @@ def get_disk_info():
         if not os.path.exists('/sys/block'):
             return disks
 
-        disk_devices = sorted(d for d in os.listdir('/sys/block') if d.startswith('sd'))
+        # Détecte sda*, nvme*, vd*, hda*
+        all_blocks = os.listdir('/sys/block')
+        disk_devices = sorted(
+            d for d in all_blocks
+            if re.match(r'^(sd[a-z]+|nvme\d+n\d+|vd[a-z]+|hd[a-z]+)$', d)
+        )
 
         mounts = {}
         try:
             with open('/proc/mounts', 'r') as f:
                 for line in f:
                     parts = line.split()
-                    if len(parts) >= 3 and parts[0].startswith('/dev/sd'):
+                    if len(parts) >= 3 and re.match(r'^/dev/(sd|nvme|vd|hd)', parts[0]):
                         device, mountpoint, fstype = parts[0], parts[1], parts[2]
                         if 'snap' not in mountpoint:
                             mounts[device] = f"{mountpoint} ({fstype})"
@@ -158,7 +163,8 @@ def get_disk_info():
 
                 mount_info = [
                     mount_str for device, mount_str in mounts.items()
-                    if device.startswith('/dev/' + disk)
+                    if os.path.basename(device).startswith(disk) or
+                       device == f'/dev/{disk}'
                 ]
 
                 disks.append({
@@ -172,6 +178,80 @@ def get_disk_info():
         pass
 
     return disks
+
+
+def get_gpu_info():
+    if 'gpu' in _static_cache:
+        return _static_cache['gpu']
+
+    # Essai 1 : nvidia-smi (NVIDIA en priorité absolue)
+    try:
+        result = subprocess.run(
+            ['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'],
+            capture_output=True, text=True, timeout=3
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            gpu = result.stdout.strip().splitlines()[0]
+            _static_cache['gpu'] = gpu
+            return gpu
+    except Exception:
+        pass
+
+    # Essai 2 : lspci — cherche NVIDIA d'abord, puis AMD, puis tout autre GPU discret
+    try:
+        result = subprocess.run(
+            ['lspci'],
+            capture_output=True, text=True, timeout=3
+        )
+        lines = result.stdout.splitlines()
+
+        # Ordre de préférence : NVIDIA > AMD/ATI > autre discret (pas Intel)
+        def gpu_priority(line):
+            l = line.upper()
+            if 'NVIDIA' in l:
+                return 0
+            if 'AMD' in l or 'ATI' in l:
+                return 1
+            if 'INTEL' not in l:
+                return 2
+            return 99  # Intel intégré en dernier recours
+
+        candidates = []
+        for line in lines:
+            if re.search(r'VGA|3D controller|Display controller', line, re.IGNORECASE):
+                match = re.search(
+                    r'(?:VGA compatible controller|3D controller|Display controller):\s*(.+)',
+                    line, re.IGNORECASE
+                )
+                if match:
+                    name = match.group(1).strip()
+                    name = re.sub(r'\s*\[.*?\]', '', name).strip()
+                    candidates.append((gpu_priority(line), name))
+
+        if candidates:
+            candidates.sort(key=lambda x: x[0])
+            gpu = candidates[0][1]
+            _static_cache['gpu'] = gpu
+            return gpu
+    except Exception:
+        pass
+
+    # Essai 3 : /sys/class/drm (fallback GPU intégré / ARM)
+    try:
+        drm_path = '/sys/class/drm'
+        for entry in sorted(os.listdir(drm_path)):
+            product_path = os.path.join(drm_path, entry, 'device', 'product')
+            if os.path.exists(product_path):
+                with open(product_path, 'r') as f:
+                    gpu = f.read().strip()
+                    if gpu:
+                        _static_cache['gpu'] = gpu
+                        return gpu
+    except Exception:
+        pass
+
+    _static_cache['gpu'] = "Unknown"
+    return "Unknown"
 
 
 def get_installed_packages():
@@ -201,14 +281,6 @@ def get_installed_packages():
 
 def get_python_version():
     return f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
-
-
-def get_desktop_environment():
-    desktop = os.environ.get('XDG_CURRENT_DESKTOP', 'Unknown')
-    session = os.environ.get('DESKTOP_SESSION', 'Unknown')
-    if desktop == 'Unknown' and session != 'Unknown':
-        return session
-    return desktop
 
 
 def get_shell():
@@ -273,7 +345,6 @@ def create_system_info():
     row("Arch:", platform.machine())
     row("OS:", get_os_name())
     row("Kernel:", platform.release())
-    row("DE:", get_desktop_environment())
 
     res, hz = get_screen_info()
     row("Display:", f"{res} @ {hz}Hz")
@@ -285,6 +356,8 @@ def create_system_info():
 
     uptime_seconds = time.time() - psutil.boot_time()
     row("Uptime:", f"{int(uptime_seconds // 3600)}h {int((uptime_seconds % 3600) // 60)}m")
+
+    row("GPU:", get_gpu_info()[:25])  # ← ajouté entre Uptime et CPU
 
     row("CPU:", get_cpu_model()[:25])
 
@@ -318,9 +391,9 @@ def create_system_info():
             left = disks[i]
             right = disks[i + 1] if i + 1 < len(disks) else None
 
-            left_header = f"{left['name']:4s} {left['size']:6.1f}GB"
+            left_header = f"{left['name']:8s} {left['size']:6.1f}GB"
             if right:
-                right_header = f"{right['name']:4s} {right['size']:6.1f}GB"
+                right_header = f"{right['name']:8s} {right['size']:6.1f}GB"
                 header_line = f"{left_header:<20s}{right_header}"
             else:
                 header_line = left_header

@@ -88,18 +88,16 @@ def get_network_latency():
     return -1.0
 
 def volume_to_bars(volume_pct):
-    """Convertit un % volume en chaîne de barres ▁▂▃▄▅▆▇█"""
-    chars = "▁▂▃▄▅▆▇█"
-    total = 16  # largeur fixe
+    """Convertit un % volume en 5 barres progressives ▁▂▃▄▅"""
+    chars = ["▁", "▂", "▃", "▄", "▅"]
+    total = 5
     filled = round(volume_pct / 100 * total)
     filled = max(0, min(filled, total))
     if filled == 0:
         return "─" * total
     result = ""
     for i in range(filled):
-        # chaque position prend le char selon sa hauteur relative
-        idx = min(int(i / total * len(chars)), len(chars) - 1)
-        result += chars[idx]
+        result += chars[i]
     return result
 
 BAR_CHARS = " ▁▂▃▄▅▆▇█"
@@ -203,7 +201,7 @@ def create_gpu_cpu_display():
     # Latence réseau - barres + ms sur la même ligne, en jaune
     text.append("PING\n", style="bold bright_red")
     if latency >= 0:
-        text.append(latency_to_bars(latency) + f"    {latency:.0f}ms\n", style="bright_yellow")
+        text.append(latency_to_bars(latency) + f"   {latency:.0f}ms\n", style="bright_yellow")
     else:
         text.append("N/A\n", style="dim white")
 
@@ -325,7 +323,7 @@ def get_ssid():
 
 def create_bar_horizontal(pct, width=10):
     """Barre horizontale avec ■□"""
-    filled = int((pct * width) / 100)
+    filled = min(int((pct * width) / 100), width)
     return "■" * filled + "□" * (width - filled)
 
 def create_system_info():

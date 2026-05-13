@@ -252,6 +252,41 @@ void  pane_search_prev(Pane *p);
 void  pane_cursor_line_col(const Pane *p, size_t *line, size_t *col);
 void  pane_push_undo(Pane *p);
 void  pane_wipe_file(Pane *p);
+void  pane_beautify(Pane *p);
+
+/* ─── File Tree Navigator ─────────────────────────────────────────── */
+#define TREE_DEFAULT_W  26
+#define TREE_MIN_W      18
+#define TREE_MAX_W      48
+
+typedef struct {
+    char   name[256];
+    bool   is_dir;
+    bool   is_lnk;
+    bool   is_exe;
+    size_t size;
+} FTEntry;
+
+typedef struct {
+    char     cwd[4096];
+    FTEntry *entries;
+    size_t   count;
+    size_t   cap;
+    size_t   selected;
+    size_t   scroll;
+    bool     visible;
+    int      width;
+    WINDOW  *win;
+} FileTree;
+
+FileTree   *ft_new(void);
+void        ft_free(FileTree *ft);
+void        ft_reload(FileTree *ft);
+void        ft_enter(FileTree *ft);
+void        ft_go_up(FileTree *ft);
+const char *ft_selected_path(FileTree *ft, char *buf, size_t bufsz);
+void        ft_render(FileTree *ft, WINDOW *win, int win_h, int win_w, bool is_active);
+bool        ft_handle_key(FileTree *ft, int key, char *open_path, size_t path_sz);
 
 /* ─── Editor (global state) ──────────────────────────────────── */
 #define MAX_PANES 4
@@ -289,6 +324,9 @@ typedef struct {
 
     bool       running;
     bool       show_shortcuts;
+
+    bool       tree_focus;   /* true = focus sur le file tree */
+    FileTree  *tree;
 
     pthread_t  save_thread;
     bool       save_pending;

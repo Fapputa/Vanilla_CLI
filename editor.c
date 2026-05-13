@@ -16,6 +16,25 @@ static void layout_windows(void) {
     int edit_h   = rows - title_h - status_h - out_h;
     if (edit_h < 1) edit_h = 1;
 
+    /* ── File tree panel (à droite) ── */
+    int tree_w = 0;
+    if (E.tree && E.tree->visible) {
+        tree_w = E.tree->width;
+        if (tree_w < TREE_MIN_W) tree_w = TREE_MIN_W;
+        if (tree_w > cols / 2)   tree_w = cols / 2;
+        int tree_x = cols - tree_w;
+        if (!E.tree->win)
+            E.tree->win = newwin(edit_h, tree_w, title_h, tree_x);
+        else {
+            mvwin(E.tree->win, title_h, tree_x);
+            wresize(E.tree->win, edit_h, tree_w);
+        }
+    }
+
+    int edit_x = 0;
+    int edit_cols = cols - tree_w;
+    if (edit_cols < 1) edit_cols = 1;
+
     if (!E.title_win)  E.title_win  = newwin(title_h, cols, 0, 0);
     else { mvwin(E.title_win, 0, 0); wresize(E.title_win, title_h, cols); }
 
@@ -28,11 +47,11 @@ static void layout_windows(void) {
     else { mvwin(E.status_win, rows - 1, 0); wresize(E.status_win, status_h, cols); }
 
     int npanes = E.npanes < 1 ? 1 : E.npanes;
-    int pane_w = (cols - (npanes - 1)) / npanes;
+    int pane_w = (edit_cols - (npanes - 1)) / npanes;
 
     for (int i = 0; i < E.npanes; i++) {
         Pane *p = E.panes[i];
-        int px = i * (pane_w + 1);
+        int px = edit_x + i * (pane_w + 1);
         int pw = (i == E.npanes - 1) ? (cols - px) : pane_w;
         if (pw < 1) pw = 1;
         if (!p->win) p->win = newwin(edit_h, pw, title_h, px);
@@ -56,15 +75,17 @@ static void render_title(void) {
         else
             wprintw(E.title_win,
                 " ^O:Save  ^K:DelLine  ^B:Run  ^F:Find  ^Z:Undo"
-                "  ^R:LineNums  ^W:Wipe  F2:Hex  ^A:Help  ^Q:Quit");
+                "  ^R:LineNums  ^W:Wipe  ^D:Beautify  F1:Tree  F2:Hex  ^A:Help  ^Q:Quit");
     } else {
         bool mod = ap->hex_mode ? (ap->hex && ap->hex->modified) : ap->modified;
-        const char *hex_tag = ap->hex_mode ? "  [HEX]" : "";
+        const char *hex_tag  = ap->hex_mode ? "  [HEX]" : "";
+        const char *tree_tag = (E.tree && E.tree->visible && E.tree_focus) ? "  [TREE]" : "";
         if (ap->filename[0])
-            wprintw(E.title_win, " Abyss  |  %s%s%s  |  ^A for shortcuts",
-                    ap->filename, mod ? " *" : "", hex_tag);
+            wprintw(E.title_win, " Abyss  |  %s%s%s%s  |  ^A for shortcuts",
+                    ap->filename, mod ? " *" : "", hex_tag, tree_tag);
         else
-            wprintw(E.title_win, " Abyss  |  [No File]  |  ^A for shortcuts");
+            wprintw(E.title_win, " Abyss  |  [No File]%s%s  |  ^A for shortcuts",
+                    hex_tag, tree_tag);
     }
     wclrtoeol(E.title_win);
     wattroff(E.title_win, COLOR_PAIR(COLOR_PAIR_TITLE) | A_BOLD);
@@ -120,7 +141,9 @@ static void render_pane_borders(void) {
     int title_h = 1, status_h = 1;
     int out_h   = E.out_visible ? (rows / 3) : 0;
     int edit_h  = rows - title_h - status_h - out_h;
-    int pane_w  = (cols - (E.npanes - 1)) / E.npanes;
+    int tree_w  = (E.tree && E.tree->visible) ? E.tree->width : 0;
+    int edit_cols = cols - tree_w;
+    int pane_w  = (edit_cols - (E.npanes - 1)) / E.npanes;
     for (int i = 0; i < E.npanes - 1; i++) {
         int bx = (i + 1) * (pane_w + 1) - 1;
         int cp = (i == E.active || i+1 == E.active)
@@ -187,6 +210,16 @@ static void full_redraw(bool force) {
             hex_render(p->hex, p->win, p->win_h, p->win_w);
         else
             pane_render(p, force);
+    }
+    /* File tree */
+    if (E.tree && E.tree->visible && E.tree->win) {
+        int rows, cols; getmaxyx(stdscr, rows, cols);
+        int title_h = 1, status_h = 1;
+        int out_h = E.out_visible ? (rows / 3) : 0;
+        int edit_h = rows - title_h - status_h - out_h;
+        if (edit_h < 1) edit_h = 1;
+        ft_render(E.tree, E.tree->win, edit_h, E.tree->width, E.tree_focus);
+        (void)cols;
     }
     render_pane_borders();
     render_title();
@@ -325,6 +358,62 @@ static void open_dialog(EditorMode m, const char *prefill) {
 /* ─── Key handling ────────────────────────────────────────────── */
 
 static void handle_key_normal(int key) {
+    /* ── F1 : toggle file tree ───────────────────────────────────── */
+    if (key == KEY_F(1)) {
+        if (E.tree) {
+            E.tree->visible = !E.tree->visible;
+            if (!E.tree->visible) E.tree_focus = false;
+            else                  E.tree_focus = true;
+        }
+        layout_windows();
+        force_full_dirty();
+        return;
+    }
+
+    /* ── Focus / unfocus le tree avec Tab quand il est visible ─────── */
+    /* Tab bascule focus tree ↔ éditeur (seulement si tree visible) */
+    if (key == '\t' && E.tree && E.tree->visible) {
+        /* En mode hex le Tab est utilisé pour basculer hex↔ascii,
+           donc on le laisse passer si hex_mode */
+        Pane *ap2 = E.panes[E.active];
+        if (!ap2->hex_mode) {
+            E.tree_focus = !E.tree_focus;
+            return;
+        }
+    }
+
+    /* ── Routing vers le tree si focus ──────────────────────────── */
+    if (E.tree_focus && E.tree && E.tree->visible) {
+        char open_path[4096] = "";
+        bool consumed = ft_handle_key(E.tree, key, open_path, sizeof open_path);
+        if (open_path[0]) {
+            /* Ouvrir le fichier dans le pane actif */
+            Pane *ap2 = E.panes[E.active];
+            gb_free(ap2->buf);  ap2->buf = gb_new(GAP_DEFAULT);
+            li_free(ap2->li);   ap2->li  = li_new();
+            syn_free(ap2->syn); ap2->syn = syn_new(LANG_C);
+            ap2->cursor = 0;
+            pane_open_file(ap2, open_path);
+            /* Mettre à jour le cwd du tree vers le répertoire du fichier */
+            char tmp[4096];
+            strncpy(tmp, open_path, sizeof tmp - 1);
+            char *slash = strrchr(tmp, '/');
+            if (slash && slash != tmp) {
+                *slash = '\0';
+                char resolved[4096];
+                if (realpath(tmp, resolved))
+                    strncpy(E.tree->cwd, resolved, sizeof E.tree->cwd - 1);
+                ft_reload(E.tree);
+            }
+            E.tree_focus = false;   /* revenir au focus éditeur */
+            layout_windows();
+            force_full_dirty();
+        } else if (consumed) {
+            /* simple navigation dans le tree, juste redraw */
+        }
+        if (consumed) return;
+    }
+
     Pane *ap = E.panes[E.active];
 
     /* ── Hex mode ─────────────────────────────────────────────── */
@@ -414,12 +503,18 @@ static void handle_key_normal(int key) {
             pane_scroll_to_cursor(ap);
             break;
         case 'w'&0x1f:
-            if (ap->filename[0]) pane_wipe_file(ap);
+            pane_wipe_file(ap);
             break;
         case 'l'&0x1f: editor_split(); layout_windows(); break;
         case 'e'&0x1f: editor_focus_next(); break;
         case 'g'&0x1f: open_dialog(MODE_GOTO_LINE, NULL); break;
         case 'a'&0x1f: E.show_shortcuts = !E.show_shortcuts; break;
+
+        /* Ctrl+D : beautify (strip emojis + comments) */
+        case 'd'&0x1f:
+            pane_beautify(ap);
+            force_full_dirty();
+            break;
 
         /* F2 — entrer en hex mode */
         case KEY_F(2):
@@ -492,6 +587,8 @@ void editor_init(void) {
     E.npanes   = 1;
     E.active   = 0;
     E.running  = true;
+    E.tree     = ft_new();
+    E.tree_focus = false;  /* focus sur l'éditeur par défaut */
 }
 
 void editor_split(void) {
@@ -532,6 +629,10 @@ void editor_cleanup(void) {
     if (E.title_win)  delwin(E.title_win);
     if (E.status_win) delwin(E.status_win);
     if (E.out_win)    delwin(E.out_win);
+    if (E.tree) {
+        if (E.tree->win) delwin(E.tree->win);
+        ft_free(E.tree);
+    }
     free(E.out_text);
     pthread_mutex_destroy(&E.save_mutex);
     unlink("./temp_bin");
@@ -546,6 +647,7 @@ void editor_run(const char *initial_file) {
     set_escdelay(25);
     curs_set(0);
     colors_init();
+    use_default_colors();  /* bg=-1 dans init_pair = fond terminal transparent */
     hex_colors_init();
 
     printf("\033[?2004h"); fflush(stdout);
@@ -573,47 +675,115 @@ void editor_run(const char *initial_file) {
         WINDOW *iw = E.panes[E.active]->win;
         int key = wgetch(iw ? iw : stdscr);
 
+        if (key == 0 || key == ERR || key == 0x16) continue;
+
         if (key == KEY_RESIZE) {
             endwin(); refresh();
             layout_windows(); full_redraw(true);
             continue;
         }
 
-        /* Bracketed paste */
+        /* Escape sequence dispatcher.
+         * Reads up to 8 extra bytes (short timeout) to recognise:
+         *   Ctrl+Tab sequences from common terminals:
+         *     xterm        ESC [ 2 7 ; 5 ; 9 ~
+         *     xterm-alt    ESC [ 1 ; 5 I
+         *     kitty        ESC [ 9 ; 5 u
+         *     Shift+Tab    ESC [ Z          (fallback, same action)
+         *   Bracketed paste markers (handled as before).
+         *   Anything else: bytes pushed back unchanged.
+         */
         if (key == 27) {
             wtimeout(iw ? iw : stdscr, 5);
-            int c1 = wgetch(iw ? iw : stdscr);
-            if (c1 == '[') {
-                int c2=wgetch(iw?iw:stdscr), c3=wgetch(iw?iw:stdscr);
-                int c4=wgetch(iw?iw:stdscr), c5=wgetch(iw?iw:stdscr);
-                int c6=wgetch(iw?iw:stdscr);
-                wtimeout(iw ? iw : stdscr, -1);
-                if (c2=='2'&&c3=='0'&&c4=='0'&&c5=='~') {
+            int sq[8]; int sn = 0;
+            for (; sn < 8; sn++) {
+                sq[sn] = wgetch(iw ? iw : stdscr);
+                if (sq[sn] == ERR) { sn--; break; }
+            }
+            sn++; if (sn < 0) sn = 0;
+            wtimeout(iw ? iw : stdscr, -1);
+
+            bool consumed = false;
+
+            if (sn >= 1 && sq[0] == '[') {
+
+                /* ESC [ Z  -- Shift+Tab (many terminals) */
+                if (!consumed && sn >= 2 && sq[1] == 'Z') {
+                    for (int si = sn-1; si >= 2; si--)
+                        if (sq[si]!=ERR) ungetch(sq[si]);
+                    key = KEY_BTAB; consumed = true;
+                }
+
+                /* ESC [ 2 7 ; 5 ; 9 ~  -- xterm Ctrl+Tab */
+                if (!consumed && sn >= 6
+                        && sq[1]=='2' && sq[2]=='7'
+                        && sq[3]==';' && sq[4]=='5' && sq[5]==';') {
+                    int n9  = (sn > 6) ? sq[6] : ERR;
+                    int ntl = (sn > 7) ? sq[7] : ERR;
+                    if (n9 == '9') {
+                        if (ntl != '~' && ntl != ERR) ungetch(ntl);
+                        key = KEY_BTAB; consumed = true;
+                    }
+                }
+
+                /* ESC [ 1 ; 5 I  -- xterm alternate Ctrl+Tab */
+                if (!consumed && sn >= 5
+                        && sq[1]=='1' && sq[2]==';' && sq[3]=='5' && sq[4]=='I') {
+                    for (int si = sn-1; si >= 5; si--)
+                        if (sq[si]!=ERR) ungetch(sq[si]);
+                    key = KEY_BTAB; consumed = true;
+                }
+
+                /* ESC [ 9 ; 5 u  -- kitty Ctrl+Tab */
+                if (!consumed && sn >= 5
+                        && sq[1]=='9' && sq[2]==';' && sq[3]=='5' && sq[4]=='u') {
+                    for (int si = sn-1; si >= 5; si--)
+                        if (sq[si]!=ERR) ungetch(sq[si]);
+                    key = KEY_BTAB; consumed = true;
+                }
+
+                /* ESC [ 2 0 0 ~  -- bracketed paste start */
+                if (!consumed && sn >= 5
+                        && sq[1]=='2' && sq[2]=='0'
+                        && sq[3]=='0' && sq[4]=='~') {
                     in_paste=true; paste_len=0;
-                    if (c6!=ERR && paste_len<(int)sizeof(paste_batch)-1)
-                        paste_batch[paste_len++]=(char)c6;
+                    if (sn > 5 && sq[5]!=ERR
+                            && paste_len<(int)sizeof(paste_batch)-1)
+                        paste_batch[paste_len++]=(char)sq[5];
+                    for (int si = sn-1; si >= 6; si--)
+                        if (sq[si]!=ERR) ungetch(sq[si]);
+                    consumed = true;
                     continue;
-                } else if (c2=='2'&&c3=='0'&&c4=='1'&&c5=='~') {
+                }
+
+                /* ESC [ 2 0 1 ~  -- bracketed paste end */
+                if (!consumed && sn >= 5
+                        && sq[1]=='2' && sq[2]=='0'
+                        && sq[3]=='1' && sq[4]=='~') {
                     if (in_paste && paste_len>0 && E.mode==MODE_NORMAL) {
                         paste_batch[paste_len]='\0';
-                        Pane *ap=E.panes[E.active];
-                        if (!ap->hex_mode)
-                            pane_insert_str(ap, paste_batch, paste_len);
+                        Pane *ap2=E.panes[E.active];
+                        if (!ap2->hex_mode)
+                            pane_insert_str(ap2, paste_batch, paste_len);
                     }
                     in_paste=false; paste_len=0;
-                    if (c6!=ERR) ungetch(c6);
+                    for (int si = sn-1; si >= 5; si--)
+                        if (sq[si]!=ERR) ungetch(sq[si]);
+                    consumed = true;
                     full_redraw(true); continue;
-                } else {
-                    if (c6!=ERR) ungetch(c6);
-                    if (c5!=ERR) ungetch(c5);
-                    if (c4!=ERR) ungetch(c4);
-                    if (c3!=ERR) ungetch(c3);
-                    if (c2!=ERR) ungetch(c2);
+                }
+
+                /* Unknown ESC [ sequence -- push everything back */
+                if (!consumed) {
+                    for (int si = sn-1; si >= 0; si--)
+                        if (sq[si]!=ERR) ungetch(sq[si]);
                 }
             } else {
-                wtimeout(iw ? iw : stdscr, -1);
-                if (c1!=ERR) ungetch(c1);
+                /* Not ESC [ -- push back */
+                for (int si = sn-1; si >= 0; si--)
+                    if (sq[si]!=ERR) ungetch(sq[si]);
             }
+            (void)consumed;
         }
 
         if (in_paste) {

@@ -655,23 +655,20 @@ void pane_search_prev(Pane *p) {
 }
 
 void pane_wipe_file(Pane *p) {
-    if (!p->filename[0]) return;
-    char cmd[4200];
-    snprintf(cmd, sizeof cmd, "shred -uz \"%s\" 2>&1", p->filename);
-    int _r = system(cmd); (void)_r;
+    struct stat _st;
+    bool file_exists = p->filename[0] && stat(p->filename, &_st) == 0;
+
+    if (file_exists) {
+        /* Fichier sur disque : shred puis vider */
+        char cmd[4200];
+        snprintf(cmd, sizeof cmd, "shred -uz \"%s\" 2>&1", p->filename);
+        int _r = system(cmd); (void)_r;
+        p->filename[0] = '\0';
+    }
+    /* Dans tous les cas : vider le buffer éditeur */
     gb_free(p->buf); p->buf = gb_new(GAP_DEFAULT);
     li_free(p->li);  p->li  = li_new();
     syn_free(p->syn); p->syn = syn_new(p->lang);
-    int fd = open(p->filename, O_RDONLY);
-    if (fd >= 0) {
-        struct stat st; fstat(fd, &st);
-        size_t sz = (size_t)st.st_size;
-        if (sz > 0) {
-            void *m = mmap(NULL, sz, PROT_READ, MAP_PRIVATE, fd, 0);
-            if (m != MAP_FAILED) { gb_insert_str(p->buf, 0, (const char*)m, sz); munmap(m,sz); }
-        }
-        close(fd);
-    }
     li_rebuild(p->li, p->buf);
     p->cursor = 0; p->cursor_line = 0; p->cursor_col = 0;
     p->scroll_line = 0; p->scroll_col = 0; p->preferred_col = 0;

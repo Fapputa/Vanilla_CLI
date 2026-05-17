@@ -1,7 +1,7 @@
 CC      = gcc
 CFLAGS  = -O2 -march=native -Wall -Wextra -Wno-unused-parameter \
           -D_GNU_SOURCE -D_POSIX_C_SOURCE=200809L
-LDFLAGS = -lncurses -lpthread
+LDFLAGS = -lncurses -lpthread -lm
 
 SRC     = gap_buf.c  \
           line_idx.c \
@@ -13,6 +13,7 @@ SRC     = gap_buf.c  \
           run.c      \
           hex.c      \
           filetree.c \
+          fileinfo.c \
           beautify.c \
           editor.c
 

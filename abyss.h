@@ -288,6 +288,26 @@ const char *ft_selected_path(FileTree *ft, char *buf, size_t bufsz);
 void        ft_render(FileTree *ft, WINDOW *win, int win_h, int win_w, bool is_active);
 bool        ft_handle_key(FileTree *ft, int key, char *open_path, size_t path_sz);
 
+/* ─── File Inspector Panel ─────────────────────────────────────── */
+#define FILEINFO_DEFAULT_W  36
+#define FILEINFO_MIN_W      28
+#define FILEINFO_MAX_W      56
+
+typedef struct {
+    char    path[4096];
+    bool    has_data;
+    bool    visible;
+    int     width;
+    int     scroll_row;   /* scroll offset for fi_render (keys J/K in fi panel) */
+    WINDOW *win;
+} FileInfo;
+
+FileInfo *fi_new(void);
+void      fi_free(FileInfo *fi);
+void      fi_analyze(FileInfo *fi, const char *path);
+void      fi_render(FileInfo *fi, WINDOW *win, int win_h, int win_w);
+void      fi_colors_init(void);
+
 /* ─── Editor (global state) ──────────────────────────────────── */
 #define MAX_PANES 4
 
@@ -327,6 +347,8 @@ typedef struct {
 
     bool       tree_focus;   /* true = focus sur le file tree */
     FileTree  *tree;
+
+    FileInfo  *finfo;        /* F3 file inspector panel */
 
     pthread_t  save_thread;
     bool       save_pending;

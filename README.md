@@ -18,10 +18,10 @@ Vanilla_CLI/
 │   ├── clip               -- Copy a file to the clipboard
 │   ├── compil             -- Smart compiler/runner
 │   ├── redem              -- WiFi driver reset
-│   ├── tree               -- Directory tree view
+│   └── tree               -- Directory tree view
 ├── bin/
-│   ├── blackjack      -- Blackjack game
-│   └── minesweeper    -- Minesweeper game
+│   ├── blackjack          -- Blackjack game
+│   └── minesweeper        -- Minesweeper game
 └── scripts/
     ├── monitoring.py      -- System dashboard
     └── wifi_monitoring.py -- Network monitor
@@ -92,7 +92,10 @@ abyss main.c
 | `Ctrl + B` | Compile and run (via `compil`) |
 | `Ctrl + N` | Split screen view |
 | `Ctrl + K` | Delete current line |
+| `Ctrl + D` | Beautify / auto-format |
+| `F1` | File tree navigator |
 | `F2` | Hex view |
+| `F3` | File inspector |
 
 ---
 

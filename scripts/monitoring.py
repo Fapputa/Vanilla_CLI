@@ -12,7 +12,6 @@ from rich.live import Live
 
 console = Console()
 
-# Historique utilisation GPU pour graphique défilant
 GRAPH_SIZE = 28
 _latency_history = []
 
@@ -48,7 +47,7 @@ def get_network_latency():
     """Mesure la latence réseau : ping ICMP en priorité, fallback TCP socket"""
     import re, socket, time as _time
 
-    # 1) ping ICMP classique
+    
     try:
         result = subprocess.run(
             ['ping', '-c', '1', '-W', '1', '1.1.1.1'],
@@ -65,7 +64,7 @@ def get_network_latency():
     except Exception:
         pass
 
-    # 2) Fallback : connexion TCP sur le port 80/443 de plusieurs cibles
+    
     targets = [
         ('1.1.1.1',   80),
         ('8.8.8.8',   53),
@@ -88,16 +87,18 @@ def get_network_latency():
     return -1.0
 
 def volume_to_bars(volume_pct):
-    """Convertit un % volume en 5 barres progressives ▁▂▃▄▅"""
-    chars = ["▁", "▂", "▃", "▄", "▅"]
-    total = 5
+    """Convertit un % volume en chaîne de barres ▁▂▃▄▅▆▇█"""
+    chars = "▁▂▃▄▅▆▇█"
+    total = 16  
     filled = round(volume_pct / 100 * total)
     filled = max(0, min(filled, total))
     if filled == 0:
         return "─" * total
     result = ""
     for i in range(filled):
-        result += chars[i]
+        
+        idx = min(int(i / total * len(chars)), len(chars) - 1)
+        result += chars[idx]
     return result
 
 BAR_CHARS = " ▁▂▃▄▅▆▇█"
@@ -117,7 +118,7 @@ def build_graph(history, max_val=100):
 
 def get_gpu_info():
     """Récupère utilisation, fréquence et température GPU - priorité NVIDIA"""
-    # NVIDIA
+    
     try:
         result = subprocess.run(
             ['nvidia-smi', '--query-gpu=utilization.gpu,clocks.current.graphics,temperature.gpu',
@@ -131,7 +132,7 @@ def get_gpu_info():
     except:
         pass
 
-    # AMD via sysfs
+    
     try:
         base = '/sys/class/drm/card0/device'
         usage, freq, temp = 0.0, 0.0, 0.0
@@ -153,7 +154,6 @@ def get_gpu_info():
 
     return 0.0, 0.0, 0.0
 
-
 def latency_to_bars(ms):
     """
     Convertit une latence en barres visuelles progressives (ordre ▂▅█).
@@ -170,7 +170,6 @@ def latency_to_bars(ms):
     if ms <= 20:
         result += "█"
     return result if result else " "
-
 
 def create_gpu_cpu_display():
     """GPU°C + CPU°C + volume statique + latence réseau défilante"""
@@ -193,21 +192,21 @@ def create_gpu_cpu_display():
     text.append("  CPU ", style="bold bright_red")
     text.append(f"{cpu_temp:.1f}°C\n\n", style="bright_yellow")
 
-    # Volume - affichage statique
+    
     text.append("VOL ", style="bold bright_red")
     text.append(f"{volume:.0f}%\n", style="bright_white")
     text.append(volume_to_bars(volume) + "\n\n", style="bright_cyan")
 
-    # Latence réseau - barres + ms sur la même ligne, en jaune
+    
     text.append("PING\n", style="bold bright_red")
     if latency >= 0:
-        text.append(latency_to_bars(latency) + f"   {latency:.0f}ms\n", style="bright_yellow")
+        text.append(latency_to_bars(latency) + f"    {latency:.0f}ms\n", style="bright_yellow")
     else:
         text.append("N/A\n", style="dim white")
 
     return text
     """Récupère utilisation, fréquence et température GPU via nvidia-smi ou sysfs AMD/Intel"""
-    # NVIDIA
+    
     try:
         result = subprocess.run(
             ['nvidia-smi', '--query-gpu=utilization.gpu,clocks.current.graphics,temperature.gpu',
@@ -224,7 +223,7 @@ def create_gpu_cpu_display():
     except:
         pass
 
-    # AMD via sysfs
+    
     try:
         base = '/sys/class/drm/card0/device'
         usage_path = f'{base}/gpu_busy_percent'
@@ -253,7 +252,7 @@ def create_gpu_cpu_display():
     except:
         pass
 
-    # Intel via sysfs
+    
     try:
         for card in os.listdir('/sys/class/drm'):
             freq_path = f'/sys/class/drm/{card}/device/drm/{card}/gt_cur_freq_mhz'
@@ -279,7 +278,7 @@ def get_cpu_temp():
     except:
         pass
     
-    # Fallback: lire depuis /sys
+    
     try:
         with open('/sys/class/thermal/thermal_zone0/temp', 'r') as f:
             temp = int(f.read().strip()) / 1000
@@ -290,16 +289,16 @@ def get_cpu_temp():
 def get_ssid():
     """Récupère le SSID du réseau WiFi"""
     try:
-        # Méthode 1: Lire depuis /proc/net/wireless
+        
         with open('/proc/net/wireless', 'r') as f:
             lines = f.readlines()
             if len(lines) > 2:
                 iface = lines[2].split(':')[0].strip()
                 
-                # Lire le SSID depuis /sys
+                
                 ssid_path = f'/sys/class/net/{iface}/operstate'
                 if os.path.exists(ssid_path):
-                    # Tenter de lire via iwgetid
+                    
                     try:
                         with os.popen(f'iwgetid -r 2>/dev/null') as p:
                             ssid = p.read().strip()
@@ -308,7 +307,7 @@ def get_ssid():
                     except:
                         pass
                     
-                    # Alternative: parser /proc/net/wireless
+                    
                     try:
                         with os.popen(f'iw dev {iface} link 2>/dev/null | grep SSID') as p:
                             line = p.read()
@@ -323,35 +322,35 @@ def get_ssid():
 
 def create_bar_horizontal(pct, width=10):
     """Barre horizontale avec ■□"""
-    filled = min(int((pct * width) / 100), width)
+    filled = int((pct * width) / 100)
     return "■" * filled + "□" * (width - filled)
 
 def create_system_info():
     """CPU, GPU, RAM, BATTERIE, RAM Freq avec ■□"""
     text = Text()
     
-    # CPU
+    
     cpu_pct = psutil.cpu_percent(interval=0.1)
     text.append("CPU ", style="bold bright_red")
     text.append(f"{cpu_pct:5.1f}% ", style="bright_white")
     text.append(create_bar_horizontal(cpu_pct, 10), style="bright_yellow")
     text.append("\n\n")
     
-    # GPU
+    
     gpu_pct, gpu_freq, gpu_temp = get_gpu_info()
     text.append("GPU ", style="bold bright_red")
     text.append(f"{gpu_pct:5.1f}% ", style="bright_white")
     text.append(create_bar_horizontal(gpu_pct, 10), style="bright_yellow")
     text.append("\n\n")
     
-    # RAM
+    
     mem = psutil.virtual_memory()
     text.append("RAM ", style="bold bright_red")
     text.append(f"{mem.percent:5.1f}% ", style="bright_white")
     text.append(create_bar_horizontal(mem.percent, 10), style="bright_yellow")
     text.append("\n\n")
     
-    # BATTERIE
+    
     try:
         battery = psutil.sensors_battery()
         bat_pct = battery.percent if battery else 100
@@ -363,11 +362,11 @@ def create_system_info():
     text.append(create_bar_horizontal(bat_pct, 10), style="bright_green")
     text.append("\n\n")
     
-    # GPU FREQ (réutilise les données déjà récupérées)
+    
     text.append("GPU FREQ: ", style="bold bright_red")
     text.append(f"{gpu_freq:.0f}MHz\n", style="bright_yellow")
     
-    # CPU FREQ (directement en dessous, sans espace)
+    
     cpu_freq = psutil.cpu_freq()
     if cpu_freq:
         text.append("CPU FREQ: ", style="bold bright_red")
@@ -388,7 +387,7 @@ def create_disk_network():
     """Disque + Réseau"""
     text = Text()
     
-    # DISK USAGE
+    
     disk = psutil.disk_usage('/')
     text.append("DISK USAGE\n", style="bold bright_red")
     text.append(f"Total: ", style="bright_white")
@@ -398,10 +397,10 @@ def create_disk_network():
     text.append(create_bar_horizontal(disk.percent, 20), style="bright_yellow")
     text.append(f" {disk.percent:.0f}%\n\n", style="bright_white")
     
-    # NETWORK
+    
     text.append("NETWORK\n", style="bold bright_red")
     
-    # Interface et SSID
+    
     net_if = psutil.net_if_addrs()
     active_if = "NULL"
     for iface in net_if.keys():
@@ -428,7 +427,7 @@ def create_process_table():
     table.add_column("MEM%", style="bright_white", width=6, justify="right")
     table.add_column("CPU%", style="bright_white", width=6, justify="right")
     
-    # Obtenir les processus triés par CPU
+    
     procs = []
     for proc in psutil.process_iter(['pid', 'name', 'memory_percent', 'cpu_percent']):
         try:
@@ -442,10 +441,10 @@ def create_process_table():
         except:
             pass
     
-    # Trier par CPU
+    
     procs.sort(key=lambda x: x[3] or 0, reverse=True)
     
-    # Afficher les 15 premiers
+    
     for i in range(min(15, len(procs))):
         name, pid, mem, cpu = procs[i]
         table.add_row(

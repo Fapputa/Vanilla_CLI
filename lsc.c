@@ -1,7 +1,4 @@
-/* lsc.c — ls wrapper with custom colorization
- * Compile: gcc -O2 -Wall -Wextra -o lsc lsc.c
- * Config:  ~/.colorrc
- */
+
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,10 +22,6 @@ typedef struct {
 static Rule  rules[MAX_RULES];
 static int   nrules     = 0;
 static char  target_dir[4096];
-
-/* ─────────────────────────────────────────────
- * Config parser
- * ───────────────────────────────────────────── */
 
 static void parse_line(char *line)
 {
@@ -86,10 +79,6 @@ static void load_config(void)
     fclose(f);
 }
 
-/* ─────────────────────────────────────────────
- * ANSI
- * ───────────────────────────────────────────── */
-
 static void emit_color(const char *name, int is_bg)
 {
     if (!name || !*name || !strcmp(name, "default")) return;
@@ -123,16 +112,12 @@ static void ansi_apply(const Rule *r)
     if (r->bold)      fputs("\033[1m", stdout);
     if (r->italic)    fputs("\033[3m", stdout);
     if (r->underline) fputs("\033[4m", stdout);
-    if (r->outline)   fputs("\033[7m", stdout);  /* reverse video (fg↔bg) */
+    if (r->outline)   fputs("\033[7m", stdout);  
     emit_color(r->fg, 0);
     emit_color(r->bg, 1);
 }
 
 static void ansi_reset(void) { fputs("\033[0m", stdout); }
-
-/* ─────────────────────────────────────────────
- * Stat d'un fichier
- * ───────────────────────────────────────────── */
 
 typedef struct { int is_dir, is_exec, is_link; } FileType;
 
@@ -156,19 +141,10 @@ static FileType stat_file(const char *name)
     return ft;
 }
 
-/* ─────────────────────────────────────────────
- * Rule lookup
- *
- * Priorité :
- *   1. extension  (.c .py …)  — sauf si dir ou lien
- *   2. type spécial (dir / link / exec)
- *   3. noext  (fichiers sans extension, ni exec)
- * ───────────────────────────────────────────── */
-
 static const Rule *find_rule(const char *name, int is_dir,
                               int is_exec, int is_link)
 {
-    /* 1. extension */
+    
     if (!is_dir && !is_link) {
         const char *dot = strrchr(name, '.');
         if (dot && dot != name) {
@@ -178,7 +154,7 @@ static const Rule *find_rule(const char *name, int is_dir,
         }
     }
 
-    /* 2. type spécial */
+    
     const char *special = NULL;
     if      (is_link) special = "link";
     else if (is_dir)  special = "dir";
@@ -190,7 +166,7 @@ static const Rule *find_rule(const char *name, int is_dir,
                 return &rules[i];
     }
 
-    /* 3. noext */
+    
     if (!is_dir && !is_link && !is_exec) {
         const char *dot = strrchr(name, '.');
         if (!dot || dot == name) {
@@ -203,10 +179,6 @@ static const Rule *find_rule(const char *name, int is_dir,
     return NULL;
 }
 
-/* ─────────────────────────────────────────────
- * Détection mode long (ls -l)
- * ───────────────────────────────────────────── */
-
 static int is_long_line(const char *s)
 {
     if (strlen(s) < 10) return 0;
@@ -217,10 +189,6 @@ static int is_long_line(const char *s)
     return 1;
 }
 
-/* ─────────────────────────────────────────────
- * Largeur terminal
- * ───────────────────────────────────────────── */
-
 static int term_cols(void)
 {
     struct winsize w;
@@ -228,10 +196,6 @@ static int term_cols(void)
         return (int)w.ws_col;
     return 80;
 }
-
-/* ─────────────────────────────────────────────
- * fork + execvp ls  (-1p : un fichier par ligne)
- * ───────────────────────────────────────────── */
 
 static FILE *spawn_ls(int argc, char **argv)
 {
@@ -269,10 +233,6 @@ static FILE *spawn_ls(int argc, char **argv)
     free(lsargv);
     return fdopen(pipefd[0], "r");
 }
-
-/* ─────────────────────────────────────────────
- * Traitement mode long (ls -l)
- * ───────────────────────────────────────────── */
 
 static void process_long_line(const char *buf)
 {
@@ -314,19 +274,11 @@ static void process_long_line(const char *buf)
     putchar('\n');
 }
 
-/* ─────────────────────────────────────────────
- * Affichage en colonnes (mode normal)
- *
- * On collecte tous les noms, on calcule la largeur
- * de colonne, puis on imprime avec padding — exactement
- * comme ls -C, mais avec nos couleurs ANSI.
- * ───────────────────────────────────────────── */
-
 #define MAX_ENTRIES 65536
 
 typedef struct {
-    char  name[4096];   /* nom avec '/' éventuel pour l'affichage */
-    char  clean[4096];  /* nom sans '/' pour le lookup            */
+    char  name[4096];   
+    char  clean[4096];  
     FileType ft;
 } Entry;
 
@@ -349,8 +301,6 @@ static void collect_entry(const char *buf)
     if (had_slash) e->ft.is_dir = 1;
 }
 
-/* Largeur d'affichage reelle d'une chaine UTF-8.
- * Les octets de continuation (10xxxxxx) ne comptent pas. */
 static int display_width(const char *s)
 {
     int w = 0;
@@ -365,14 +315,14 @@ static void print_columns(void)
 
     int cols = term_cols();
 
-    /* largeur max en colonnes d'affichage (UTF-8 correct) */
+    
     int maxw = 0;
     for (int i = 0; i < nentries; i++) {
         int w = display_width(entries[i].name);
         if (w > maxw) maxw = w;
     }
 
-    /* nombre de colonnes qui tiennent */
+    
     int gap   = 2;
     int col_w = maxw + gap;
     int ncols = cols / col_w;
@@ -381,7 +331,7 @@ static void print_columns(void)
 
     for (int row = 0; row < nrows; row++) {
         for (int col = 0; col < ncols; col++) {
-            int idx = col * nrows + row;   /* ordre colonne-major, comme ls -C */
+            int idx = col * nrows + row;   
             if (idx >= nentries) break;
 
             Entry *e = &entries[idx];
@@ -392,7 +342,7 @@ static void print_columns(void)
             fputs(e->name, stdout);
             if (r) ansi_reset();
 
-            /* padding sauf pour la derniere colonne de la ligne */
+            
             int is_last_col = (col == ncols - 1) ||
                               ((col + 1) * nrows + row >= nentries);
             if (!is_last_col) {
@@ -404,15 +354,11 @@ static void print_columns(void)
     }
 }
 
-/* ─────────────────────────────────────────────
- * Main
- * ───────────────────────────────────────────── */
-
 int main(int argc, char **argv)
 {
     load_config();
 
-    /* Répertoire cible : argument non-option, sinon CWD absolu réel */
+    
     const char *arg_dir = NULL;
     int long_mode = 0;
     for (int i = 1; i < argc; i++) {
@@ -435,7 +381,7 @@ int main(int argc, char **argv)
 
     char line[8192];
     while (fgets(line, sizeof(line), f)) {
-        /* strip newline */
+        
         char buf[8192];
         snprintf(buf, sizeof(buf), "%s", line);
         char *nl = strchr(buf, '\n'); if (nl) *nl = '\0';
@@ -443,7 +389,7 @@ int main(int argc, char **argv)
         if (!*buf) continue;
 
         if (long_mode || is_long_line(buf)) {
-            /* mode long : on vide d'abord le buffer colonne si besoin */
+            
             if (nentries > 0) { print_columns(); nentries = 0; }
             process_long_line(buf);
         } else {
@@ -451,7 +397,7 @@ int main(int argc, char **argv)
         }
     }
 
-    /* afficher ce qui reste en colonnes */
+    
     if (nentries > 0) print_columns();
 
     fclose(f);

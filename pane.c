@@ -658,23 +658,15 @@ void pane_search_prev(Pane *p) {
 }
 
 void pane_wipe_file(Pane *p) {
-    struct stat _st;
-    bool file_exists = p->filename[0] && stat(p->filename, &_st) == 0;
-
-    if (file_exists) {
-        
-        FILE *f = fopen(p->filename, "w");
-        if (f) fclose(f);
-    }
-    
+    pane_push_undo(p);
     gb_free(p->buf); p->buf = gb_new(GAP_DEFAULT);
     li_free(p->li);  p->li  = li_new();
     syn_free(p->syn); p->syn = syn_new(p->lang);
     li_rebuild(p->li, p->buf);
     p->cursor = 0; p->cursor_line = 0; p->cursor_col = 0;
     p->scroll_line = 0; p->scroll_col = 0; p->preferred_col = 0;
-    p->modified = false;
-    pane_push_undo(p); mark_dirty(p);
+    p->modified = true;
+    mark_dirty(p);
 }
 
 void pane_cursor_line_col(const Pane *p, size_t *line, size_t *col) {

@@ -1,16 +1,4 @@
-/* lsc-config.c — TUI ncurses pour éditer ~/.colorrc
- * Compile: gcc -O2 -Wall -Wextra -o lsc-config lsc-config.c -lncurses
- *
- * Contrôles:
- *   ↑↓        naviguer les règles
- *   f         changer couleur FG (menu déroulant avec preview)
- *   g         changer couleur BG (menu déroulant avec preview)
- *   b/i/u     toggle Bold / Italic / Underline
- *   a         ajouter une règle
- *   d         supprimer la règle sélectionnée
- *   s         sauvegarder
- *   q         quitter
- */
+
 
 #include <ncurses.h>
 #include <stdlib.h>
@@ -21,10 +9,6 @@
 #define MAX_RULES 512
 #define MAX_EXT   128
 #define MAX_COLOR  64
-
-/* ─────────────────────────────────────────────
- * Palette de couleurs disponibles
- * ───────────────────────────────────────────── */
 
 typedef struct {
     const char *name;
@@ -104,10 +88,6 @@ static void init_color_pairs(void)
     init_pair((short)PAIR_PREVIEW, -1, -1);
 }
 
-/* ─────────────────────────────────────────────
- * Modèle de données
- * ───────────────────────────────────────────── */
-
 typedef struct {
     char ext[MAX_EXT];
     char fg[MAX_COLOR];
@@ -119,10 +99,6 @@ static Rule  rules[MAX_RULES];
 static int   nrules = 0;
 static int   sel    = 0;
 static char  config_path[512];
-
-/* ─────────────────────────────────────────────
- * I/O fichier
- * ───────────────────────────────────────────── */
 
 static void load_file(void)
 {
@@ -188,14 +164,6 @@ static void save_file(void)
     fclose(f);
 }
 
-/* ─────────────────────────────────────────────
- * Rendu ANSI inline dans ncurses via escape raw
- * On utilise attron/attroff ncurses pour les attributs,
- * et on émet directement les codes ANSI pour les couleurs
- * (puisque ncurses gère mal les 256 couleurs sans init complexe).
- * ───────────────────────────────────────────── */
-
-/* Applique fg+bg+attrs pour preview dans ncurses via color pairs */
 static void apply_preview(WINDOW *w, const Rule *r)
 {
     if (r->bold)      wattron(w, A_BOLD);
@@ -211,7 +179,7 @@ static void apply_preview(WINDOW *w, const Rule *r)
     int bg_id  = resolve_color(r->bg);
 
     if (fg_id >= 0 || bg_id >= 0) {
-        /* init d'un pair temporaire fg+bg */
+        
         init_pair((short)PAIR_PREVIEW,
                   (short)(fg_id >= 0 ? fg_id : -1),
                   (short)(bg_id >= 0 ? bg_id : -1));
@@ -232,11 +200,6 @@ static void clear_preview(WINDOW *w, const Rule *r)
     wattroff(w, COLOR_PAIR(PAIR_PREVIEW));
 }
 
-/* ─────────────────────────────────────────────
- * Menu déroulant avec preview couleur ANSI
- * Retourne l'index sélectionné dans COLOR_TABLE[]
- * ───────────────────────────────────────────── */
-
 static int dropdown_color(int y, int x, int current, const char *label)
 {
     int n = color_count();
@@ -245,23 +208,23 @@ static int dropdown_color(int y, int x, int current, const char *label)
     int maxy, maxx;
     getmaxyx(stdscr, maxy, maxx);
 
-    /* hauteur visible bornée à ce qui tient dans le terminal */
+    
     int max_visible = maxy - 4;
     if (max_visible < 3) max_visible = 3;
     int visible = (n < max_visible) ? n : max_visible;
-    int height  = visible + 2;  /* bordures */
+    int height  = visible + 2;  
 
-    /* position : recalculer pour tenir */
+    
     if (y + height > maxy) y = maxy - height;
     if (x + width  > maxx) x = maxx - width;
     if (y < 0) y = 0;
     if (x < 0) x = 0;
 
     WINDOW *w = newwin(height, width, y, x);
-    if (!w) return current;   /* guard : newwin a échoué */
+    if (!w) return current;   
     keypad(w, TRUE);
-    raw();       /* raw() : Enter = 13 (\r), pas besoin de \n */
-    flushinp();  /* vider tout ce qui traîne dans le buffer */
+    raw();       
+    flushinp();  
     box(w, 0, 0);
 
     char title[40];
@@ -269,14 +232,14 @@ static int dropdown_color(int y, int x, int current, const char *label)
     mvwprintw(w, 0, (width - (int)strlen(title)) / 2, "%s", title);
 
     int idx    = current;
-    int scroll = 0;  /* première entrée visible */
+    int scroll = 0;  
 
-    /* mettre la sélection dans la fenêtre */
+    
     if (idx >= scroll + visible) scroll = idx - visible + 1;
     if (idx < scroll)            scroll = idx;
 
     for (;;) {
-        /* dessiner les entrées visibles */
+        
         for (int vi = 0; vi < visible; vi++) {
             int i   = scroll + vi;
             int row = vi + 1;
@@ -300,7 +263,7 @@ static int dropdown_color(int y, int x, int current, const char *label)
             if (i == idx) wattroff(w, A_REVERSE);
         }
 
-        /* indicateur scroll */
+        
         if (scroll > 0)
             mvwprintw(w, 0, width - 4, " ▲ ");
         if (scroll + visible < n)
@@ -342,15 +305,11 @@ static int dropdown_color(int y, int x, int current, const char *label)
     }
 done:
     delwin(w);
-    cbreak();    /* rétablir cbreak pour la boucle principale */
+    cbreak();    
     touchwin(stdscr);
     refresh();
     return idx;
 }
-
-/* ─────────────────────────────────────────────
- * Dessin de la liste principale
- * ───────────────────────────────────────────── */
 
 static void draw_list(int sy, int sx, int height)
 {
@@ -371,12 +330,12 @@ static void draw_list(int sy, int sx, int height)
         Rule *r = &rules[ri];
         int row = sy + 1 + i;
 
-        /* Extension */
+        
         if (ri == sel) attron(A_REVERSE);
         mvprintw(row, sx, "%-16s", r->ext);
         if (ri == sel) attroff(A_REVERSE);
 
-        /* FG : carré coloré (couleur en fond) + nom */
+        
         {
             int fidx = color_index(r->fg);
             int fid  = resolve_color(r->fg);
@@ -394,7 +353,7 @@ static void draw_list(int sy, int sx, int height)
             if (ri == sel) attroff(A_REVERSE);
         }
 
-        /* BG : carré coloré (couleur en fond) + nom */
+        
         {
             int bidx = color_index(r->bg);
             int bid  = resolve_color(r->bg);
@@ -412,7 +371,7 @@ static void draw_list(int sy, int sx, int height)
             if (ri == sel) attroff(A_REVERSE);
         }
 
-        /* Flags */
+        
         if (ri == sel) attron(A_REVERSE);
         mvprintw(row, sx + 62, " %c %c %c %c",
             r->bold      ? 'B' : '.',
@@ -426,10 +385,6 @@ static void draw_list(int sy, int sx, int height)
         mvprintw(sy + 1 + visible, sx, " [%d/%d]", sel + 1, nrules);
 }
 
-/* ─────────────────────────────────────────────
- * Preview de la règle sélectionnée
- * ───────────────────────────────────────────── */
-
 static void draw_preview(int y, int x, const Rule *r)
 {
     attron(A_BOLD);
@@ -438,7 +393,7 @@ static void draw_preview(int y, int x, const Rule *r)
 
     move(y, x + 9);
 
-    /* Construire un color pair fg+bg combiné pour la preview */
+    
     int fg_id = resolve_color(r->fg);
     int bg_id = resolve_color(r->bg);
     init_pair((short)PAIR_PREVIEW,
@@ -457,10 +412,6 @@ static void draw_preview(int y, int x, const Rule *r)
     printw("  %s  ", *r->ext ? r->ext : "fichier");
     attroff(attrs);
 }
-
-/* ─────────────────────────────────────────────
- * Actions
- * ───────────────────────────────────────────── */
 
 static void action_fg(void)
 {
@@ -502,7 +453,7 @@ static void action_add(void)
     delwin(w);
     touchwin(stdscr);
 
-    /* trim */
+    
     char *p = input;
     while (*p == ' ' || *p == '\t') p++;
     char *e = p + strlen(p) - 1;
@@ -535,10 +486,6 @@ static void action_toggle(char flag)
     if (flag == 'o') r->outline   ^= 1;
 }
 
-/* ─────────────────────────────────────────────
- * Main loop
- * ───────────────────────────────────────────── */
-
 int main(void)
 {
     const char *home = getenv("HOME");
@@ -551,7 +498,7 @@ int main(void)
     noecho();
     curs_set(0);
     keypad(stdscr, TRUE);
-    /* Activer les couleurs si dispo */
+    
     if (has_colors()) {
         start_color();
         use_default_colors();
@@ -566,13 +513,13 @@ int main(void)
         getmaxyx(stdscr, maxy, maxx);
         clear();
 
-        /* ── titre ── */
+        
         attron(A_BOLD | A_REVERSE);
         mvprintw(0, 0, "%-*s", maxx, "  lsc-config");
         attroff(A_BOLD | A_REVERSE);
         mvprintw(1, 2, "%s", config_path);
 
-        /* ── aide ── */
+        
         int help_y = maxy - 2;
         attron(A_DIM);
         mvprintw(help_y, 0,
@@ -580,19 +527,19 @@ int main(void)
             "  a:add  d:del  s:save  q:quit");
         attroff(A_DIM);
 
-        /* ── status ── */
+        
         if (*status_msg) {
             attron(A_BOLD);
             mvprintw(maxy - 1, 0, " %s", status_msg);
             attroff(A_BOLD);
         }
 
-        /* ── liste ── */
+        
         int list_y = 3;
         int list_h = help_y - list_y - 3;
         draw_list(list_y, 2, list_h);
 
-        /* ── preview ── */
+        
         if (nrules > 0) {
             draw_preview(help_y - 2, 2, &rules[sel]);
         }

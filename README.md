@@ -19,9 +19,9 @@ Vanilla_CLI/
 │   ├── compil             -- Smart compiler/runner
 │   ├── redem              -- WiFi driver reset
 │   ├── tree               -- Directory tree view
-│   └── bin/
-│       ├── blackjack      -- Blackjack game
-│       └── minesweeper    -- Minesweeper game
+├── bin/
+│   ├── blackjack      -- Blackjack game
+│   └── minesweeper    -- Minesweeper game
 └── scripts/
     ├── monitoring.py      -- System dashboard
     └── wifi_monitoring.py -- Network monitor

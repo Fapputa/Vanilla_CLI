@@ -3,42 +3,42 @@
 void colors_init(void) {
     start_color();
     use_default_colors();
-    /* Define a sleek dark theme */
-    /* Normal text: white on dark bg */
+    
+    
     init_pair(COLOR_PAIR_NORMAL,    COLOR_WHITE,   -1);
-    /* Keywords: bright cyan */
+    
     init_pair(COLOR_PAIR_KEYWORD,   COLOR_CYAN,    -1);
-    /* Types: bright green */
+    
     init_pair(COLOR_PAIR_TYPE,      COLOR_GREEN,   -1);
-    /* Preprocessor: magenta */
+    
     init_pair(COLOR_PAIR_PREPROC,   COLOR_MAGENTA, -1);
-    /* Strings: yellow */
+    
     init_pair(COLOR_PAIR_STRING,    COLOR_YELLOW,  -1);
-    /* Comments: dark blue */
+    
     init_pair(COLOR_PAIR_COMMENT,   COLOR_BLUE,    -1);
-    /* Numbers: red */
+    
     init_pair(COLOR_PAIR_NUMBER,    COLOR_RED,     -1);
-    /* Identifiers: white */
+    
     init_pair(COLOR_PAIR_IDENT,     COLOR_WHITE,   -1);
-    /* Search highlight: black on yellow */
+    
     init_pair(COLOR_PAIR_SEARCH,    COLOR_BLACK,   COLOR_YELLOW);
-    /* Title bar: black on bright blue */
+    
     init_pair(COLOR_PAIR_TITLE,     COLOR_WHITE,   COLOR_RED);
-    /* Status bar: black on white */
+    
     init_pair(COLOR_PAIR_STATUS,    COLOR_BLACK,   COLOR_WHITE);
-    /* Line numbers: dark cyan */
+    
     init_pair(COLOR_PAIR_LINENUM,   COLOR_CYAN,    -1);
-    /* Cursor line: highlight */
+    
     init_pair(COLOR_PAIR_CURSOR,    COLOR_WHITE,   COLOR_BLACK);
-    /* Operators: white */
+    
     init_pair(COLOR_PAIR_OPERATOR,  COLOR_WHITE,   -1);
-    /* Active pane border: bright cyan */
+    
     init_pair(COLOR_PAIR_ACTIVE_BORDER,   COLOR_CYAN,  -1);
-    /* Inactive pane border: dark */
+    
     init_pair(COLOR_PAIR_INACTIVE_BORDER, COLOR_WHITE, -1);
-    /* Selection: black on cyan */
+    
     init_pair(COLOR_PAIR_SELECTION, COLOR_BLACK,   COLOR_CYAN);
-    /* Char literals: yellow like strings */
+    
     init_pair(COLOR_PAIR_CHAR,      COLOR_YELLOW,  -1);
 }
 
@@ -57,7 +57,6 @@ int tok_to_color_pair(TokenType t) {
     }
 }
 
-/* ─── Arena ──────────────────────────────────────────────────── */
 #define ARENA_BLOCK_SIZE 65536
 
 Arena *arena_new(size_t block_size) {
@@ -71,7 +70,7 @@ Arena *arena_new(size_t block_size) {
 }
 
 void *arena_alloc(Arena *a, size_t n) {
-    n = (n + 7) & ~(size_t)7; /* align 8 */
+    n = (n + 7) & ~(size_t)7; 
     if (a->head->used + n > a->head->cap) {
         size_t bsz = n > ARENA_BLOCK_SIZE ? n : ARENA_BLOCK_SIZE;
         ArenaBlock *b = malloc(sizeof(ArenaBlock) + bsz);

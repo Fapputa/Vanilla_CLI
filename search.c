@@ -1,7 +1,6 @@
 #include "abyss.h"
 #include <string.h>
 
-/* Simple Boyer-Moore-Horspool for text search */
 static void bmh_build(const char *pat, int plen, int *skip) {
     for (int i = 0; i < 256; i++) skip[i] = plen;
     for (int i = 0; i < plen - 1; i++)
@@ -17,7 +16,7 @@ void search_find(SearchCtx *sc, const GapBuf *g) {
     size_t tlen = gb_len(g);
     if ((size_t)plen > tlen) return;
 
-    /* Materialise buffer for BMH */
+    
     char *text = gb_to_str(g);
 
     int skip[256];
@@ -29,7 +28,7 @@ void search_find(SearchCtx *sc, const GapBuf *g) {
         size_t k = i;
         while (j >= 0 && text[k] == sc->query[j]) { j--; k--; }
         if (j < 0) {
-            /* match at k+1 */
+            
             if (sc->count >= sc->cap) {
                 sc->cap = sc->cap ? sc->cap * 2 : 64;
                 sc->matches = realloc(sc->matches, sc->cap * sizeof(size_t));

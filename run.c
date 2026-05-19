@@ -5,12 +5,12 @@
 
 static const char *lang_cmd(Language lang, const char *path, char *out_cmd, size_t cmd_sz) {
     const char *ext_map[][2] = {
-        /* handled by external scripts / direct commands */
+        
         {NULL, NULL}
     };
     (void)ext_map;
 
-    /* Mirror Python version's exact command strings */
+    
     switch (lang) {
         case LANG_C:
             snprintf(out_cmd, cmd_sz, "gcc \"%s\" -o ./temp_bin && ./temp_bin", path);
@@ -28,7 +28,7 @@ static const char *lang_cmd(Language lang, const char *path, char *out_cmd, size
             snprintf(out_cmd, cmd_sz, "node \"%s\"", path);
             break;
         case LANG_PHP: {
-            /* Start PHP dev server + open browser */
+            
             snprintf(out_cmd, cmd_sz,
                 "php -S localhost:8080 -t \"%s\" &"
                 " sleep 0.3 && xdg-open 'http://localhost:8080/%s'",
@@ -50,7 +50,7 @@ void run_file(const char *path, Language lang, char *out_buf, size_t out_max) {
         return;
     }
 
-    /* Redirect stderr to stdout */
+    
     char full_cmd[8256];
     snprintf(full_cmd, sizeof full_cmd, "(%s) 2>&1", cmd);
 
@@ -76,7 +76,7 @@ void run_file(const char *path, Language lang, char *out_buf, size_t out_max) {
             snprintf(out_buf, out_max, "(Process exited with code %d)", WEXITSTATUS(ret));
     }
 
-    /* Clean up temp binary */
+    
     if (lang == LANG_C || lang == LANG_CPP) {
         unlink("./temp_bin");
     }

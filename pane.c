@@ -4,9 +4,6 @@
 
 GapBuf *gb_clone(const GapBuf *g);
 
-/* ── UTF-8 helpers on GapBuf ──────────────────────────────────────── */
-
-/* Read up to 4 bytes from GapBuf at byte offset pos into tmp[], decode. */
 static int gb_decode_cp(const GapBuf *g, size_t pos, uint32_t *cp) {
     size_t len = gb_len(g);
     if (pos >= len) { *cp = 0; return 0; }
@@ -17,14 +14,12 @@ static int gb_decode_cp(const GapBuf *g, size_t pos, uint32_t *cp) {
     return utf8_decode(tmp, (size_t)n, cp);
 }
 
-/* Visual width of the character at byte offset pos in GapBuf. */
 static int gb_char_vis_width(const GapBuf *g, size_t pos) {
     uint32_t cp; gb_decode_cp(g, pos, &cp);
-    if (cp == '\t') return 4; /* treat tab as 4 spaces */
+    if (cp == '\t') return 4; 
     return utf8_cp_width(cp);
 }
 
-/* Move one codepoint forward (returns bytes advanced). */
 static size_t gb_next_cp(const GapBuf *g, size_t pos) {
     size_t len = gb_len(g);
     if (pos >= len) return 0;
@@ -33,18 +28,16 @@ static size_t gb_next_cp(const GapBuf *g, size_t pos) {
     return (size_t)n;
 }
 
-/* Move one codepoint backward (returns bytes retreated). */
 static size_t gb_prev_cp(const GapBuf *g, size_t pos) {
     if (pos == 0) return 0;
     size_t back = 1;
-    /* skip continuation bytes */
+    
     while (back < 4 && back < pos &&
            utf8_is_continuation((unsigned char)gb_at(g, pos - back - 1)))
         back++;
     return back;
 }
 
-/* Compute visual column of byte offset within a line (line_start in bytes). */
 static size_t byte_offset_to_vis_col(const GapBuf *g, size_t line_start, size_t byte_offset) {
     size_t vis = 0;
     size_t pos = line_start;
@@ -58,8 +51,6 @@ static size_t byte_offset_to_vis_col(const GapBuf *g, size_t line_start, size_t 
     return vis;
 }
 
-/* Find the byte offset whose visual column is >= target_vis_col.
-   Returns byte offset from line_start. line_len is in bytes. */
 static size_t vis_col_to_byte_offset(const GapBuf *g, size_t line_start,
                                       size_t line_len, size_t target_vis) {
     size_t vis = 0, pos = 0;
@@ -107,6 +98,8 @@ void pane_free(Pane *p) {
     free(p);
 }
 
+extern char E_notify[256];
+
 void pane_open_file(Pane *p, const char *path) {
     char resolved[4096];
     if (realpath(path, resolved))
@@ -115,7 +108,18 @@ void pane_open_file(Pane *p, const char *path) {
         strncpy(p->filename, path, sizeof(p->filename)-1);
     p->filename[sizeof(p->filename)-1] = '\0';
 
-    /* Vider le buffer précédent avant de charger */
+    
+    E_notify[0] = '\0';
+    bool can_read  = (access(p->filename, R_OK) == 0);
+    bool can_write = (access(p->filename, W_OK) == 0);
+    if (!can_read && !can_write)
+        snprintf(E_notify, sizeof E_notify, "Cannot read or write: %s", p->filename);
+    else if (!can_read)
+        snprintf(E_notify, sizeof E_notify, "Cannot read: %s", p->filename);
+    else if (!can_write)
+        snprintf(E_notify, sizeof E_notify, "Cannot write: %s (read-only)", p->filename);
+
+    
     gb_free(p->buf); p->buf = gb_new(GAP_DEFAULT);
     p->cursor = 0; p->cursor_line = 0; p->cursor_col = 0;
     p->scroll_line = 0; p->scroll_col = 0; p->preferred_col = 0;
@@ -126,7 +130,7 @@ void pane_open_file(Pane *p, const char *path) {
     const char *ext = strrchr(path, '.');
     p->lang = lang_from_ext(ext ? ext : "");
 
-    /* Binary file → hex mode, don't load into GapBuf */
+    
     if (p->lang == LANG_HEX) {
         if (!p->hex) p->hex = hex_new();
         hex_load(p->hex, p->filename);
@@ -142,7 +146,7 @@ void pane_open_file(Pane *p, const char *path) {
                 void *m = mmap(NULL, sz, PROT_READ, MAP_PRIVATE, fd, 0);
                 if (m != MAP_FAILED) {
                     const char *src = (const char *)m;
-                    /* Detect and strip \r\n → \n (CRLF files) */
+                    
                     p->crlf = false;
                     for (size_t i = 0; i + 1 < sz; i++) {
                         if (src[i] == '\r' && src[i+1] == '\n') { p->crlf = true; break; }
@@ -180,7 +184,7 @@ static void *save_thread_fn(void *arg) {
 }
 
 bool pane_save_file(Pane *p, const char *path) {
-    /* In hex mode, delegate to hex_save */
+    
     if (p->hex_mode && p->hex)
         return hex_save(p->hex, path);
 
@@ -189,10 +193,10 @@ bool pane_save_file(Pane *p, const char *path) {
     char *s = gb_to_str(p->buf);
     size_t slen = strlen(s);
 
-    /* Re-add \r\n if file originally used CRLF */
+    
     char *out = s; size_t outlen = slen;
     if (p->crlf) {
-        /* Count \n to know how much space we need */
+        
         size_t newlines = 0;
         for (size_t i = 0; i < slen; i++) if (s[i] == '\n') newlines++;
         out = malloc(slen + newlines + 1);
@@ -228,8 +232,8 @@ void pane_set_window(Pane *p, WINDOW *w, int y, int x, int h, int ww) {
     p->win = w; p->win_y = y; p->win_x = x; p->win_h = h; p->win_w = ww;
     p->prev_render_rows = 0;
     keypad(w, TRUE);
-    /* Prevent ncurses from wrapping long lines onto the next row,
-       which would shift all subsequent lines and cause them to disappear */
+    
+
     scrollok(w, FALSE);
     idlok(w, FALSE);
 }
@@ -241,7 +245,7 @@ static void cursor_update_line_col(Pane *p) {
         if (li_line_start(p->li, mid) <= p->cursor) lo = mid; else hi = mid;
     }
     p->cursor_line = lo;
-    /* cursor_col = visual column, not byte offset */
+    
     size_t line_start = li_line_start(p->li, lo);
     p->cursor_col = byte_offset_to_vis_col(p->buf, line_start, p->cursor);
 }
@@ -251,7 +255,7 @@ void pane_scroll_to_cursor(Pane *p) {
     int gutter = p->show_line_numbers ? 6 : 0;
     int text_w = p->win_w - gutter; if (text_w < 1) text_w = 1;
 
-    /* Vertical scroll */
+    
     if (p->win_h > 0) {
         long cl = (long)p->cursor_line;
         long sl = (long)p->scroll_line;
@@ -261,7 +265,7 @@ void pane_scroll_to_cursor(Pane *p) {
             p->scroll_line = (size_t)(cl - p->win_h + margin + 1);
     }
 
-    /* Horizontal scroll — use signed arithmetic to avoid size_t wrap bugs */
+    
     long cc = (long)p->cursor_col;
     long sc = (long)p->scroll_col;
     if (cc < sc)
@@ -271,7 +275,7 @@ void pane_scroll_to_cursor(Pane *p) {
 }
 
 void pane_render(Pane *p, bool force) {
-    /* If hex mode is active, delegate entirely to hex_render */
+    
     if (p->hex_mode && p->hex) {
         hex_render(p->hex, p->win, p->win_h, p->win_w);
         return;
@@ -318,13 +322,12 @@ void pane_render(Pane *p, bool force) {
 
         LineAttr *la = &p->syn->lines[lineno];
 
-        /* UTF-8 aware rendering:
-           - iterate by codepoint (byte pos), track visual column
-           - scroll_col and text_w are in visual columns */
-        size_t byte_pos = line_start; /* current byte position in buffer */
-        size_t vis_col  = 0;          /* current visual column on this line */
+        
 
-        /* Skip characters that are scrolled off to the left */
+        size_t byte_pos = line_start; 
+        size_t vis_col  = 0;          
+
+        
         while (byte_pos < line_start + line_len) {
             uint32_t cp; char tmp[4];
             int blen_cp = utf8_byte_len((unsigned char)gb_at(p->buf, byte_pos));
@@ -338,10 +341,10 @@ void pane_render(Pane *p, bool force) {
             byte_pos += (size_t)blen_cp;
         }
 
-        /* Render visible characters */
-        int screen_col = 0; /* columns written to screen so far */
+        
+        int screen_col = 0; 
         while (byte_pos < line_start + line_len && screen_col < text_w - 1) {
-            /* Decode codepoint */
+            
             char tmp[4]; uint32_t cp;
             int blen_cp = utf8_byte_len((unsigned char)gb_at(p->buf, byte_pos));
             int avail = (int)(line_start + line_len - byte_pos);
@@ -349,9 +352,9 @@ void pane_render(Pane *p, bool force) {
             for (int i = 0; i < blen_cp; i++) tmp[i] = gb_at(p->buf, byte_pos + i);
             utf8_decode(tmp, (size_t)blen_cp, &cp);
 
-            int w; /* visual width of this char */
+            int w; 
             if (cp == '\t') {
-                /* Compute actual tab width from absolute visual col */
+                
                 size_t abs_vis = vis_col;
                 w = (int)(((abs_vis/4)+1)*4 - abs_vis);
                 if (screen_col + w > text_w) w = text_w - screen_col;
@@ -359,11 +362,11 @@ void pane_render(Pane *p, bool force) {
                 w = utf8_cp_width(cp);
             }
 
-            /* Don't overflow the line width */
+            
             if (screen_col + w > text_w) break;
 
-            /* Determine token type using byte offset into line attrs */
-            size_t ci = byte_pos - line_start; /* byte offset within line */
+            
+            size_t ci = byte_pos - line_start; 
             TokenType tok = (la->attrs && ci < la->len) ? la->attrs[ci] : TOK_NORMAL;
 
             bool sel = false;
@@ -388,7 +391,7 @@ void pane_render(Pane *p, bool force) {
             } else if (cp < 0x80) {
                 waddch(p->win, (chtype)cp);
             } else {
-                /* Multi-byte: write raw UTF-8 bytes */
+                
                 tmp[blen_cp] = '\0';
                 waddstr(p->win, tmp);
             }
@@ -398,7 +401,7 @@ void pane_render(Pane *p, bool force) {
             byte_pos   += (size_t)blen_cp;
         }
         wstandend(p->win);
-        /* Cursor at end of line */
+        
         if (byte_pos == p->cursor && is_cur_row && screen_col < text_w) {
             wattron(p->win, A_REVERSE); waddch(p->win, ' '); wstandend(p->win);
         }
@@ -472,7 +475,7 @@ void pane_insert_char(Pane *p, char c) {
             { p->cursor++; goto done; }
         gb_insert_char(p->buf, p->cursor, c); p->cursor++;
     }
-    pane_push_undo(p); /* push APRÈS insertion avec curseur correct */
+    pane_push_undo(p); 
 done:
     mark_dirty(p);
     li_rebuild(p->li, p->buf);
@@ -490,7 +493,7 @@ void pane_insert_str(Pane *p, const char *s, size_t n) {
 void pane_delete_char(Pane *p) {
     if (p->cursor == 0) return;
     size_t blen = gb_len(p->buf);
-    /* Find start of previous codepoint */
+    
     size_t back = gb_prev_cp(p->buf, p->cursor);
     size_t prev_pos = p->cursor - back;
     char prev = gb_at(p->buf, prev_pos);
@@ -520,7 +523,7 @@ void pane_delete_forward(Pane *p) {
 void pane_move_cursor(Pane *p, int dy, int dx) {
     if (p->li->dirty) li_rebuild(p->li, p->buf);
     if (dy != 0) {
-        /* Vertical: use preferred_col (visual), find closest byte offset */
+        
         size_t nl = li_line_count(p->li);
         long tl = (long)p->cursor_line + dy;
         if (tl < 0) tl = 0;
@@ -659,13 +662,11 @@ void pane_wipe_file(Pane *p) {
     bool file_exists = p->filename[0] && stat(p->filename, &_st) == 0;
 
     if (file_exists) {
-        /* Fichier sur disque : shred puis vider */
-        char cmd[4200];
-        snprintf(cmd, sizeof cmd, "shred -uz \"%s\" 2>&1", p->filename);
-        int _r = system(cmd); (void)_r;
-        p->filename[0] = '\0';
+        
+        FILE *f = fopen(p->filename, "w");
+        if (f) fclose(f);
     }
-    /* Dans tous les cas : vider le buffer éditeur */
+    
     gb_free(p->buf); p->buf = gb_new(GAP_DEFAULT);
     li_free(p->li);  p->li  = li_new();
     syn_free(p->syn); p->syn = syn_new(p->lang);

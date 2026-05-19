@@ -2,7 +2,6 @@
 #include <string.h>
 #include <ctype.h>
 
-/* ─── Keyword tables ─────────────────────────────────────────── */
 static const char *kw_c[] = {
     "auto","break","case","continue","default","do","else","enum",
     "extern","for","goto","if","inline","register","return","sizeof",
@@ -106,7 +105,7 @@ Language lang_from_ext(const char *ext) {
     if (strcmp(ext,".css")==0)  return LANG_CSS;
     if (strcmp(ext,".php")==0)  return LANG_PHP;
     if (strcmp(ext,".cs")==0)   return LANG_CS;
-    /* Binary / hex formats → hex viewer */
+    
     if (strcmp(ext,".bin")==0  || strcmp(ext,".dump")==0 ||
         strcmp(ext,".dmp")==0  || strcmp(ext,".img")==0  ||
         strcmp(ext,".iso")==0  || strcmp(ext,".exe")==0  ||
@@ -120,8 +119,6 @@ Language lang_from_ext(const char *ext) {
         return LANG_HEX;
     return LANG_NONE;
 }
-
-/* ─── State machine lexer ────────────────────────────────────── */
 
 typedef struct { int state; } LexState;
 

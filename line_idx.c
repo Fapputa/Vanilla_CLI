@@ -20,7 +20,7 @@ void li_rebuild(LineIdx *li, const GapBuf *g) {
     li->count = 0;
     size_t len = gb_len(g);
 
-    /* ensure capacity */
+    
     if (li->cap < 2) {
         li->cap = LINE_IDX_CHUNK;
         li->offsets = realloc(li->offsets, li->cap * sizeof(size_t));

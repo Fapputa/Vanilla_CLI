@@ -3,8 +3,7 @@
 #include <locale.h>
 
 Editor E;
-
-/* ─── Layout ─────────────────────────────────────────────────── */
+char E_notify[256] = "";  
 
 static void layout_windows(void) {
     int rows, cols;
@@ -16,7 +15,7 @@ static void layout_windows(void) {
     int edit_h   = rows - title_h - status_h - out_h;
     if (edit_h < 1) edit_h = 1;
 
-    /* ── File Inspector panel (à droite, priorité sur le tree) ── */
+    
     int finfo_w = 0;
     if (E.finfo && E.finfo->visible) {
         finfo_w = E.finfo->width;
@@ -31,7 +30,7 @@ static void layout_windows(void) {
         }
     }
 
-    /* ── File tree panel (à droite du tree, avant finfo) ── */
+    
     int tree_w = 0;
     if (E.tree && E.tree->visible) {
         tree_w = E.tree->width;
@@ -75,8 +74,6 @@ static void layout_windows(void) {
     }
 }
 
-/* ─── Title bar ──────────────────────────────────────────────── */
-
 static void render_title(void) {
     wbkgdset(E.title_win, ' ' | COLOR_PAIR(COLOR_PAIR_TITLE));
     wmove(E.title_win, 0, 0);
@@ -106,8 +103,6 @@ static void render_title(void) {
     wattroff(E.title_win, COLOR_PAIR(COLOR_PAIR_TITLE) | A_BOLD);
     wnoutrefresh(E.title_win);
 }
-
-/* ─── Status bar ─────────────────────────────────────────────── */
 
 static void render_status(void) {
     wmove(E.status_win, 0, 0);
@@ -145,11 +140,23 @@ static void render_status(void) {
                 readonly ? "  [RO]" : "");
     }
     wclrtoeol(E.status_win);
+
+    
+    if (E_notify[0]) {
+        int rows, cols; getmaxyx(stdscr, rows, cols); (void)rows;
+        int msglen = (int)strlen(E_notify);
+        int nx = cols - msglen - 2;
+        if (nx < 1) nx = 1;
+        wattron(E.status_win, COLOR_PAIR(COLOR_PAIR_STATUS) | A_BOLD);
+        
+        init_pair(99, COLOR_WHITE, COLOR_RED);
+        wattron(E.status_win, COLOR_PAIR(99) | A_BOLD);
+        mvwprintw(E.status_win, 0, nx, " %s ", E_notify);
+        wattroff(E.status_win, COLOR_PAIR(99) | A_BOLD);
+    }
     wattroff(E.status_win, COLOR_PAIR(COLOR_PAIR_STATUS));
     wnoutrefresh(E.status_win);
 }
-
-/* ─── Pane borders ────────────────────────────────────────────── */
 
 static void render_pane_borders(void) {
     if (E.npanes < 2) return;
@@ -172,8 +179,6 @@ static void render_pane_borders(void) {
     (void)cols;
 }
 
-/* ─── Output pane ────────────────────────────────────────────── */
-
 static void render_output(void) {
     if (!E.out_visible || !E.out_win || !E.out_text) return;
     int h, w; getmaxyx(E.out_win, h, w);
@@ -192,8 +197,6 @@ static void render_output(void) {
     wattroff(E.out_win, COLOR_PAIR(COLOR_PAIR_COMMENT));
     wnoutrefresh(E.out_win);
 }
-
-/* ─── Dialog ──────────────────────────────────────────────────── */
 
 static void render_dialog(const char *title) {
     int rows, cols; getmaxyx(stdscr, rows, cols);
@@ -218,8 +221,6 @@ static void render_dialog(const char *title) {
     delwin(dw2);
 }
 
-/* ─── Full redraw ────────────────────────────────────────────── */
-
 static void full_redraw(bool force) {
     for (int i = 0; i < E.npanes; i++) {
         Pane *p = E.panes[i];
@@ -228,7 +229,7 @@ static void full_redraw(bool force) {
         else
             pane_render(p, force);
     }
-    /* File tree */
+    
     if (E.tree && E.tree->visible && E.tree->win) {
         int rows, cols; getmaxyx(stdscr, rows, cols);
         int title_h = 1, status_h = 1;
@@ -238,7 +239,7 @@ static void full_redraw(bool force) {
         ft_render(E.tree, E.tree->win, edit_h, E.tree->width, E.tree_focus);
         (void)cols;
     }
-    /* File Inspector */
+    
     if (E.finfo && E.finfo->visible && E.finfo->win) {
         int rows, cols; getmaxyx(stdscr, rows, cols);
         int title_h = 1, status_h = 1;
@@ -267,8 +268,6 @@ static void full_redraw(bool force) {
     doupdate();
 }
 
-/* ─── Dialog input ────────────────────────────────────────────── */
-
 static void dialog_insert(char c) {
     size_t len = strlen(E.dialog_buf);
     if (len >= sizeof(E.dialog_buf)-1) return;
@@ -296,7 +295,7 @@ static void dialog_confirm(void) {
     Pane *ap = E.panes[E.active];
     switch (E.mode) {
 
-        /* ── Hex dialogs ─────────────────────────────────────── */
+        
         case MODE_HEX_JUMP: {
             if (ap->hex && E.dialog_buf[0]) {
                 char *end;
@@ -305,36 +304,36 @@ static void dialog_confirm(void) {
                         && (size_t)off < ap->hex->data_len) {
                     ap->hex->cursor = (size_t)off;
                     ap->hex->nibble = 0;
-                    hex_scroll_to_cursor(ap->hex, ap->win_h); /* ← scroll */
+                    hex_scroll_to_cursor(ap->hex, ap->win_h); 
                 }
             }
             E.mode = MODE_NORMAL;
-            full_redraw(true); /* ← redraw */
+            full_redraw(true); 
             return;
         }
         case MODE_HEX_SEARCH: {
             if (!ap->hex) { E.mode = MODE_NORMAL; return; }
             HexPane *h = ap->hex;
             if (strcmp(E.dialog_buf, h->search_query) != 0) {
-                /* Nouvelle query → chercher et aller au premier résultat */
+                
                 hex_search_ascii(h, E.dialog_buf);
                 if (h->search_count > 0) {
                     h->search_current = 0;
                     h->cursor = h->search_results[0];
-                    hex_scroll_to_cursor(h, ap->win_h); /* ← scroll */
+                    hex_scroll_to_cursor(h, ap->win_h); 
                 }
             } else if (h->search_count > 0) {
-                /* Même query → résultat suivant */
+                
                 h->search_current = (h->search_current + 1) % h->search_count;
                 h->cursor = h->search_results[h->search_current];
-                hex_scroll_to_cursor(h, ap->win_h); /* ← scroll */
+                hex_scroll_to_cursor(h, ap->win_h); 
             }
-            /* Rester dans le dialog — Échap pour fermer */
-            full_redraw(true); /* ← redraw */
+            
+            full_redraw(true); 
             return;
         }
 
-        /* ── Normal dialogs ──────────────────────────────────── */
+        
         case MODE_SAVE_DIALOG:
             pane_save_file(ap, E.dialog_buf);
             force_full_dirty();
@@ -365,8 +364,8 @@ static void dialog_confirm(void) {
             } else {
                 pane_search_next(ap);
             }
-            full_redraw(true); /* ← redraw */
-            return; /* stay in dialog */
+            full_redraw(true); 
+            return; 
         case MODE_GOTO_LINE: {
             long l = atol(E.dialog_buf);
             if (l > 0) pane_move_to_line_col(ap, (size_t)(l-1), 0);
@@ -384,10 +383,8 @@ static void open_dialog(EditorMode m, const char *prefill) {
     E.dialog_cursor = strlen(E.dialog_buf);
 }
 
-/* ─── Key handling ────────────────────────────────────────────── */
-
 static void handle_key_normal(int key) {
-    /* ── F1 : toggle file tree ───────────────────────────────────── */
+    
     if (key == KEY_F(1)) {
         if (E.tree) {
             E.tree->visible = !E.tree->visible;
@@ -399,12 +396,12 @@ static void handle_key_normal(int key) {
         return;
     }
 
-    /* ── F3 : toggle file inspector + gestion focus ─────────────── */
+    
     static bool finfo_focus = false;
     if (key == KEY_F(3)) {
         if (E.finfo) {
             if (!E.finfo->visible) {
-                /* Ouvrir → prendre le focus */
+                
                 E.finfo->visible = true;
                 finfo_focus = true;
                 Pane *ap2 = E.panes[E.active];
@@ -413,7 +410,7 @@ static void handle_key_normal(int key) {
                                     : ap2->filename;
                 fi_analyze(E.finfo, fpath);
             } else {
-                /* Fermer → enlever le focus */
+                
                 E.finfo->visible = false;
                 finfo_focus = false;
                 E.finfo->scroll_row = 0;
@@ -424,7 +421,7 @@ static void handle_key_normal(int key) {
         return;
     }
 
-    /* ── Scroll dans le file inspector quand il a le focus ───────── */
+    
     if (finfo_focus && E.finfo && E.finfo->visible) {
         if (key == KEY_DOWN || key == 'j') {
             E.finfo->scroll_row++;
@@ -433,7 +430,7 @@ static void handle_key_normal(int key) {
             if (E.finfo->scroll_row > 0) E.finfo->scroll_row--;
             return;
         }
-        /* Tab : garder le panneau ouvert mais rendre le focus à l'éditeur */
+        
         if (key == '\t') {
             finfo_focus = false;
             return;
@@ -441,11 +438,11 @@ static void handle_key_normal(int key) {
     }
     if (!E.finfo || !E.finfo->visible) finfo_focus = false;
 
-    /* ── Focus / unfocus le tree avec Tab quand il est visible ─────── */
-    /* Tab bascule focus tree ↔ éditeur (seulement si tree visible) */
+    
+    
     if (key == '\t' && E.tree && E.tree->visible) {
-        /* En mode hex le Tab est utilisé pour basculer hex↔ascii,
-           donc on le laisse passer si hex_mode */
+        
+
         Pane *ap2 = E.panes[E.active];
         if (!ap2->hex_mode) {
             E.tree_focus = !E.tree_focus;
@@ -453,19 +450,19 @@ static void handle_key_normal(int key) {
         }
     }
 
-    /* ── Routing vers le tree si focus ──────────────────────────── */
+    
     if (E.tree_focus && E.tree && E.tree->visible) {
         char open_path[4096] = "";
         bool consumed = ft_handle_key(E.tree, key, open_path, sizeof open_path);
         if (open_path[0]) {
-            /* Ouvrir le fichier dans le pane actif */
+            
             Pane *ap2 = E.panes[E.active];
             gb_free(ap2->buf);  ap2->buf = gb_new(GAP_DEFAULT);
             li_free(ap2->li);   ap2->li  = li_new();
             syn_free(ap2->syn); ap2->syn = syn_new(LANG_C);
             ap2->cursor = 0;
             pane_open_file(ap2, open_path);
-            /* Mettre à jour le cwd du tree vers le répertoire du fichier */
+            
             char tmp[4096];
             strncpy(tmp, open_path, sizeof tmp - 1);
             char *slash = strrchr(tmp, '/');
@@ -476,21 +473,21 @@ static void handle_key_normal(int key) {
                     strncpy(E.tree->cwd, resolved, sizeof E.tree->cwd - 1);
                 ft_reload(E.tree);
             }
-            /* Mettre à jour le file inspector si visible */
+            
             if (E.finfo && E.finfo->visible)
                 fi_analyze(E.finfo, open_path);
-            E.tree_focus = false;   /* revenir au focus éditeur */
+            E.tree_focus = false;   
             layout_windows();
             force_full_dirty();
         } else if (consumed) {
-            /* simple navigation dans le tree, juste redraw */
+            
         }
         if (consumed) return;
     }
 
     Pane *ap = E.panes[E.active];
 
-    /* ── Hex mode ─────────────────────────────────────────────── */
+    
     if (ap->hex_mode && ap->hex) {
         if (key == ('q'&0x1f)) { E.running = false; return; }
         if (key == ('a'&0x1f)) { E.show_shortcuts = !E.show_shortcuts; return; }
@@ -510,12 +507,12 @@ static void handle_key_normal(int key) {
                         ap->hex->search_query[0] ? ap->hex->search_query : NULL);
             return;
         }
-        /* Tout le reste : navigation, Tab, nibbles, ASCII edit */
+        
         hex_handle_key(ap->hex, key, ap->win_h);
         return;
     }
 
-    /* ── Mode texte normal ────────────────────────────────────── */
+    
     switch (key) {
         case KEY_UP:    pane_move_cursor(ap, -1, 0); break;
         case KEY_DOWN:  pane_move_cursor(ap,  1, 0); break;
@@ -526,7 +523,7 @@ static void handle_key_normal(int key) {
         case KEY_HOME: {
             size_t ls = li_line_start(ap->li, ap->cursor_line);
             ap->cursor = ls;
-            ap->scroll_col = 0;   /* always reset horizontal scroll */
+            ap->scroll_col = 0;   
             pane_move_cursor(ap, 0, 0); break;
         }
         case KEY_END: {
@@ -584,13 +581,13 @@ static void handle_key_normal(int key) {
         case 'g'&0x1f: open_dialog(MODE_GOTO_LINE, NULL); break;
         case 'a'&0x1f: E.show_shortcuts = !E.show_shortcuts; break;
 
-        /* Ctrl+D : beautify (strip emojis + comments) */
+        
         case 'd'&0x1f:
             pane_beautify(ap);
             force_full_dirty();
             break;
 
-        /* F2 — entrer en hex mode */
+        
         case KEY_F(2):
             if (!ap->hex) ap->hex = hex_new();
             if (ap->filename[0]) hex_load(ap->hex, ap->filename);
@@ -616,7 +613,7 @@ static void handle_key_normal(int key) {
         case KEY_MOUSE: {
             MEVENT ev;
             if (getmouse(&ev) == OK) {
-                if (ev.bstate & BUTTON4_PRESSED) {      /* molette haut */
+                if (ev.bstate & BUTTON4_PRESSED) {      
                     if (E.tree_focus && E.tree && E.tree->visible) {
                         if (E.tree->selected > 0) E.tree->selected--;
                     } else if (E.finfo && E.finfo->visible) {
@@ -624,7 +621,7 @@ static void handle_key_normal(int key) {
                     } else {
                         pane_move_cursor(ap, -3, 0);
                     }
-                } else if (ev.bstate & BUTTON5_PRESSED) { /* molette bas */
+                } else if (ev.bstate & BUTTON5_PRESSED) { 
                     if (E.tree_focus && E.tree && E.tree->visible) {
                         if (E.tree->selected + 1 < E.tree->count)
                             E.tree->selected++;
@@ -677,8 +674,6 @@ static void handle_key_dialog(int key) {
     }
 }
 
-/* ─── Editor lifecycle ────────────────────────────────────────── */
-
 void editor_init(void) {
     memset(&E, 0, sizeof E);
     pthread_mutex_init(&E.save_mutex, NULL);
@@ -687,7 +682,7 @@ void editor_init(void) {
     E.active   = 0;
     E.running  = true;
     E.tree     = ft_new();
-    E.tree_focus = false;  /* focus sur l'éditeur par défaut */
+    E.tree_focus = false;  
     E.finfo    = fi_new();
 }
 
@@ -742,8 +737,6 @@ void editor_cleanup(void) {
     unlink("./temp_bin");
 }
 
-/* ─── Main loop ──────────────────────────────────────────────── */
-
 void editor_run(const char *initial_file) {
     setlocale(LC_ALL, "");
     initscr(); raw(); noecho();
@@ -752,11 +745,11 @@ void editor_run(const char *initial_file) {
     set_escdelay(25);
     curs_set(0);
     colors_init();
-    use_default_colors();  /* bg=-1 dans init_pair = fond terminal transparent */
+    use_default_colors();  
     hex_colors_init();
     fi_colors_init();
 
-    printf("\033[?2004h"); /* bracketed paste */
+    printf("\033[?2004h"); 
     fflush(stdout);
     layout_windows();
 
@@ -784,22 +777,17 @@ void editor_run(const char *initial_file) {
 
         if (key == 0 || key == ERR || key == 0x16) continue;
 
+        
+        E_notify[0] = '\0';
+
         if (key == KEY_RESIZE) {
             endwin(); refresh();
             layout_windows(); full_redraw(true);
             continue;
         }
 
-        /* Escape sequence dispatcher.
-         * Reads up to 8 extra bytes (short timeout) to recognise:
-         *   Ctrl+Tab sequences from common terminals:
-         *     xterm        ESC [ 2 7 ; 5 ; 9 ~
-         *     xterm-alt    ESC [ 1 ; 5 I
-         *     kitty        ESC [ 9 ; 5 u
-         *     Shift+Tab    ESC [ Z          (fallback, same action)
-         *   Bracketed paste markers (handled as before).
-         *   Anything else: bytes pushed back unchanged.
-         */
+        
+
         if (key == 27) {
             WINDOW *ew = iw ? iw : stdscr;
             wtimeout(ew, 5);
@@ -815,14 +803,14 @@ void editor_run(const char *initial_file) {
 
             if (sn >= 1 && sq[0] == '[') {
 
-                /* ESC [ Z  -- Shift+Tab */
+                
                 if (!consumed && sn >= 2 && sq[1] == 'Z') {
                     for (int si = sn-1; si >= 2; si--)
                         if (sq[si]!=ERR) ungetch(sq[si]);
                     key = KEY_BTAB; consumed = true;
                 }
 
-                /* ESC [ 2 7 ; 5 ; 9 ~  -- xterm Ctrl+Tab */
+                
                 if (!consumed && sn >= 6
                         && sq[1]=='2' && sq[2]=='7'
                         && sq[3]==';' && sq[4]=='5' && sq[5]==';') {
@@ -834,7 +822,7 @@ void editor_run(const char *initial_file) {
                     }
                 }
 
-                /* ESC [ 1 ; 5 I  -- xterm alternate Ctrl+Tab */
+                
                 if (!consumed && sn >= 5
                         && sq[1]=='1' && sq[2]==';' && sq[3]=='5' && sq[4]=='I') {
                     for (int si = sn-1; si >= 5; si--)
@@ -842,7 +830,7 @@ void editor_run(const char *initial_file) {
                     key = KEY_BTAB; consumed = true;
                 }
 
-                /* ESC [ 9 ; 5 u  -- kitty Ctrl+Tab */
+                
                 if (!consumed && sn >= 5
                         && sq[1]=='9' && sq[2]==';' && sq[3]=='5' && sq[4]=='u') {
                     for (int si = sn-1; si >= 5; si--)
@@ -850,7 +838,7 @@ void editor_run(const char *initial_file) {
                     key = KEY_BTAB; consumed = true;
                 }
 
-                /* ESC [ 2 0 0 ~  -- bracketed paste start */
+                
                 if (!consumed && sn >= 5
                         && sq[1]=='2' && sq[2]=='0'
                         && sq[3]=='0' && sq[4]=='~') {
@@ -864,7 +852,7 @@ void editor_run(const char *initial_file) {
                     continue;
                 }
 
-                /* ESC [ 2 0 1 ~  -- bracketed paste end */
+                
                 if (!consumed && sn >= 5
                         && sq[1]=='2' && sq[2]=='0'
                         && sq[3]=='1' && sq[4]=='~') {
@@ -881,13 +869,13 @@ void editor_run(const char *initial_file) {
                     full_redraw(true); continue;
                 }
 
-                /* Unknown ESC [ sequence -- push back */
+                
                 if (!consumed) {
                     for (int si = sn-1; si >= 0; si--)
                         if (sq[si]!=ERR) ungetch(sq[si]);
                 }
             } else {
-                /* Not ESC [ -- push back */
+                
                 for (int si = sn-1; si >= 0; si--)
                     if (sq[si]!=ERR) ungetch(sq[si]);
             }
@@ -900,7 +888,7 @@ void editor_run(const char *initial_file) {
             continue;
         }
 
-        /* Fast-paste batching — skip in hex mode and dialog */
+        
         Pane *ap = E.panes[E.active];
         (void)ap;
         EditorMode prev_mode = E.mode;
@@ -911,7 +899,7 @@ void editor_run(const char *initial_file) {
         full_redraw(force);
     }
 
-    printf("\033[?2004l"); /* disable bracketed paste */
+    printf("\033[?2004l"); 
     fflush(stdout);
     endwin();
 }

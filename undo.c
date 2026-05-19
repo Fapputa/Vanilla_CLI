@@ -1,6 +1,5 @@
 #include "abyss.h"
 
-/* Forward-declare clone (defined in gap_buf.c) */
 GapBuf *gb_clone(const GapBuf *g);
 
 #define MAX_UNDO_DEPTH 512
@@ -28,7 +27,7 @@ void us_free(UndoStack *us) {
 }
 
 void us_push(UndoStack *us, const GapBuf *g, size_t cursor) {
-    /* Discard redo history */
+    
     if (us->current) {
         UndoAction *a = us->current->next;
         while (a) {
@@ -48,7 +47,7 @@ void us_push(UndoStack *us, const GapBuf *g, size_t cursor) {
     us->current = ua;
 
     us->depth++;
-    /* Trim oldest entries if too deep */
+    
     if (us->depth > MAX_UNDO_DEPTH) {
         UndoAction *old = us->head;
         us->head = old->next;

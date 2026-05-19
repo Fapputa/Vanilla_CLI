@@ -14,7 +14,6 @@
 #include <grp.h>
 #include <elf.h>
 
-/* ── Minimal SHA-256 (public domain, no external deps) ─────────────── */
 typedef struct { uint32_t state[8]; uint64_t count; uint8_t buf[64]; } SHA256_CTX2;
 static const uint32_t K256[64] = {
     0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,
@@ -65,22 +64,21 @@ static void sha256_final(SHA256_CTX2 *c, uint8_t *h) {
     for(i=0;i<8;i++){h[i*4]=(c->state[i]>>24)&0xff;h[i*4+1]=(c->state[i]>>16)&0xff;h[i*4+2]=(c->state[i]>>8)&0xff;h[i*4+3]=c->state[i]&0xff;}
 }
 
-/* ── Color pairs (allocated after filetree's range) ─────────────── */
 #define FI_CP_BASE       110
-#define FI_CP_HEADER     (FI_CP_BASE + 0)   /* bandeau titre */
-#define FI_CP_SECTION    (FI_CP_BASE + 1)   /* section label */
-#define FI_CP_KEY        (FI_CP_BASE + 2)   /* clé */
-#define FI_CP_VAL        (FI_CP_BASE + 3)   /* valeur normale */
-#define FI_CP_VAL_GOOD   (FI_CP_BASE + 4)   /* valeur positive (ex: writable) */
-#define FI_CP_VAL_WARN   (FI_CP_BASE + 5)   /* valeur avertissement */
-#define FI_CP_VAL_BAD    (FI_CP_BASE + 6)   /* valeur danger */
-#define FI_CP_MAGIC      (FI_CP_BASE + 7)   /* magic number */
-#define FI_CP_PERM_ON    (FI_CP_BASE + 8)   /* permission activée */
-#define FI_CP_PERM_OFF   (FI_CP_BASE + 9)   /* permission absente */
-#define FI_CP_BORDER     (FI_CP_BASE + 10)  /* bordure */
-#define FI_CP_ENCODING   (FI_CP_BASE + 11)  /* encodage */
-#define FI_CP_SIZE       (FI_CP_BASE + 12)  /* taille fichier */
-#define FI_CP_DATE       (FI_CP_BASE + 13)  /* dates */
+#define FI_CP_HEADER     (FI_CP_BASE + 0)   
+#define FI_CP_SECTION    (FI_CP_BASE + 1)   
+#define FI_CP_KEY        (FI_CP_BASE + 2)   
+#define FI_CP_VAL        (FI_CP_BASE + 3)   
+#define FI_CP_VAL_GOOD   (FI_CP_BASE + 4)   
+#define FI_CP_VAL_WARN   (FI_CP_BASE + 5)   
+#define FI_CP_VAL_BAD    (FI_CP_BASE + 6)   
+#define FI_CP_MAGIC      (FI_CP_BASE + 7)   
+#define FI_CP_PERM_ON    (FI_CP_BASE + 8)   
+#define FI_CP_PERM_OFF   (FI_CP_BASE + 9)   
+#define FI_CP_BORDER     (FI_CP_BASE + 10)  
+#define FI_CP_ENCODING   (FI_CP_BASE + 11)  
+#define FI_CP_SIZE       (FI_CP_BASE + 12)  
+#define FI_CP_DATE       (FI_CP_BASE + 13)  
 
 void fi_colors_init(void) {
     init_pair(FI_CP_HEADER,   COLOR_BLACK,   COLOR_CYAN);
@@ -112,20 +110,18 @@ void fi_free(FileInfo *fi) {
     free(fi);
 }
 
-/* ── Magic number detection ─────────────────────────────────────── */
-
 typedef struct {
-    const char *ext;           /* extension attendue */
-    const char *real_name;     /* nom complet du format */
-    const char *description;   /* description fonctionnelle */
-    const char *category;      /* catégorie */
+    const char *ext;           
+    const char *real_name;     
+    const char *description;   
+    const char *category;      
     unsigned char magic[16];
     int    magic_len;
-    int    magic_offset;       /* offset dans le fichier */
+    int    magic_offset;       
 } MagicEntry;
 
 static const MagicEntry MAGIC_DB[] = {
-    /* Images */
+    
     {".png",  "PNG Image",         "Image raster compressée sans perte (Portable Network Graphics). Supporte la transparence alpha.",
      "Image",  {0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A}, 8, 0},
     {".jpg",  "JPEG Image",        "Image raster compressée avec perte (Joint Photographic Experts Group). Standard photographique.",
@@ -141,7 +137,7 @@ static const MagicEntry MAGIC_DB[] = {
     {".tiff", "TIFF Image",        "Format d'image haute qualité (Tagged Image File Format). Utilisé en photographie pro.",
      "Image",  {0x49,0x49,0x2A,0x00}, 4, 0},
 
-    /* Audio */
+    
     {".mp3",  "MP3 Audio",         "Audio compressé avec perte (MPEG-1 Audio Layer III). Standard mondial de la musique numérique.",
      "Audio",  {0x49,0x44,0x33}, 3, 0},
     {".flac", "FLAC Audio",        "Audio compressé sans perte (Free Lossless Audio Codec). Qualité CD parfaite.",
@@ -153,7 +149,7 @@ static const MagicEntry MAGIC_DB[] = {
     {".aac",  "AAC Audio",         "Audio compressé avancé (Advanced Audio Coding). Successeur du MP3.",
      "Audio",  {0xFF,0xF1}, 2, 0},
 
-    /* Vidéo */
+    
     {".mp4",  "MP4 Video",         "Conteneur vidéo MPEG-4. Format standard pour la vidéo numérique moderne.",
      "Video",  {0x66,0x74,0x79,0x70}, 4, 4},
     {".mkv",  "Matroska Video",    "Conteneur vidéo open-source (Matroska). Supporte tous les codecs.",
@@ -161,7 +157,7 @@ static const MagicEntry MAGIC_DB[] = {
     {".avi",  "AVI Video",         "Audio Video Interleave Microsoft. Format vidéo Windows classique.",
      "Video",  {0x52,0x49,0x46,0x46}, 4, 0},
 
-    /* Documents */
+    
     {".pdf",  "PDF Document",      "Document portable (Portable Document Format). Standard d'échange de documents Adobe.",
      "Document", {0x25,0x50,0x44,0x46,0x2D}, 5, 0},
     {".docx", "DOCX Document",     "Document Word XML compressé (Office Open XML). Format Microsoft Word moderne.",
@@ -171,7 +167,7 @@ static const MagicEntry MAGIC_DB[] = {
     {".odt",  "ODF Text",          "Document texte Open Document Format. Standard ISO pour les suites bureautiques libres.",
      "Document", {0x50,0x4B,0x03,0x04}, 4, 0},
 
-    /* Archives */
+    
     {".zip",  "ZIP Archive",       "Archive compressée (ZIP). Format universel de compression de fichiers.",
      "Archive", {0x50,0x4B,0x03,0x04}, 4, 0},
     {".gz",   "GZIP Archive",      "Fichier compressé GZIP. Compression Unix standard.",
@@ -193,7 +189,7 @@ static const MagicEntry MAGIC_DB[] = {
     {".rpm",  "RPM Package",       "Paquet logiciel RPM (Red Hat Package Manager). Format Fedora/RHEL/CentOS.",
      "Package", {0xED,0xAB,0xEE,0xDB}, 4, 0},
 
-    /* Exécutables & bibliothèques */
+    
     {".elf",  "ELF Executable",    "Executable and Linkable Format Linux/Unix. Binaire natif Linux.",
      "Binary", {0x7F,0x45,0x4C,0x46}, 4, 0},
     {".so",   "Shared Library",    "Bibliothèque partagée ELF Linux. Chargée dynamiquement à l'exécution.",
@@ -205,13 +201,13 @@ static const MagicEntry MAGIC_DB[] = {
     {".wasm", "WebAssembly",       "Module WebAssembly. Bytecode portable haute performance pour le web.",
      "Binary", {0x00,0x61,0x73,0x6D}, 4, 0},
 
-    /* Données & bases */
+    
     {".sqlite","SQLite Database",  "Base de données SQLite. SGBD embarqué le plus répandu au monde.",
      "Database", {0x53,0x51,0x4C,0x69,0x74,0x65,0x20,0x66,0x6F,0x72,0x6D,0x61,0x74,0x20,0x33,0x00}, 16, 0},
     {".dmp",  "Core Dump / Dump",  "Dump mémoire ou crash dump. Instantané de la mémoire d'un processus.",
      "Debug", {0}, 0, 0},
 
-    /* Polices */
+    
     {".ttf",  "TrueType Font",     "Police de caractères TrueType (Apple/Microsoft). Format vectoriel scalable.",
      "Font",   {0x00,0x01,0x00,0x00,0x00}, 5, 0},
     {".otf",  "OpenType Font",     "Police OpenType (Adobe/Microsoft). Supérieure au TrueType, supporte plus de glyphes.",
@@ -219,7 +215,7 @@ static const MagicEntry MAGIC_DB[] = {
     {".woff", "WOFF Font",         "Web Open Font Format. Police optimisée pour le web.",
      "Font",   {0x77,0x4F,0x46,0x46}, 4, 0},
 
-    /* Données scientifiques & médias spéciaux */
+    
     {".mid",  "MIDI File",         "Fichier MIDI (Musical Instrument Digital Interface). Séquenceur musical numérique.",
      "Audio",  {0x4D,0x54,0x68,0x64}, 4, 0},
     {".psd",  "Photoshop Document","Fichier Photoshop natif (Adobe). Supporte les calques et effets.",
@@ -249,7 +245,6 @@ static const MagicEntry MAGIC_DB[] = {
     {NULL, NULL, NULL, NULL, {0}, 0, 0}
 };
 
-/* Detect magic from raw bytes */
 static const MagicEntry *detect_magic(const char *path) {
     unsigned char buf[512];
     int fd = open(path, O_RDONLY);
@@ -269,7 +264,6 @@ static const MagicEntry *detect_magic(const char *path) {
     return NULL;
 }
 
-/* Find ext entry by extension */
 static const MagicEntry *find_by_ext(const char *ext) {
     if (!ext) return NULL;
     for (int i = 0; MAGIC_DB[i].ext != NULL; i++)
@@ -278,7 +272,6 @@ static const MagicEntry *find_by_ext(const char *ext) {
     return NULL;
 }
 
-/* ── Encoding detection ─────────────────────────────────────────── */
 static const char *detect_encoding(const char *path) {
     unsigned char buf[4096];
     int fd = open(path, O_RDONLY);
@@ -287,14 +280,14 @@ static const char *detect_encoding(const char *path) {
     close(fd);
     if (n <= 0) return "Empty";
 
-    /* BOM checks */
+    
     if (n >= 3 && buf[0]==0xEF && buf[1]==0xBB && buf[2]==0xBF) return "UTF-8 BOM";
     if (n >= 2 && buf[0]==0xFF && buf[1]==0xFE) return "UTF-16 LE";
     if (n >= 2 && buf[0]==0xFE && buf[1]==0xFF) return "UTF-16 BE";
     if (n >= 4 && buf[0]==0x00 && buf[1]==0x00 && buf[2]==0xFE && buf[3]==0xFF) return "UTF-32 BE";
     if (n >= 4 && buf[0]==0xFF && buf[1]==0xFE && buf[2]==0x00 && buf[3]==0x00) return "UTF-32 LE";
 
-    /* Check binary */
+    
     int nulls = 0, highs = 0;
     bool valid_utf8 = true;
     for (ssize_t i = 0; i < n; i++) {
@@ -303,7 +296,7 @@ static const char *detect_encoding(const char *path) {
     }
     if (nulls > n / 20) return "Binary";
 
-    /* Try valid UTF-8 */
+    
     for (ssize_t i = 0; i < n && valid_utf8; ) {
         unsigned char c = buf[i];
         int bytes = 0;
@@ -322,7 +315,6 @@ static const char *detect_encoding(const char *path) {
     return "Latin-1 / ISO-8859";
 }
 
-/* ── Line ending detection ──────────────────────────────────────── */
 static const char *detect_line_endings(const char *path) {
     unsigned char buf[8192];
     int fd = open(path, O_RDONLY);
@@ -343,7 +335,6 @@ static const char *detect_line_endings(const char *path) {
     return "None";
 }
 
-/* ── Human-readable size ────────────────────────────────────────── */
 static void fmt_size(off_t sz, char *out, size_t outlen) {
     if      (sz < 1024LL)              snprintf(out, outlen, "%lld B", (long long)sz);
     else if (sz < 1024LL*1024)         snprintf(out, outlen, "%.2f KiB (%lld bytes)", (double)sz/1024.0, (long long)sz);
@@ -352,7 +343,6 @@ static void fmt_size(off_t sz, char *out, size_t outlen) {
     else                               snprintf(out, outlen, "%.2f TiB (%lld bytes)", (double)sz/(1024.0*1024*1024*1024), (long long)sz);
 }
 
-/* ── Permission string ──────────────────────────────────────────── */
 static void fmt_perms(mode_t mode, char *out) {
     out[0]  = S_ISDIR(mode)  ? 'd' : S_ISLNK(mode) ? 'l' : '-';
     out[1]  = (mode & S_IRUSR) ? 'r' : '-';
@@ -367,7 +357,6 @@ static void fmt_perms(mode_t mode, char *out) {
     out[10] = '\0';
 }
 
-/* ── File type string ───────────────────────────────────────────── */
 static const char *file_type_str(mode_t mode) {
     if (S_ISREG(mode))  return "Regular file";
     if (S_ISDIR(mode))  return "Directory";
@@ -379,7 +368,6 @@ static const char *file_type_str(mode_t mode) {
     return "Unknown";
 }
 
-/* ── Wrap text to fit width ─────────────────────────────────────── */
 static void draw_wrapped(WINDOW *win, int *vrowp, int scroll, int win_h,
                          int col, int width, int cp, const char *text) {
     if (!text || !text[0]) return;
@@ -411,7 +399,6 @@ static void draw_wrapped(WINDOW *win, int *vrowp, int scroll, int win_h,
     }
 }
 
-/* ─── Main render ─────────────────────────────────────────────── */
 void fi_analyze(FileInfo *fi, const char *path) {
     if (!path || !path[0]) {
         fi->has_data = false;
@@ -425,13 +412,13 @@ void fi_render(FileInfo *fi, WINDOW *win, int win_h, int win_w) {
     if (!win || win_h < 4 || win_w < 8) return;
     werase(win);
 
-    /* Bordure gauche */
+    
     wattron(win, COLOR_PAIR(FI_CP_BORDER) | A_BOLD);
     for (int y = 0; y < win_h; y++) mvwaddch(win, y, 0, ACS_VLINE);
     wattroff(win, COLOR_PAIR(FI_CP_BORDER) | A_BOLD);
 
-    int w = win_w - 1;   /* largeur utile (après la bordure) */
-    int x = 1;           /* début de contenu */
+    int w = win_w - 1;   
+    int x = 1;           
 
     if (!fi->has_data || !fi->path[0]) {
         wattron(win, COLOR_PAIR(FI_CP_KEY));
@@ -443,11 +430,11 @@ void fi_render(FileInfo *fi, WINDOW *win, int win_h, int win_w) {
 
     const char *path = fi->path;
 
-    /* ── stat ── */
+    
     struct stat st;
     bool has_stat = (lstat(path, &st) == 0);
 
-    /* ── magic + ext info ── */
+    
     const char *dot = strrchr(path, '.');
     const char *ext = dot ? dot : "";
     const char *basename = strrchr(path, '/');
@@ -460,7 +447,7 @@ void fi_render(FileInfo *fi, WINDOW *win, int win_h, int win_w) {
 
     int scroll = fi->scroll_row;
 
-    /* ══ Header (toujours visible, pas scrollable) ═══════════════ */
+    
     {
         wattron(win, COLOR_PAIR(FI_CP_HEADER) | A_BOLD);
         char hdr[128];
@@ -469,26 +456,22 @@ void fi_render(FileInfo *fi, WINDOW *win, int win_h, int win_w) {
         wattroff(win, COLOR_PAIR(FI_CP_HEADER) | A_BOLD);
     }
 
-    /* Scroll : vrow = indice de ligne logique (0-based).
-       row   = ligne écran = 1 + vrow - scroll.
-       ROW_VIS : la ligne est visible si row est dans [1, win_h[.
-       ADVANCE() : passe à la ligne logique suivante — TOUJOURS appelé,
-                   même si ROW_VIS était faux. */
+    
+
     int vrow = 0;
     #undef  ROW_VIS
     #define ROW_VIS   (vrow >= scroll && (1 + vrow - scroll) < win_h)
     #define row       (1 + vrow - scroll)
     #define ADVANCE() do { vrow++; } while(0)
 
-
-    /* ══ Section: Identité ════════════════════════════════════════ */
+    
     if (ROW_VIS) {
         wattron(win, COLOR_PAIR(FI_CP_SECTION) | A_BOLD);
         mvwprintw(win, row, x, "━━ Identity ");
         wattroff(win, COLOR_PAIR(FI_CP_SECTION) | A_BOLD);
     } ADVANCE();
 
-    /* Nom */
+    
     if (ROW_VIS) {
         wattron(win, COLOR_PAIR(FI_CP_KEY));
         mvwprintw(win, row, x, "Name  : "); wattroff(win, COLOR_PAIR(FI_CP_KEY));
@@ -497,7 +480,7 @@ void fi_render(FileInfo *fi, WINDOW *win, int win_h, int win_w) {
         wattroff(win, COLOR_PAIR(FI_CP_VAL) | A_BOLD);
     } ADVANCE();
 
-    /* Extension (from filename) */
+    
     if (ROW_VIS) {
         wattron(win, COLOR_PAIR(FI_CP_KEY));
         mvwprintw(win, row, x, "Ext   : "); wattroff(win, COLOR_PAIR(FI_CP_KEY));
@@ -506,7 +489,7 @@ void fi_render(FileInfo *fi, WINDOW *win, int win_h, int win_w) {
         wattroff(win, COLOR_PAIR(FI_CP_VAL));
     } ADVANCE();
 
-    /* Real extension (from magic number) */
+    
     if (has_stat && S_ISREG(st.st_mode)) {
         if (ROW_VIS) {
             wattron(win, COLOR_PAIR(FI_CP_KEY));
@@ -528,11 +511,11 @@ void fi_render(FileInfo *fi, WINDOW *win, int win_h, int win_w) {
                 mvwprintw(win, row, x+9, "(unknown)");
                 wattroff(win, COLOR_PAIR(FI_CP_VAL_WARN));
             }
-            (void)(by_magic && by_ext && strcmp(by_magic->ext, by_ext->ext)==0); /* ext_match used above */
+            (void)(by_magic && by_ext && strcmp(by_magic->ext, by_ext->ext)==0); 
         } ADVANCE();
     }
 
-    /* Format (human name from magic) */
+    
     if (ROW_VIS) {
         wattron(win, COLOR_PAIR(FI_CP_KEY));
         mvwprintw(win, row, x, "Format: "); wattroff(win, COLOR_PAIR(FI_CP_KEY));
@@ -551,7 +534,7 @@ void fi_render(FileInfo *fi, WINDOW *win, int win_h, int win_w) {
         }
     } ADVANCE();
 
-    /* Catégorie */
+    
     if (info) {
         if (ROW_VIS) {
             wattron(win, COLOR_PAIR(FI_CP_KEY));
@@ -562,7 +545,7 @@ void fi_render(FileInfo *fi, WINDOW *win, int win_h, int win_w) {
         } ADVANCE();
     }
 
-    /* Magic bytes */
+    
     if (by_magic && by_magic->magic_len > 0) {
         if (ROW_VIS) {
             wattron(win, COLOR_PAIR(FI_CP_KEY));
@@ -581,7 +564,7 @@ void fi_render(FileInfo *fi, WINDOW *win, int win_h, int win_w) {
         } ADVANCE();
     }
 
-    /* Description (avec word-wrap) */
+    
     if (info && info->description) {
         if (ROW_VIS) {
             wattron(win, COLOR_PAIR(FI_CP_KEY));
@@ -590,14 +573,14 @@ void fi_render(FileInfo *fi, WINDOW *win, int win_h, int win_w) {
         draw_wrapped(win, &vrow, scroll, win_h, x+1, w, FI_CP_VAL, info->description);
     }
 
-    /* ══ Section: Localisation ════════════════════════════════════ */
+    
     if (ROW_VIS) {
         wattron(win, COLOR_PAIR(FI_CP_SECTION) | A_BOLD);
         mvwprintw(win, row, x, "━━ Location ");
         wattroff(win, COLOR_PAIR(FI_CP_SECTION) | A_BOLD);
     } ADVANCE();
 
-    /* Chemin complet */
+    
     {
         char resolved[4096] = "";
         if (!realpath(path, resolved)) strncpy(resolved, path, sizeof(resolved)-1);
@@ -608,7 +591,7 @@ void fi_render(FileInfo *fi, WINDOW *win, int win_h, int win_w) {
         draw_wrapped(win, &vrow, scroll, win_h, x+1, w, FI_CP_VAL, resolved[0] ? resolved : path);
     }
 
-    /* Inode */
+    
     if (has_stat) {
         if (ROW_VIS) {
             wattron(win, COLOR_PAIR(FI_CP_KEY));
@@ -619,7 +602,7 @@ void fi_render(FileInfo *fi, WINDOW *win, int win_h, int win_w) {
         } ADVANCE();
     }
 
-    /* Device */
+    
     if (has_stat) {
         if (ROW_VIS) {
             wattron(win, COLOR_PAIR(FI_CP_KEY));
@@ -633,7 +616,7 @@ void fi_render(FileInfo *fi, WINDOW *win, int win_h, int win_w) {
         } ADVANCE();
     }
 
-    /* Hard links */
+    
     if (has_stat) {
         if (ROW_VIS) {
             wattron(win, COLOR_PAIR(FI_CP_KEY));
@@ -646,7 +629,7 @@ void fi_render(FileInfo *fi, WINDOW *win, int win_h, int win_w) {
         } ADVANCE();
     }
 
-    /* ══ Section: Taille ═════════════════════════════════════════ */
+    
     if (ROW_VIS) {
         wattron(win, COLOR_PAIR(FI_CP_SECTION) | A_BOLD);
         mvwprintw(win, row, x, "━━ Size ");
@@ -681,7 +664,7 @@ void fi_render(FileInfo *fi, WINDOW *win, int win_h, int win_w) {
         } ADVANCE();
     }
 
-    /* ══ Section: Encodage ════════════════════════════════════════ */
+    
     if (has_stat && S_ISREG(st.st_mode)) {
         if (ROW_VIS) {
             wattron(win, COLOR_PAIR(FI_CP_SECTION) | A_BOLD);
@@ -713,7 +696,7 @@ void fi_render(FileInfo *fi, WINDOW *win, int win_h, int win_w) {
         }
     }
 
-    /* ══ Section: Permissions ════════════════════════════════════ */
+    
     if (ROW_VIS) {
         wattron(win, COLOR_PAIR(FI_CP_SECTION) | A_BOLD);
         mvwprintw(win, row, x, "━━ Permissions ");
@@ -727,7 +710,7 @@ void fi_render(FileInfo *fi, WINDOW *win, int win_h, int win_w) {
             wattron(win, COLOR_PAIR(FI_CP_KEY));
             mvwprintw(win, row, x, "Mode  : "); wattroff(win, COLOR_PAIR(FI_CP_KEY));
 
-            /* Afficher chaque caractère avec sa couleur */
+            
             int px = x + 8;
             for (int pi = 0; pi < 10 && px < win_w-1; pi++, px++) {
                 if (perms[pi] == '-') {
@@ -740,12 +723,12 @@ void fi_render(FileInfo *fi, WINDOW *win, int win_h, int win_w) {
                     wattroff(win, COLOR_PAIR(FI_CP_PERM_ON) | A_BOLD);
                 }
             }
-            /* octal */
+            
             wattron(win, COLOR_PAIR(FI_CP_VAL));
             mvwprintw(win, row, px+1, "(%04o)", (unsigned)(st.st_mode & 07777));
             wattroff(win, COLOR_PAIR(FI_CP_VAL));
 
-            /* Bits spéciaux */
+            
             if (st.st_mode & S_ISUID) {
                 wattron(win, COLOR_PAIR(FI_CP_VAL_BAD) | A_BOLD);
                 mvwprintw(win, row, px+8, "SUID");
@@ -764,7 +747,7 @@ void fi_render(FileInfo *fi, WINDOW *win, int win_h, int win_w) {
         } ADVANCE();
     }
 
-    /* Type de fichier */
+    
     if (has_stat) {
         if (ROW_VIS) {
             wattron(win, COLOR_PAIR(FI_CP_KEY));
@@ -775,7 +758,7 @@ void fi_render(FileInfo *fi, WINDOW *win, int win_h, int win_w) {
         } ADVANCE();
     }
 
-    /* Propriétaire — wrap si trop long */
+    
     if (has_stat) {
         struct passwd *pw = getpwuid(st.st_uid);
         struct group  *gr = getgrgid(st.st_gid);
@@ -800,7 +783,7 @@ void fi_render(FileInfo *fi, WINDOW *win, int win_h, int win_w) {
         } ADVANCE();
     }
 
-    /* Accès R/W/X pour l'utilisateur courant */
+    
     if (ROW_VIS) {
         wattron(win, COLOR_PAIR(FI_CP_KEY));
         mvwprintw(win, row, x, "Access: "); wattroff(win, COLOR_PAIR(FI_CP_KEY));
@@ -816,7 +799,7 @@ void fi_render(FileInfo *fi, WINDOW *win, int win_h, int win_w) {
         }
     } ADVANCE();
 
-    /* ══ Section: Dates ══════════════════════════════════════════ */
+    
     if (ROW_VIS) {
         wattron(win, COLOR_PAIR(FI_CP_SECTION) | A_BOLD);
         mvwprintw(win, row, x, "━━ Timestamps ");
@@ -844,7 +827,7 @@ void fi_render(FileInfo *fi, WINDOW *win, int win_h, int win_w) {
         }
     }
 
-    /* ══ Section: SHA-256 ═══════════════════════════════════════ */
+    
     if (has_stat && S_ISREG(st.st_mode) && st.st_size > 0
             && st.st_size < 512*1024*1024) {
         if (ROW_VIS) {
@@ -876,11 +859,11 @@ void fi_render(FileInfo *fi, WINDOW *win, int win_h, int win_w) {
         }
     }
 
-    /* ══ Section: Contenu texte ══════════════════════════════════ */
+    
     if (has_stat && S_ISREG(st.st_mode) && st.st_size > 0) {
         const char *enc = detect_encoding(path);
         if (strcmp(enc,"Binary") != 0 && strcmp(enc,"Unknown") != 0) {
-            /* Compter lignes / mots / chars */
+            
             int fd = open(path, O_RDONLY);
             if (fd >= 0) {
                 long lines = 0, words = 0, chars = 0;
@@ -927,7 +910,7 @@ void fi_render(FileInfo *fi, WINDOW *win, int win_h, int win_w) {
         }
     }
 
-    /* ══ Section: Lien symbolique ════════════════════════════════ */
+    
     if (has_stat && S_ISLNK(st.st_mode)) {
         char lnk_target[4096] = "";
         ssize_t lr = readlink(path, lnk_target, sizeof(lnk_target)-1);
@@ -946,10 +929,9 @@ void fi_render(FileInfo *fi, WINDOW *win, int win_h, int win_w) {
         }
     }
 
-
-    /* ══ Section: Binary Info (ELF) ═════════════════════════════ */
+    
     if (has_stat && S_ISREG(st.st_mode) && st.st_size >= 64) {
-        /* Check ELF magic */
+        
         unsigned char elfhdr[64];
         int efd = open(path, O_RDONLY);
         bool is_elf = false;
@@ -965,18 +947,18 @@ void fi_render(FileInfo *fi, WINDOW *win, int win_h, int win_w) {
                 mvwprintw(win, row, x, "━━ Binary / ELF ");
                 wattroff(win, COLOR_PAIR(FI_CP_SECTION) | A_BOLD);
             } ADVANCE();
-            /* ELF class */
+            
             const char *elf_class = elfhdr[4]==1?"32-bit":elfhdr[4]==2?"64-bit":"unknown";
             const char *elf_endian = elfhdr[5]==1?"LE":elfhdr[5]==2?"BE":"?";
             const char *elf_osabi_names[] = {"System V","HP-UX","NetBSD","Linux","GNU/Hurd",
                 "?","Solaris","AIX","IRIX","FreeBSD","Tru64","Modesto","OpenBSD","OpenVMS","NSK","AROS"};
             int osabi = elfhdr[7];
             const char *osabi_str = (osabi < 16) ? elf_osabi_names[osabi] : "Other";
-            /* e_type at offset 16 (2 bytes LE) */
+            
             uint16_t e_type = (uint16_t)(elfhdr[16] | (elfhdr[17]<<8));
             const char *etype_str = e_type==1?"Relocatable":e_type==2?"Executable":
                                     e_type==3?"Shared lib":e_type==4?"Core dump":"Unknown";
-            /* e_machine at offset 18 */
+            
             uint16_t e_mach = (uint16_t)(elfhdr[18] | (elfhdr[19]<<8));
             const char *arch_str = e_mach==0x3e?"x86-64":e_mach==0x28?"ARM":
                                    e_mach==0xb7?"AArch64":e_mach==0x03?"x86":
@@ -995,7 +977,7 @@ void fi_render(FileInfo *fi, WINDOW *win, int win_h, int win_w) {
                 mvwprintw(win, row, x+8, "%s (OS: %s)", etype_str, osabi_str);
                 wattroff(win, COLOR_PAIR(FI_CP_VAL));
             } ADVANCE();
-            /* Count ELF sections */
+            
             uint16_t e_shnum = (uint16_t)(elfhdr[60] | (elfhdr[61]<<8));
             if (ROW_VIS) {
                 wattron(win, COLOR_PAIR(FI_CP_KEY));
@@ -1004,7 +986,7 @@ void fi_render(FileInfo *fi, WINDOW *win, int win_h, int win_w) {
                 mvwprintw(win, row, x+8, "%u ELF sections", (unsigned)e_shnum);
                 wattroff(win, COLOR_PAIR(FI_CP_VAL));
             } ADVANCE();
-            /* Check stripped via nm */
+            
             bool stripped = true;
             FILE *nm_pipe = NULL;
             {
@@ -1029,9 +1011,9 @@ void fi_render(FileInfo *fi, WINDOW *win, int win_h, int win_w) {
         }
     }
 
-    /* ══ Section: GPS / EXIF (JPEG only) ════════════════════════ */
+    
     if (has_stat && S_ISREG(st.st_mode) && st.st_size > 12) {
-        /* Check JPEG magic */
+        
         unsigned char jbuf[4];
         int jfd = open(path, O_RDONLY);
         bool is_jpeg = false;
@@ -1041,7 +1023,7 @@ void fi_render(FileInfo *fi, WINDOW *win, int win_h, int win_w) {
             close(jfd);
         }
         if (is_jpeg) {
-            /* Parse EXIF: scan for APP1 (FF E1) marker with "Exif" */
+            
             unsigned char *exif_buf = NULL;
             size_t exif_len = 0;
             int xfd = open(path, O_RDONLY);
@@ -1050,7 +1032,7 @@ void fi_render(FileInfo *fi, WINDOW *win, int win_h, int win_w) {
                 size_t scan_max = fsz < 65536 ? fsz : 65536;
                 unsigned char *fbuf = malloc(scan_max);
                 if (fbuf && read(xfd, fbuf, scan_max) == (ssize_t)scan_max) {
-                    /* Find APP1 */
+                    
                     for (size_t si = 0; si + 10 < scan_max; si++) {
                         if (fbuf[si]==0xFF && fbuf[si+1]==0xE1) {
                             size_t seg_len = (fbuf[si+2]<<8)|fbuf[si+3];
@@ -1063,7 +1045,7 @@ void fi_render(FileInfo *fi, WINDOW *win, int win_h, int win_w) {
                         }
                     }
                     if (exif_buf && exif_len > 8) {
-                        /* TIFF header in EXIF */
+                        
                         bool le = (exif_buf[0]=='I');
                         #define EXIF_U16(p) (le ? ((uint16_t)(p)[0]|((uint16_t)(p)[1]<<8)) : ((uint16_t)(p)[1]|((uint16_t)(p)[0]<<8)))
                         #define EXIF_U32(p) (le ? ((uint32_t)(p)[0]|((uint32_t)(p)[1]<<8)|((uint32_t)(p)[2]<<16)|((uint32_t)(p)[3]<<24)) : ((uint32_t)(p)[3]|((uint32_t)(p)[2]<<8)|((uint32_t)(p)[1]<<16)|((uint32_t)(p)[0]<<24)))
@@ -1071,7 +1053,7 @@ void fi_render(FileInfo *fi, WINDOW *win, int win_h, int win_w) {
                         double gps_lat=0, gps_lon=0, gps_alt=0;
                         bool has_lat=false, has_lon=false, has_alt=false;
                         char gps_lat_ref='N', gps_lon_ref='E';
-                        /* Scan IFD0 for GPS IFD pointer (tag 0x8825) */
+                        
                         if (ifd0_off + 2 <= exif_len) {
                             uint16_t nent = EXIF_U16(exif_buf + ifd0_off);
                             uint32_t gps_ifd_off = 0;
@@ -1080,18 +1062,18 @@ void fi_render(FileInfo *fi, WINDOW *win, int win_h, int win_w) {
                                 uint16_t tag = EXIF_U16(e);
                                 if (tag == 0x8825) { gps_ifd_off = EXIF_U32(e+8); break; }
                             }
-                            /* Parse GPS IFD */
+                            
                             if (gps_ifd_off && gps_ifd_off+2 <= exif_len) {
                                 uint16_t gn = EXIF_U16(exif_buf + gps_ifd_off);
                                 for (uint16_t gi = 0; gi < gn && gps_ifd_off+2+gi*12+12 <= exif_len; gi++) {
                                     uint8_t *ge = exif_buf + gps_ifd_off + 2 + gi*12;
                                     uint16_t gtag = EXIF_U16(ge);
                                     uint32_t voff = EXIF_U32(ge+8);
-                                    /* GPS tags: 1=LatRef, 2=Lat, 3=LonRef, 4=Lon, 5=AltRef, 6=Alt */
+                                    
                                     if (gtag == 1 && voff < exif_len) { gps_lat_ref = (char)exif_buf[voff]; }
                                     else if (gtag == 3 && voff < exif_len) { gps_lon_ref = (char)exif_buf[voff]; }
                                     else if ((gtag == 2 || gtag == 4) && voff+24 <= exif_len) {
-                                        /* 3 rationals: deg, min, sec */
+                                        
                                         double deg = (double)EXIF_U32(exif_buf+voff)   / (double)EXIF_U32(exif_buf+voff+4);
                                         double min = (double)EXIF_U32(exif_buf+voff+8) / (double)EXIF_U32(exif_buf+voff+12);
                                         double sec = (double)EXIF_U32(exif_buf+voff+16)/ (double)EXIF_U32(exif_buf+voff+20);
@@ -1137,7 +1119,7 @@ void fi_render(FileInfo *fi, WINDOW *win, int win_h, int win_w) {
                                     wattroff(win, COLOR_PAIR(FI_CP_VAL));
                                 } ADVANCE();
                             }
-                            /* Google Maps URL hint */
+                            
                             if (ROW_VIS) {
                                 wattron(win, COLOR_PAIR(FI_CP_KEY));
                                 mvwprintw(win, row, x, "Maps  :"); wattroff(win, COLOR_PAIR(FI_CP_KEY));
@@ -1159,7 +1141,7 @@ void fi_render(FileInfo *fi, WINDOW *win, int win_h, int win_w) {
         }
     }
 
-    /* ══ Section: Forensic ═══════════════════════════════════════ */
+    
     if (has_stat && S_ISREG(st.st_mode) && st.st_size > 0
             && st.st_size < 256*1024*1024) {
         if (ROW_VIS) {
@@ -1167,7 +1149,7 @@ void fi_render(FileInfo *fi, WINDOW *win, int win_h, int win_w) {
             mvwprintw(win, row, x, "━━ Forensic ");
             wattroff(win, COLOR_PAIR(FI_CP_SECTION) | A_BOLD);
         } ADVANCE();
-        /* Shannon entropy */
+        
         {
             uint64_t freq[256] = {0};
             int efd2 = open(path, O_RDONLY);
@@ -1195,7 +1177,7 @@ void fi_render(FileInfo *fi, WINDOW *win, int win_h, int win_w) {
             if (ROW_VIS) {
                 wattron(win, COLOR_PAIR(FI_CP_KEY));
                 mvwprintw(win, row, x, "Entropy:"); wattroff(win, COLOR_PAIR(FI_CP_KEY));
-                /* > 7.8 = likely encrypted/compressed, > 7.2 = packed */
+                
                 int cp_ent = entropy > 7.8 ? FI_CP_VAL_BAD :
                              entropy > 7.2 ? FI_CP_VAL_WARN : FI_CP_VAL_GOOD;
                 wattron(win, COLOR_PAIR(cp_ent) | A_BOLD);
@@ -1205,7 +1187,7 @@ void fi_render(FileInfo *fi, WINDOW *win, int win_h, int win_w) {
                 wattroff(win, COLOR_PAIR(cp_ent) | A_BOLD);
             } ADVANCE();
         }
-        /* Printable strings count (quick heuristic) */
+        
         {
             int sfd = open(path, O_RDONLY);
             long str_count = 0;
@@ -1232,7 +1214,7 @@ void fi_render(FileInfo *fi, WINDOW *win, int win_h, int win_w) {
                 wattroff(win, COLOR_PAIR(FI_CP_VAL));
             } ADVANCE();
         }
-        /* Embedded archive / polyglot detection: scan for magic sigs inside file */
+        
         if (st.st_size > 256) {
             unsigned char *polybuf = NULL;
             size_t polymax = (size_t)(st.st_size < 1024*1024 ? st.st_size : 1024*1024);
@@ -1251,7 +1233,7 @@ void fi_render(FileInfo *fi, WINDOW *win, int win_h, int win_w) {
                     };
                     for (int hi = 0; hidden_sigs[hi].name; hi++) {
                         int slen = hidden_sigs[hi].len;
-                        /* skip offset 0 (that's the file itself) */
+                        
                         for (size_t pi = 1; pi + (size_t)slen <= polymax; pi++) {
                             if (memcmp(polybuf+pi, hidden_sigs[hi].sig, (size_t)slen)==0) {
                                 hidden_count++;
@@ -1261,7 +1243,7 @@ void fi_render(FileInfo *fi, WINDOW *win, int win_h, int win_w) {
                                               hidden_sigs[hi].name, pi);
                                     wattroff(win, COLOR_PAIR(FI_CP_VAL_BAD) | A_BOLD);
                                 } ADVANCE();
-                                break; /* one per type */
+                                break; 
                             }
                         }
                     }

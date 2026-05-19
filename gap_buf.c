@@ -33,13 +33,13 @@ void gb_move_gap(GapBuf *g, size_t pos) {
     if (pos == g->gap_start) return;
     size_t gs = gap_size(g);
     if (pos < g->gap_start) {
-        /* move text right */
+        
         size_t n = g->gap_start - pos;
         memmove(g->buf + pos + gs, g->buf + pos, n);
         g->gap_start = pos;
         g->gap_end   = pos + gs;
     } else {
-        /* move text left */
+        
         size_t n = pos - g->gap_start;
         memmove(g->buf + g->gap_start, g->buf + g->gap_end, n);
         g->gap_start = pos;
@@ -51,9 +51,9 @@ static void gb_ensure_gap(GapBuf *g, size_t needed) {
     if (gap_size(g) >= needed) return;
     size_t new_cap = g->cap + needed + GAP_GROW;
     char *new_buf = malloc(new_cap);
-    /* copy pre-gap */
+    
     memcpy(new_buf, g->buf, g->gap_start);
-    /* copy post-gap with new gap size */
+    
     size_t new_gap_end = new_cap - (g->cap - g->gap_end);
     memcpy(new_buf + new_gap_end, g->buf + g->gap_end, g->cap - g->gap_end);
     free(g->buf);
@@ -100,7 +100,6 @@ void gb_get_range(const GapBuf *g, size_t start, size_t len, char *out) {
         out[i] = gb_at(g, start + i);
 }
 
-/* ─── Clone a gap buffer (for undo snapshots) ─────────────────── */
 GapBuf *gb_clone(const GapBuf *g) {
     GapBuf *n = malloc(sizeof *n);
     n->cap = g->cap;

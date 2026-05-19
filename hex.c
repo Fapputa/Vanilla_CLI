@@ -5,7 +5,6 @@
 
 #define HEX_BYTES_PER_ROW 16
 
-/* ------------------------------------------------------------------ */
 void hex_colors_init(void) {
     init_pair(HEX_CP_OFFSET,   COLOR_CYAN,    -1);
     init_pair(HEX_CP_ZERO,     COLOR_WHITE,   -1);
@@ -88,7 +87,6 @@ void hex_search_ascii(HexPane *h, const char *query) {
     strncpy(h->search_query, query, sizeof(h->search_query)-1);
 }
 
-/* ------------------------------------------------------------------ */
 void hex_scroll_to_cursor(HexPane *h, int win_h) {
     size_t cur_row   = h->cursor / HEX_BYTES_PER_ROW;
     int    text_rows = win_h - 1; if (text_rows < 1) text_rows = 1;
@@ -99,13 +97,12 @@ void hex_scroll_to_cursor(HexPane *h, int win_h) {
         h->scroll_row = cur_row - (size_t)text_rows + (size_t)margin + 1;
 }
 
-/* ------------------------------------------------------------------ */
 void hex_render(HexPane *h, WINDOW *win, int win_h, int win_w) {
     if (!win || win_h < 3 || win_w < 10) return;
     werase(win);
     int text_rows = win_h - 1;
 
-    /* Header */
+    
     wattron(win, COLOR_PAIR(HEX_CP_HEADER) | A_BOLD);
     wmove(win, 0, 0);
     wprintw(win, " Offset   ");
@@ -139,7 +136,7 @@ void hex_render(HexPane *h, WINDOW *win, int win_h, int win_w) {
         wprintw(win, " %07zx  ", rs);
         wattroff(win, COLOR_PAIR(HEX_CP_OFFSET));
 
-        /* Hex */
+        
         for (size_t b = 0; b < (size_t)HEX_BYTES_PER_ROW; b++) {
             if (b == 8) waddch(win, ' ');
             if (b >= rlen) { waddstr(win, "   "); continue; }
@@ -168,7 +165,7 @@ void hex_render(HexPane *h, WINDOW *win, int win_h, int win_w) {
         waddstr(win, " |");
         wattroff(win, COLOR_PAIR(HEX_CP_OFFSET));
 
-        /* ASCII */
+        
         for (size_t b = 0; b < rlen; b++) {
             size_t  ap2    = rs + b;
             uint8_t byte   = h->data[ap2];
@@ -192,7 +189,6 @@ void hex_render(HexPane *h, WINDOW *win, int win_h, int win_w) {
     wnoutrefresh(win);
 }
 
-/* ------------------------------------------------------------------ */
 static void hex_move(HexPane *h, int dy, int dx, int win_h) {
     if (!h->data_len) return;
     long pos = (long)h->cursor + dy * HEX_BYTES_PER_ROW + dx;
@@ -222,7 +218,7 @@ bool hex_handle_key(HexPane *h, int key, int win_h) {
             h->focus  = (h->focus == HEX_FOCUS_HEX) ? HEX_FOCUS_ASCII : HEX_FOCUS_HEX;
             h->nibble = 0; return true;
 
-        /* Ctrl+N / Ctrl+P — résultat suivant / précédent */
+        
         case 'n'&0x1f:
             if (h->search_count > 0) {
                 h->search_current = (h->search_current + 1) % h->search_count;
@@ -239,13 +235,13 @@ bool hex_handle_key(HexPane *h, int key, int win_h) {
             return true;
 
         default:
-            /* ASCII panel */
+            
             if (h->focus == HEX_FOCUS_ASCII && h->data_len > 0 && key >= 32 && key < 127) {
                 h->data[h->cursor] = (uint8_t)key; h->modified = true;
                 if (h->cursor + 1 < h->data_len) h->cursor++;
                 hex_scroll_to_cursor(h, win_h); return true;
             }
-            /* Hex panel nibble */
+            
             if (h->focus == HEX_FOCUS_HEX && h->data_len > 0) {
                 int nv = -1;
                 if (key >= '0' && key <= '9') nv = key - '0';

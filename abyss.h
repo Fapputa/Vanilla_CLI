@@ -25,7 +25,6 @@
 #include <ctype.h>
 #include <time.h>
 
-/* ─── Gap Buffer ─────────────────────────────────────────────── */
 #define GAP_DEFAULT   4096
 #define GAP_GROW      8192
 
@@ -47,7 +46,6 @@ void    gb_delete(GapBuf *g, size_t pos, size_t n);
 char   *gb_to_str(const GapBuf *g);
 void    gb_get_range(const GapBuf *g, size_t start, size_t len, char *out);
 
-/* ─── Line Index ─────────────────────────────────────────────── */
 #define LINE_IDX_CHUNK 1024
 
 typedef struct {
@@ -64,7 +62,6 @@ size_t   li_line_start(const LineIdx *li, size_t line);
 size_t   li_line_count(const LineIdx *li);
 void     li_mark_dirty(LineIdx *li);
 
-/* ─── Undo/Redo ──────────────────────────────────────────────── */
 typedef enum { PIECE_ORIG, PIECE_ADD } PieceSource;
 
 typedef struct {
@@ -92,7 +89,6 @@ void       us_push(UndoStack *us, const GapBuf *g, size_t cursor);
 bool       us_undo(UndoStack *us, GapBuf **g_out, size_t *cursor_out);
 bool       us_redo(UndoStack *us, GapBuf **g_out, size_t *cursor_out);
 
-/* ─── Syntax / Lexer ─────────────────────────────────────────── */
 typedef enum {
     TOK_NORMAL = 0,
     TOK_KEYWORD,
@@ -140,7 +136,6 @@ void     syn_ensure_line(SynCtx *s, size_t line, const GapBuf *g,
 Language lang_from_ext(const char *ext);
 TokenType syn_search_tok(TokenType base);
 
-/* ─── Search ─────────────────────────────────────────────────── */
 typedef struct {
     char    query[256];
     size_t *matches;
@@ -152,7 +147,6 @@ typedef struct {
 void search_find(SearchCtx *sc, const GapBuf *g);
 void search_clear(SearchCtx *sc);
 
-/* ─── Clipboard ──────────────────────────────────────────────── */
 typedef struct {
     char  *text;
     size_t len;
@@ -170,7 +164,7 @@ typedef struct {
     size_t    scroll_row;
     char      filename[4096];
     bool      modified;
-    /* Recherche ASCII */
+    
     char      search_query[256];
     size_t   *search_results;
     size_t    search_count;
@@ -187,7 +181,6 @@ void     hex_render(HexPane *h, WINDOW *win, int win_h, int win_w);
 bool     hex_handle_key(HexPane *h, int key, int win_h);
 void     hex_colors_init(void);
 
-/* ─── Pane ───────────────────────────────────────────────────── */
 typedef struct {
     GapBuf    *buf;
     LineIdx   *li;
@@ -198,13 +191,13 @@ typedef struct {
 
     char    filename[4096];
     bool    modified;
-    bool    crlf;         /* file used CRLF line endings */
+    bool    crlf;         
     Language lang;
 
     size_t  cursor;
     size_t  cursor_line;
     size_t  cursor_col;
-    size_t  preferred_col;   /* sticky column for vertical navigation */
+    size_t  preferred_col;   
 
     size_t  scroll_line;
     size_t  scroll_col;
@@ -222,7 +215,7 @@ typedef struct {
 
     bool    show_line_numbers;
 
-    /* Hex mode */
+    
     bool      hex_mode;
     HexPane  *hex;
 } Pane;
@@ -254,7 +247,6 @@ void  pane_push_undo(Pane *p);
 void  pane_wipe_file(Pane *p);
 void  pane_beautify(Pane *p);
 
-/* ─── File Tree Navigator ─────────────────────────────────────────── */
 #define TREE_DEFAULT_W  26
 #define TREE_MIN_W      18
 #define TREE_MAX_W      48
@@ -288,7 +280,6 @@ const char *ft_selected_path(FileTree *ft, char *buf, size_t bufsz);
 void        ft_render(FileTree *ft, WINDOW *win, int win_h, int win_w, bool is_active);
 bool        ft_handle_key(FileTree *ft, int key, char *open_path, size_t path_sz);
 
-/* ─── File Inspector Panel ─────────────────────────────────────── */
 #define FILEINFO_DEFAULT_W  36
 #define FILEINFO_MIN_W      28
 #define FILEINFO_MAX_W      56
@@ -298,7 +289,7 @@ typedef struct {
     bool    has_data;
     bool    visible;
     int     width;
-    int     scroll_row;   /* scroll offset for fi_render (keys J/K in fi panel) */
+    int     scroll_row;   
     WINDOW *win;
 } FileInfo;
 
@@ -308,7 +299,6 @@ void      fi_analyze(FileInfo *fi, const char *path);
 void      fi_render(FileInfo *fi, WINDOW *win, int win_h, int win_w);
 void      fi_colors_init(void);
 
-/* ─── Editor (global state) ──────────────────────────────────── */
 #define MAX_PANES 4
 
 typedef enum {
@@ -345,10 +335,10 @@ typedef struct {
     bool       running;
     bool       show_shortcuts;
 
-    bool       tree_focus;   /* true = focus sur le file tree */
+    bool       tree_focus;   
     FileTree  *tree;
 
-    FileInfo  *finfo;        /* F3 file inspector panel */
+    FileInfo  *finfo;        
 
     pthread_t  save_thread;
     bool       save_pending;
@@ -368,11 +358,9 @@ void editor_close_split(void);
 void editor_focus_next(void);
 void editor_resize_panes(void);
 
-/* ─── Run / Build ────────────────────────────────────────────── */
 void run_file(const char *path, Language lang, char *out_buf, size_t out_max);
 void run_async(const char *path, Language lang);
 
-/* ─── Colour pairs ───────────────────────────────────────────── */
 #define COLOR_PAIR_NORMAL          1
 #define COLOR_PAIR_KEYWORD         2
 #define COLOR_PAIR_TYPE            3
@@ -391,7 +379,7 @@ void run_async(const char *path, Language lang);
 #define COLOR_PAIR_INACTIVE_BORDER 16
 #define COLOR_PAIR_SELECTION      17
 #define COLOR_PAIR_CHAR           18
-/* Hex editor colour pairs */
+
 #define HEX_CP_OFFSET             19
 #define HEX_CP_ZERO               20
 #define HEX_CP_PRINT              21
@@ -405,7 +393,6 @@ void run_async(const char *path, Language lang);
 void colors_init(void);
 int  tok_to_color_pair(TokenType t);
 
-/* ─── Arena Allocator ────────────────────────────────────────── */
 typedef struct ArenaBlock {
     struct ArenaBlock *next;
     size_t used;
@@ -419,8 +406,7 @@ Arena *arena_new(size_t block_size);
 void  *arena_alloc(Arena *a, size_t n);
 void   arena_free(Arena *a);
 
-/* ─── Utilities ──────────────────────────────────────────────── */
 static inline size_t min_sz(size_t a, size_t b) { return a < b ? a : b; }
 static inline size_t max_sz(size_t a, size_t b) { return a > b ? a : b; }
 
-#endif /* ABYSS_H */
+#endif 

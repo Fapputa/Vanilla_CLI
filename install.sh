@@ -15,7 +15,7 @@ warn() { echo -e "${YELLOW}[!]${NC} $*"; }
 fail() { echo -e "${RED}[x]${NC} $*"; exit 1; }
 
 if [ "$EUID" -ne 0 ]; then
-    fail "Ce script doit etre execute en tant que root. Relancez avec : sudo $0"
+    fail "This script needs to be executed with sudo $0"
 fi
 
 INSTALL_BIN="/usr/local/bin"

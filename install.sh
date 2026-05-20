@@ -63,7 +63,6 @@ install_system_deps() {
             python3-pip \
             xclip \
             xsel \
-            wireless-tools \
             net-tools
     elif [ "$PKG_MANAGER" = "pacman" ]; then
         pacman -Sy --noconfirm \
@@ -73,7 +72,6 @@ install_system_deps() {
             python-pip \
             xclip \
             xsel \
-            wireless_tools \
             net-tools
     fi
 

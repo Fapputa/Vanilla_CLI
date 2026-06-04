@@ -3,7 +3,13 @@
 #include <locale.h>
 
 Editor E;
-char E_notify[256] = "";  
+char E_notify[256] = "";
+
+static void handle_key_normal(int key);
+static void handle_key_dialog(int key);
+static void full_redraw(bool force);
+static void layout_windows(void);
+static void force_full_dirty(void);
 
 static void layout_windows(void) {
     int rows, cols;
@@ -16,6 +22,7 @@ static void layout_windows(void) {
     if (edit_h < 1) edit_h = 1;
 
     
+
     int finfo_w = 0;
     if (E.finfo && E.finfo->visible) {
         finfo_w = E.finfo->width;
@@ -30,13 +37,26 @@ static void layout_windows(void) {
         }
     }
 
-    
+    int hl_w = 0;
+    if (E.hl && E.hl->visible) {
+        hl_w = HIGHLIGHT_DEFAULT_W;
+        if (hl_w < HIGHLIGHT_MIN_W) hl_w = HIGHLIGHT_MIN_W;
+        if (hl_w > (cols - finfo_w) / 2) hl_w = (cols - finfo_w) / 2;
+        int hl_x = cols - finfo_w - hl_w;
+        if (!E.hl->win)
+            E.hl->win = newwin(edit_h, hl_w, title_h, hl_x);
+        else {
+            mvwin(E.hl->win, title_h, hl_x);
+            wresize(E.hl->win, edit_h, hl_w);
+        }
+    }
+
     int tree_w = 0;
     if (E.tree && E.tree->visible) {
         tree_w = E.tree->width;
         if (tree_w < TREE_MIN_W) tree_w = TREE_MIN_W;
-        if (tree_w > (cols - finfo_w) / 2) tree_w = (cols - finfo_w) / 2;
-        int tree_x = cols - finfo_w - tree_w;
+        if (tree_w > (cols - finfo_w - hl_w) / 2) tree_w = (cols - finfo_w - hl_w) / 2;
+        int tree_x = cols - finfo_w - hl_w - tree_w;
         if (!E.tree->win)
             E.tree->win = newwin(edit_h, tree_w, title_h, tree_x);
         else {
@@ -45,8 +65,8 @@ static void layout_windows(void) {
         }
     }
 
-    int edit_x = 0;
-    int edit_cols = cols - tree_w - finfo_w;
+    int edit_x    = 0;
+    int edit_cols = cols - tree_w - hl_w - finfo_w;
     if (edit_cols < 1) edit_cols = 1;
 
     if (!E.title_win)  E.title_win  = newwin(title_h, cols, 0, 0);
@@ -66,7 +86,7 @@ static void layout_windows(void) {
     for (int i = 0; i < E.npanes; i++) {
         Pane *p = E.panes[i];
         int px = edit_x + i * (pane_w + 1);
-        int pw = (i == E.npanes - 1) ? (cols - px) : pane_w;
+        int pw = (i == E.npanes - 1) ? (edit_cols - i * (pane_w + 1)) : pane_w;
         if (pw < 1) pw = 1;
         if (!p->win) p->win = newwin(edit_h, pw, title_h, px);
         else { mvwin(p->win, title_h, px); wresize(p->win, edit_h, pw); }
@@ -79,6 +99,7 @@ static void render_title(void) {
     wmove(E.title_win, 0, 0);
     wattron(E.title_win, COLOR_PAIR(COLOR_PAIR_TITLE) | A_BOLD);
     Pane *ap = E.panes[E.active];
+
     if (E.show_shortcuts) {
         if (ap->hex_mode)
             wprintw(E.title_win,
@@ -86,18 +107,19 @@ static void render_title(void) {
                 "  ^S:Save  F2:Exit Hex  ^Q:Quit");
         else
             wprintw(E.title_win,
-                " ^O:SaveAs  ^S:Save  ^K:DelLine  ^B:Run  ^F:Find  ^Z:Undo"
-                "  ^R:LineNums  ^W:Wipe  ^D:Fmt  F1:Tree  F2:Hex  F3:Info  ^A:Help  ^Q:Quit");
+                " ^O:SaveAs  ^S:Save  ^K:Line  ^B:Run  ^F:Find  ^Z:Undo"
+                "  ^R:LN  ^W:Wipe  ^D:Fmt  F1:Tree  F2:Hex  F3:Info  F4:HL  ^A:Help  ^Q:Quit");
     } else {
-        bool mod = ap->hex_mode ? (ap->hex && ap->hex->modified) : ap->modified;
-        const char *hex_tag  = ap->hex_mode ? "  [HEX]" : "";
+        bool mod         = ap->hex_mode ? (ap->hex && ap->hex->modified) : ap->modified;
+        const char *hex_tag  = ap->hex_mode ? "  [HEX]"  : "";
         const char *tree_tag = (E.tree && E.tree->visible && E.tree_focus) ? "  [TREE]" : "";
+        const char *hl_tag   = (E.hl   && E.hl->visible)                  ? "  [HL]"   : "";
         if (ap->filename[0])
-            wprintw(E.title_win, " Abyss  |  %s%s%s%s  |  ^A for shortcuts",
-                    ap->filename, mod ? " *" : "", hex_tag, tree_tag);
+            wprintw(E.title_win, " Abyss  |  %s%s%s%s%s  |  ^A for shortcuts",
+                    ap->filename, mod ? " *" : "", hex_tag, tree_tag, hl_tag);
         else
-            wprintw(E.title_win, " Abyss  |  [No File]%s%s  |  ^A for shortcuts",
-                    hex_tag, tree_tag);
+            wprintw(E.title_win, " Abyss  |  [No File]%s%s%s  |  ^A for shortcuts",
+                    hex_tag, tree_tag, hl_tag);
     }
     wclrtoeol(E.title_win);
     wattroff(E.title_win, COLOR_PAIR(COLOR_PAIR_TITLE) | A_BOLD);
@@ -131,24 +153,21 @@ static void render_status(void) {
         if (ap->search.query[0])
             snprintf(search_info, sizeof search_info, " | \"%s\" [%d/%zu]",
                      ap->search.query,
-                     ap->search.current >= 0 ? ap->search.current+1 : 0,
+                     ap->search.current >= 0 ? ap->search.current + 1 : 0,
                      ap->search.count);
         bool readonly = ap->filename[0] && access(ap->filename, W_OK) != 0;
         wprintw(E.status_win, " Ln %zu/%zu  Col %zu  [%s]%s%s%s ",
-                line+1, nlines, col+1, lname, search_info,
+                line + 1, nlines, col + 1, lname, search_info,
                 ap->show_line_numbers ? "  [LN]" : "",
                 readonly ? "  [RO]" : "");
     }
     wclrtoeol(E.status_win);
 
-    
     if (E_notify[0]) {
         int rows, cols; getmaxyx(stdscr, rows, cols); (void)rows;
         int msglen = (int)strlen(E_notify);
         int nx = cols - msglen - 2;
         if (nx < 1) nx = 1;
-        wattron(E.status_win, COLOR_PAIR(COLOR_PAIR_STATUS) | A_BOLD);
-        
         init_pair(99, COLOR_WHITE, COLOR_RED);
         wattron(E.status_win, COLOR_PAIR(99) | A_BOLD);
         mvwprintw(E.status_win, 0, nx, " %s ", E_notify);
@@ -162,15 +181,17 @@ static void render_pane_borders(void) {
     if (E.npanes < 2) return;
     int rows, cols;
     getmaxyx(stdscr, rows, cols);
-    int title_h = 1, status_h = 1;
-    int out_h   = E.out_visible ? (rows / 3) : 0;
-    int edit_h  = rows - title_h - status_h - out_h;
-    int tree_w  = (E.tree && E.tree->visible) ? E.tree->width : 0;
-    int edit_cols = cols - tree_w;
-    int pane_w  = (edit_cols - (E.npanes - 1)) / E.npanes;
+    int title_h   = 1, status_h = 1;
+    int out_h     = E.out_visible ? (rows / 3) : 0;
+    int edit_h    = rows - title_h - status_h - out_h;
+    int hl_w      = (E.hl   && E.hl->visible)   ? HIGHLIGHT_DEFAULT_W : 0;
+    int finfo_w   = (E.finfo && E.finfo->visible) ? E.finfo->width     : 0;
+    int tree_w    = (E.tree  && E.tree->visible)  ? E.tree->width      : 0;
+    int edit_cols = cols - tree_w - hl_w - finfo_w;
+    int pane_w    = (edit_cols - (E.npanes - 1)) / E.npanes;
     for (int i = 0; i < E.npanes - 1; i++) {
         int bx = (i + 1) * (pane_w + 1) - 1;
-        int cp = (i == E.active || i+1 == E.active)
+        int cp = (i == E.active || i + 1 == E.active)
                  ? COLOR_PAIR_ACTIVE_BORDER : COLOR_PAIR_INACTIVE_BORDER;
         attron(COLOR_PAIR(cp));
         for (int y = title_h; y < title_h + edit_h; y++) mvaddch(y, bx, ACS_VLINE);
@@ -187,11 +208,11 @@ static void render_output(void) {
     const char *ptr = E.out_text;
     int row = 0; size_t scroll = E.out_scroll;
     while (*ptr && row < h) {
-        const char *nl = strchr(ptr, '\n');
-        size_t len = nl ? (size_t)(nl - ptr) : strlen(ptr);
+        const char *nl  = strchr(ptr, '\n');
+        size_t      len = nl ? (size_t)(nl - ptr) : strlen(ptr);
         if (scroll > 0) { scroll--; }
-        else { mvwaddnstr(E.out_win, row, 0, ptr, (int)min_sz(len,(size_t)w)); row++; }
-        ptr = nl ? nl+1 : ptr+len;
+        else { mvwaddnstr(E.out_win, row, 0, ptr, (int)min_sz(len, (size_t)w)); row++; }
+        ptr = nl ? nl + 1 : ptr + len;
         if (!nl) break;
     }
     wattroff(E.out_win, COLOR_PAIR(COLOR_PAIR_COMMENT));
@@ -201,16 +222,16 @@ static void render_output(void) {
 static void render_dialog(const char *title) {
     int rows, cols; getmaxyx(stdscr, rows, cols);
     int dw = 62, dh = 3;
-    int dy = rows/2-1, dx = (cols-dw)/2;
+    int dy = rows / 2 - 1, dx = (cols - dw) / 2;
     if (dx < 0) dx = 0;
     WINDOW *dw2 = newwin(dh, dw, dy, dx);
     wattron(dw2, COLOR_PAIR(COLOR_PAIR_STATUS) | A_BOLD);
     box(dw2, 0, 0);
     mvwprintw(dw2, 0, 2, " %s ", title);
     wattron(dw2, COLOR_PAIR(COLOR_PAIR_NORMAL));
-    mvwprintw(dw2, 1, 1, "%-*s", dw-2, E.dialog_buf);
+    mvwprintw(dw2, 1, 1, "%-*s", dw - 2, E.dialog_buf);
     int cx = 1 + (int)E.dialog_cursor;
-    if (cx < dw-1) {
+    if (cx < dw - 1) {
         wmove(dw2, 1, cx);
         wattron(dw2, A_REVERSE);
         waddch(dw2, E.dialog_buf[E.dialog_cursor] ? E.dialog_buf[E.dialog_cursor] : ' ');
@@ -222,6 +243,15 @@ static void render_dialog(const char *title) {
 }
 
 static void full_redraw(bool force) {
+    int rows, cols;
+    getmaxyx(stdscr, rows, cols);
+    int title_h = 1, status_h = 1;
+    int out_h   = E.out_visible ? (rows / 3) : 0;
+    int edit_h  = rows - title_h - status_h - out_h;
+    if (edit_h < 1) edit_h = 1;
+    (void)cols;
+
+    
     for (int i = 0; i < E.npanes; i++) {
         Pane *p = E.panes[i];
         if (p->hex_mode && p->hex)
@@ -229,32 +259,50 @@ static void full_redraw(bool force) {
         else
             pane_render(p, force);
     }
+
     
-    if (E.tree && E.tree->visible && E.tree->win) {
-        int rows, cols; getmaxyx(stdscr, rows, cols);
-        int title_h = 1, status_h = 1;
-        int out_h = E.out_visible ? (rows / 3) : 0;
-        int edit_h = rows - title_h - status_h - out_h;
-        if (edit_h < 1) edit_h = 1;
+    if (E.tree && E.tree->visible && E.tree->win)
         ft_render(E.tree, E.tree->win, edit_h, E.tree->width, E.tree_focus);
-        (void)cols;
-    }
+
     
-    if (E.finfo && E.finfo->visible && E.finfo->win) {
-        int rows, cols; getmaxyx(stdscr, rows, cols);
-        int title_h = 1, status_h = 1;
-        int out_h = E.out_visible ? (rows / 3) : 0;
-        int edit_h = rows - title_h - status_h - out_h;
-        if (edit_h < 1) edit_h = 1;
+    if (E.finfo && E.finfo->visible && E.finfo->win)
         fi_render(E.finfo, E.finfo->win, edit_h, E.finfo->width);
-        (void)cols;
+
+    
+    if (E.hl && E.hl->visible && E.hl->win) {
+        Pane *ap = E.panes[E.active];
+        if (!ap->hex_mode && E.hl->dirty) {
+            
+            static size_t last_len  = (size_t)-1;
+            static unsigned last_fp = 0;
+
+            size_t len = gb_len(ap->buf);
+            unsigned fp = (unsigned)len;
+            if (len > 0) {
+                fp ^= (unsigned char)gb_at(ap->buf, 0);
+                fp ^= (unsigned char)gb_at(ap->buf, len / 2) << 8;
+                fp ^= (unsigned char)gb_at(ap->buf, len - 1) << 16;
+            }
+
+            if (len != last_len || fp != last_fp) {
+                hl_scan(E.hl, ap->buf);
+                last_len = len;
+                last_fp  = fp;
+            } else {
+                E.hl->dirty = false; 
+            }
+        }
+        int hl_w = getmaxx(E.hl->win);
+        hl_render(E.hl, E.hl->win, edit_h, hl_w);
     }
+
     render_pane_borders();
     render_title();
     render_status();
     render_output();
+
     if (E.mode != MODE_NORMAL) {
-        const char *titles[] = {
+        static const char *titles[] = {
             "",
             "Save As",
             "Search",
@@ -270,8 +318,8 @@ static void full_redraw(bool force) {
 
 static void dialog_insert(char c) {
     size_t len = strlen(E.dialog_buf);
-    if (len >= sizeof(E.dialog_buf)-1) return;
-    memmove(E.dialog_buf + E.dialog_cursor+1,
+    if (len >= sizeof(E.dialog_buf) - 1) return;
+    memmove(E.dialog_buf + E.dialog_cursor + 1,
             E.dialog_buf + E.dialog_cursor,
             len - E.dialog_cursor + 1);
     E.dialog_buf[E.dialog_cursor++] = c;
@@ -280,7 +328,7 @@ static void dialog_insert(char c) {
 static void dialog_backspace(void) {
     if (!E.dialog_cursor) return;
     size_t len = strlen(E.dialog_buf);
-    memmove(E.dialog_buf + E.dialog_cursor-1,
+    memmove(E.dialog_buf + E.dialog_cursor - 1,
             E.dialog_buf + E.dialog_cursor,
             len - E.dialog_cursor + 1);
     E.dialog_cursor--;
@@ -291,11 +339,17 @@ static void force_full_dirty(void) {
         syn_mark_dirty_from(E.panes[i]->syn, 0);
 }
 
+static void open_dialog(EditorMode m, const char *prefill) {
+    E.mode = m;
+    if (prefill) snprintf(E.dialog_buf, sizeof(E.dialog_buf), "%s", prefill);
+    else E.dialog_buf[0] = '\0';
+    E.dialog_cursor = strlen(E.dialog_buf);
+}
+
 static void dialog_confirm(void) {
     Pane *ap = E.panes[E.active];
     switch (E.mode) {
 
-        
         case MODE_HEX_JUMP: {
             if (ap->hex && E.dialog_buf[0]) {
                 char *end;
@@ -304,40 +358,38 @@ static void dialog_confirm(void) {
                         && (size_t)off < ap->hex->data_len) {
                     ap->hex->cursor = (size_t)off;
                     ap->hex->nibble = 0;
-                    hex_scroll_to_cursor(ap->hex, ap->win_h); 
+                    hex_scroll_to_cursor(ap->hex, ap->win_h);
                 }
             }
             E.mode = MODE_NORMAL;
-            full_redraw(true); 
+            full_redraw(true);
             return;
         }
+
         case MODE_HEX_SEARCH: {
             if (!ap->hex) { E.mode = MODE_NORMAL; return; }
             HexPane *h = ap->hex;
             if (strcmp(E.dialog_buf, h->search_query) != 0) {
-                
                 hex_search_ascii(h, E.dialog_buf);
                 if (h->search_count > 0) {
                     h->search_current = 0;
                     h->cursor = h->search_results[0];
-                    hex_scroll_to_cursor(h, ap->win_h); 
+                    hex_scroll_to_cursor(h, ap->win_h);
                 }
             } else if (h->search_count > 0) {
-                
                 h->search_current = (h->search_current + 1) % h->search_count;
                 h->cursor = h->search_results[h->search_current];
-                hex_scroll_to_cursor(h, ap->win_h); 
+                hex_scroll_to_cursor(h, ap->win_h);
             }
-            
-            full_redraw(true); 
+            full_redraw(true);
             return;
         }
 
-        
         case MODE_SAVE_DIALOG:
             pane_save_file(ap, E.dialog_buf);
             force_full_dirty();
             break;
+
         case MODE_OPEN_DIALOG:
             gb_free(ap->buf);  ap->buf = gb_new(GAP_DEFAULT);
             li_free(ap->li);   ap->li  = li_new();
@@ -346,13 +398,16 @@ static void dialog_confirm(void) {
             pane_open_file(ap, E.dialog_buf);
             if (E.finfo && E.finfo->visible)
                 fi_analyze(E.finfo, ap->filename);
+            if (E.hl && E.hl->visible)
+                E.hl->dirty = true;
             layout_windows();
             force_full_dirty();
             break;
+
         case MODE_SEARCH_DIALOG:
             if (strcmp(E.dialog_buf, ap->search.query) != 0) {
-                snprintf(ap->search.query, sizeof(ap->search.query), "%s", E.dialog_buf);
-                snprintf(ap->syn->search_word, sizeof(ap->syn->search_word), "%s", E.dialog_buf);
+                snprintf(ap->search.query,    sizeof ap->search.query,    "%s", E.dialog_buf);
+                snprintf(ap->syn->search_word, sizeof ap->syn->search_word, "%s", E.dialog_buf);
                 search_find(&ap->search, ap->buf);
                 syn_mark_dirty_from(ap->syn, 0);
                 if (ap->search.count > 0) {
@@ -364,32 +419,27 @@ static void dialog_confirm(void) {
             } else {
                 pane_search_next(ap);
             }
-            full_redraw(true); 
-            return; 
+            full_redraw(true);
+            return;
+
         case MODE_GOTO_LINE: {
             long l = atol(E.dialog_buf);
-            if (l > 0) pane_move_to_line_col(ap, (size_t)(l-1), 0);
+            if (l > 0) pane_move_to_line_col(ap, (size_t)(l - 1), 0);
             break;
         }
+
         default: break;
     }
     E.mode = MODE_NORMAL;
 }
 
-static void open_dialog(EditorMode m, const char *prefill) {
-    E.mode = m;
-    if (prefill) snprintf(E.dialog_buf, sizeof(E.dialog_buf), "%s", prefill);
-    else E.dialog_buf[0] = '\0';
-    E.dialog_cursor = strlen(E.dialog_buf);
-}
-
 static void handle_key_normal(int key) {
+
     
     if (key == KEY_F(1)) {
         if (E.tree) {
             E.tree->visible = !E.tree->visible;
-            if (!E.tree->visible) E.tree_focus = false;
-            else                  E.tree_focus = true;
+            E.tree_focus    = E.tree->visible;
         }
         layout_windows();
         force_full_dirty();
@@ -401,18 +451,15 @@ static void handle_key_normal(int key) {
     if (key == KEY_F(3)) {
         if (E.finfo) {
             if (!E.finfo->visible) {
-                
                 E.finfo->visible = true;
-                finfo_focus = true;
-                Pane *ap2 = E.panes[E.active];
+                finfo_focus      = true;
+                Pane *ap2  = E.panes[E.active];
                 const char *fpath = ap2->hex_mode && ap2->hex
-                                    ? ap2->hex->filename
-                                    : ap2->filename;
+                                    ? ap2->hex->filename : ap2->filename;
                 fi_analyze(E.finfo, fpath);
             } else {
-                
-                E.finfo->visible = false;
-                finfo_focus = false;
+                E.finfo->visible    = false;
+                finfo_focus         = false;
                 E.finfo->scroll_row = 0;
             }
         }
@@ -422,47 +469,54 @@ static void handle_key_normal(int key) {
     }
 
     
+    if (key == KEY_F(4)) {
+        if (E.hl) {
+            if (!E.hl->visible) {
+                E.hl->visible = true;
+                E.hl->dirty   = true;
+                E.hl_focus    = true;
+                Pane *ap2 = E.panes[E.active];
+                if (!ap2->hex_mode)
+                    hl_scan(E.hl, ap2->buf);
+            } else {
+                E.hl->visible = false;
+                E.hl_focus    = false;
+            }
+        }
+        layout_windows();
+        force_full_dirty();
+        return;
+    }
+
+    
     if (finfo_focus && E.finfo && E.finfo->visible) {
-        if (key == KEY_DOWN || key == 'j') {
-            E.finfo->scroll_row++;
-            return;
-        } else if (key == KEY_UP || key == 'k') {
-            if (E.finfo->scroll_row > 0) E.finfo->scroll_row--;
-            return;
-        }
-        
-        if (key == '\t') {
-            finfo_focus = false;
-            return;
-        }
+        if (key == KEY_DOWN || key == 'j') { E.finfo->scroll_row++;                        return; }
+        if (key == KEY_UP   || key == 'k') { if (E.finfo->scroll_row > 0) E.finfo->scroll_row--; return; }
+        if (key == '\t') { finfo_focus = false; return; }
     }
     if (!E.finfo || !E.finfo->visible) finfo_focus = false;
 
     
-    
-    if (key == '\t' && E.tree && E.tree->visible) {
-        
-
-        Pane *ap2 = E.panes[E.active];
-        if (!ap2->hex_mode) {
-            E.tree_focus = !E.tree_focus;
-            return;
-        }
+    if (E.hl_focus && E.hl && E.hl->visible) {
+        if (key == KEY_DOWN || key == 'j') { E.hl->scroll++;                        return; }
+        if (key == KEY_UP   || key == 'k') { if (E.hl->scroll > 0) E.hl->scroll--; return; }
+        if (key == '\t') { E.hl_focus = false; return; }
+        return;
     }
+    if (!E.hl || !E.hl->visible) E.hl_focus = false;
 
     
     if (E.tree_focus && E.tree && E.tree->visible) {
         char open_path[4096] = "";
         bool consumed = ft_handle_key(E.tree, key, open_path, sizeof open_path);
         if (open_path[0]) {
-            
             Pane *ap2 = E.panes[E.active];
             gb_free(ap2->buf);  ap2->buf = gb_new(GAP_DEFAULT);
             li_free(ap2->li);   ap2->li  = li_new();
             syn_free(ap2->syn); ap2->syn = syn_new(LANG_C);
             ap2->cursor = 0;
             pane_open_file(ap2, open_path);
-            
+
             char tmp[4096];
             strncpy(tmp, open_path, sizeof tmp - 1);
             char *slash = strrchr(tmp, '/');
@@ -473,14 +527,15 @@ static void handle_key_normal(int key) {
                     strncpy(E.tree->cwd, resolved, sizeof E.tree->cwd - 1);
                 ft_reload(E.tree);
             }
-            
+
             if (E.finfo && E.finfo->visible)
                 fi_analyze(E.finfo, open_path);
-            E.tree_focus = false;   
+            if (E.hl && E.hl->visible)
+                E.hl->dirty = true;
+
+            E.tree_focus = false;
             layout_windows();
             force_full_dirty();
-        } else if (consumed) {
-            
         }
         if (consumed) return;
     }
@@ -489,105 +544,103 @@ static void handle_key_normal(int key) {
 
     
     if (ap->hex_mode && ap->hex) {
-        if (key == ('q'&0x1f)) { E.running = false; return; }
-        if (key == ('a'&0x1f)) { E.show_shortcuts = !E.show_shortcuts; return; }
-        if (key == KEY_F(2))   { ap->hex_mode = false; force_full_dirty(); return; }
-        if (key == ('s'&0x1f)) { hex_save(ap->hex, NULL); return; }
-        if (key == ('o'&0x1f)) {
-            open_dialog(MODE_SAVE_DIALOG,
-                        ap->hex->filename[0] ? ap->hex->filename : NULL);
+        if (key == ('q' & 0x1f)) { E.running = false; return; }
+        if (key == ('a' & 0x1f)) { E.show_shortcuts = !E.show_shortcuts; return; }
+        if (key == KEY_F(2))     { ap->hex_mode = false; force_full_dirty(); return; }
+        if (key == ('s' & 0x1f)) { hex_save(ap->hex, NULL); return; }
+        if (key == ('o' & 0x1f)) {
+            open_dialog(MODE_SAVE_DIALOG, ap->hex->filename[0] ? ap->hex->filename : NULL);
             return;
         }
-        if (key == ('j'&0x1f)) {
-            open_dialog(MODE_HEX_JUMP, NULL);
+        if (key == ('j' & 0x1f)) { open_dialog(MODE_HEX_JUMP, NULL); return; }
+        if (key == ('f' & 0x1f)) {
+            open_dialog(MODE_HEX_SEARCH, ap->hex->search_query[0] ? ap->hex->search_query : NULL);
             return;
         }
-        if (key == ('f'&0x1f)) {
-            open_dialog(MODE_HEX_SEARCH,
-                        ap->hex->search_query[0] ? ap->hex->search_query : NULL);
-            return;
-        }
-        
         hex_handle_key(ap->hex, key, ap->win_h);
         return;
     }
 
     
     switch (key) {
-        case KEY_UP:    pane_move_cursor(ap, -1, 0); break;
-        case KEY_DOWN:  pane_move_cursor(ap,  1, 0); break;
-        case KEY_LEFT:  pane_move_cursor(ap,  0,-1); break;
-        case KEY_RIGHT: pane_move_cursor(ap,  0, 1); break;
+        case KEY_UP:    pane_move_cursor(ap, -1,  0); break;
+        case KEY_DOWN:  pane_move_cursor(ap,  1,  0); break;
+        case KEY_LEFT:  pane_move_cursor(ap,  0, -1); break;
+        case KEY_RIGHT: pane_move_cursor(ap,  0,  1); break;
         case KEY_PPAGE: pane_move_cursor(ap, -(ap->win_h > 2 ? ap->win_h - 1 : 1), 0); break;
         case KEY_NPAGE: pane_move_cursor(ap,  (ap->win_h > 2 ? ap->win_h - 1 : 1), 0); break;
+
         case KEY_HOME: {
             size_t ls = li_line_start(ap->li, ap->cursor_line);
-            ap->cursor = ls;
-            ap->scroll_col = 0;   
-            pane_move_cursor(ap, 0, 0); break;
+            ap->cursor     = ls;
+            ap->scroll_col = 0;
+            pane_move_cursor(ap, 0, 0);
+            break;
         }
         case KEY_END: {
             size_t nl = li_line_count(ap->li);
-            size_t le = (ap->cursor_line+1 < nl)
-                        ? li_line_start(ap->li, ap->cursor_line+1)-1
+            size_t le = (ap->cursor_line + 1 < nl)
+                        ? li_line_start(ap->li, ap->cursor_line + 1) - 1
                         : gb_len(ap->buf);
-            ap->cursor = le; pane_move_cursor(ap, 0, 0); break;
+            ap->cursor = le;
+            pane_move_cursor(ap, 0, 0);
+            break;
         }
-        case KEY_BACKSPACE: case 127: case '\b': pane_delete_char(ap); break;
-        case KEY_DC:  pane_delete_forward(ap); break;
-        case '\n': case '\r': pane_insert_char(ap, '\n'); break;
-        case '\t': pane_insert_str(ap, "    ", 4); break;
 
-        case 'o'&0x1f:
+        case KEY_BACKSPACE: case 127: case '\b': pane_delete_char(ap);    break;
+        case KEY_DC:                             pane_delete_forward(ap); break;
+        case '\n': case '\r':                    pane_insert_char(ap, '\n'); break;
+        case '\t':                               pane_insert_str(ap, "    ", 4); break;
+
+        case 'o' & 0x1f:
             open_dialog(MODE_SAVE_DIALOG, ap->filename[0] ? ap->filename : NULL);
             break;
-        case 's'&0x1f:
+        case 's' & 0x1f:
             if (ap->filename[0]) pane_save_file(ap, NULL);
             else open_dialog(MODE_SAVE_DIALOG, NULL);
             break;
-        case 'z'&0x1f: pane_undo(ap); break;
-        case 'y'&0x1f: pane_redo(ap); break;
-        case 'c'&0x1f: pane_copy(ap); break;
-        case 'x'&0x1f: pane_cut(ap);  break;
-        case 'v'&0x1f: pane_paste(ap); break;
-        case 'k'&0x1f: pane_kill_whole_line(ap); break;
-        case 't'&0x1f: pane_kill_whole_line(ap); break;
-        case 'f'&0x1f:
-            open_dialog(MODE_SEARCH_DIALOG,
-                        ap->search.query[0] ? ap->search.query : NULL);
+        case 'z' & 0x1f: pane_undo(ap);  break;
+        case 'y' & 0x1f: pane_redo(ap);  break;
+        case 'c' & 0x1f: pane_copy(ap);  break;
+        case 'x' & 0x1f: pane_cut(ap);   break;
+        case 'v' & 0x1f: pane_paste(ap); break;
+        case 'k' & 0x1f: pane_kill_whole_line(ap); break;
+        case 't' & 0x1f: pane_kill_whole_line(ap); break;
+        case 'f' & 0x1f:
+            open_dialog(MODE_SEARCH_DIALOG, ap->search.query[0] ? ap->search.query : NULL);
             break;
-        case 'n'&0x1f: pane_search_next(ap); break;
-        case 'p'&0x1f: pane_search_prev(ap); break;
-        case 'b'&0x1f:
+        case 'n' & 0x1f: pane_search_next(ap); break;
+        case 'p' & 0x1f: pane_search_prev(ap); break;
+        case 'b' & 0x1f:
             if (ap->filename[0]) {
                 pane_save_file(ap, NULL);
                 E.out_visible = true;
                 layout_windows();
                 free(E.out_text);
-                E.out_text = malloc(1<<16); E.out_text[0] = '\0';
-                run_file(ap->filename, ap->lang, E.out_text, 1<<16);
+                E.out_text    = malloc(1 << 16);
+                E.out_text[0] = '\0';
+                run_file(ap->filename, ap->lang, E.out_text, 1 << 16);
             }
             break;
-        case 'r'&0x1f:
+        case 'r' & 0x1f:
             ap->show_line_numbers = !ap->show_line_numbers;
             pane_set_window(ap, ap->win, ap->win_y, ap->win_x, ap->win_h, ap->win_w);
             pane_scroll_to_cursor(ap);
             break;
-        case 'w'&0x1f:
+        case 'w' & 0x1f:
             pane_wipe_file(ap);
+            if (E.hl && E.hl->visible) E.hl->dirty = true;
             break;
-        case 'l'&0x1f: editor_split(); layout_windows(); break;
-        case 'e'&0x1f: editor_focus_next(); break;
-        case 'g'&0x1f: open_dialog(MODE_GOTO_LINE, NULL); break;
-        case 'a'&0x1f: E.show_shortcuts = !E.show_shortcuts; break;
+        case 'l' & 0x1f: editor_split(); layout_windows(); break;
+        case 'e' & 0x1f: editor_focus_next(); break;
+        case 'g' & 0x1f: open_dialog(MODE_GOTO_LINE, NULL); break;
+        case 'a' & 0x1f: E.show_shortcuts = !E.show_shortcuts; break;
 
-        
-        case 'd'&0x1f:
+        case 'd' & 0x1f:
             pane_beautify(ap);
             force_full_dirty();
             break;
 
-        
         case KEY_F(2):
             if (!ap->hex) ap->hex = hex_new();
             if (ap->filename[0]) hex_load(ap->hex, ap->filename);
@@ -595,40 +648,43 @@ static void handle_key_normal(int key) {
             force_full_dirty();
             break;
 
-        case 'q'&0x1f: E.running = false; break;
+        case 'q' & 0x1f: E.running = false; break;
 
         case KEY_SLEFT:
-            if (!ap->sel_active) { ap->sel_active=true; ap->sel_anchor=ap->cursor; }
+            if (!ap->sel_active) { ap->sel_active = true; ap->sel_anchor = ap->cursor; }
             pane_move_cursor(ap, 0, -1); break;
         case KEY_SRIGHT:
-            if (!ap->sel_active) { ap->sel_active=true; ap->sel_anchor=ap->cursor; }
-            pane_move_cursor(ap, 0, 1); break;
+            if (!ap->sel_active) { ap->sel_active = true; ap->sel_anchor = ap->cursor; }
+            pane_move_cursor(ap, 0,  1); break;
         case KEY_SR:
-            if (!ap->sel_active) { ap->sel_active=true; ap->sel_anchor=ap->cursor; }
+            if (!ap->sel_active) { ap->sel_active = true; ap->sel_anchor = ap->cursor; }
             pane_move_cursor(ap, -1, 0); break;
         case KEY_SF:
-            if (!ap->sel_active) { ap->sel_active=true; ap->sel_anchor=ap->cursor; }
-            pane_move_cursor(ap, 1, 0); break;
+            if (!ap->sel_active) { ap->sel_active = true; ap->sel_anchor = ap->cursor; }
+            pane_move_cursor(ap,  1, 0); break;
 
         case KEY_MOUSE: {
             MEVENT ev;
             if (getmouse(&ev) == OK) {
-                if (ev.bstate & BUTTON4_PRESSED) {      
+                if (ev.bstate & BUTTON4_PRESSED) {
                     if (E.tree_focus && E.tree && E.tree->visible) {
                         if (E.tree->selected > 0) E.tree->selected--;
+                    } else if (E.hl_focus && E.hl && E.hl->visible) {
+                        if (E.hl->scroll > 0) E.hl->scroll--;
                     } else if (E.finfo && E.finfo->visible) {
                         if (E.finfo->scroll_row > 0) E.finfo->scroll_row--;
                     } else {
                         pane_move_cursor(ap, -3, 0);
                     }
-                } else if (ev.bstate & BUTTON5_PRESSED) { 
+                } else if (ev.bstate & BUTTON5_PRESSED) {
                     if (E.tree_focus && E.tree && E.tree->visible) {
-                        if (E.tree->selected + 1 < E.tree->count)
-                            E.tree->selected++;
+                        if (E.tree->selected + 1 < E.tree->count) E.tree->selected++;
+                    } else if (E.hl_focus && E.hl && E.hl->visible) {
+                        E.hl->scroll++;
                     } else if (E.finfo && E.finfo->visible) {
                         E.finfo->scroll_row++;
                     } else {
-                        pane_move_cursor(ap,  3, 0);
+                        pane_move_cursor(ap, 3, 0);
                     }
                 }
             }
@@ -638,14 +694,16 @@ static void handle_key_normal(int key) {
         case 27:
             ap->sel_active = false;
             search_clear(&ap->search);
-            ap->search.query[0] = '\0';
-            ap->syn->search_word[0] = '\0';
+            ap->search.query[0]      = '\0';
+            ap->syn->search_word[0]  = '\0';
             syn_mark_dirty_from(ap->syn, 0);
             break;
 
         default:
-            if (key >= 32 && key < 127)  pane_insert_char(ap, (char)key);
-            else if (key >= 128)          pane_insert_char(ap, (char)key);
+            if (key >= 32 && key < 127) pane_insert_char(ap, (char)key);
+            else if (key >= 128)         pane_insert_char(ap, (char)key);
+            
+            if (E.hl && E.hl->visible) E.hl->dirty = true;
             break;
     }
 }
@@ -657,14 +715,16 @@ static void handle_key_dialog(int key) {
             if (E.mode == MODE_SEARCH_DIALOG) {
                 Pane *ap = E.panes[E.active];
                 search_clear(&ap->search);
-                ap->search.query[0] = '\0';
+                ap->search.query[0]     = '\0';
                 ap->syn->search_word[0] = '\0';
                 syn_mark_dirty_from(ap->syn, 0);
             }
             E.mode = MODE_NORMAL;
             break;
         case KEY_BACKSPACE: case 127: case '\b': dialog_backspace(); break;
-        case KEY_LEFT:  if (E.dialog_cursor > 0) E.dialog_cursor--; break;
+        case KEY_LEFT:
+            if (E.dialog_cursor > 0) E.dialog_cursor--;
+            break;
         case KEY_RIGHT:
             if (E.dialog_cursor < strlen(E.dialog_buf)) E.dialog_cursor++;
             break;
@@ -677,13 +737,15 @@ static void handle_key_dialog(int key) {
 void editor_init(void) {
     memset(&E, 0, sizeof E);
     pthread_mutex_init(&E.save_mutex, NULL);
-    E.panes[0] = pane_new();
-    E.npanes   = 1;
-    E.active   = 0;
-    E.running  = true;
-    E.tree     = ft_new();
-    E.tree_focus = false;  
-    E.finfo    = fi_new();
+    E.panes[0]   = pane_new();
+    E.npanes     = 1;
+    E.active     = 0;
+    E.running    = true;
+    E.tree       = ft_new();
+    E.tree_focus = false;
+    E.finfo      = fi_new();
+    E.hl         = hl_new();
+    E.hl_focus   = false;
 }
 
 void editor_split(void) {
@@ -708,12 +770,12 @@ void editor_close_split(void) {
         E.panes[E.active]->win = NULL;
     }
     pane_free(E.panes[E.active]);
-    for (int i = E.active; i < E.npanes-1; i++) E.panes[i] = E.panes[i+1];
+    for (int i = E.active; i < E.npanes - 1; i++) E.panes[i] = E.panes[i + 1];
     E.npanes--;
-    if (E.active >= E.npanes) E.active = E.npanes-1;
+    if (E.active >= E.npanes) E.active = E.npanes - 1;
 }
 
-void editor_focus_next(void) { E.active = (E.active + 1) % E.npanes; }
+void editor_focus_next(void)   { E.active = (E.active + 1) % E.npanes; }
 void editor_resize_panes(void) { layout_windows(); }
 
 void editor_cleanup(void) {
@@ -732,6 +794,10 @@ void editor_cleanup(void) {
         if (E.finfo->win) delwin(E.finfo->win);
         fi_free(E.finfo);
     }
+    if (E.hl) {
+        if (E.hl->win) delwin(E.hl->win);
+        hl_free(E.hl);
+    }
     free(E.out_text);
     pthread_mutex_destroy(&E.save_mutex);
     unlink("./temp_bin");
@@ -741,15 +807,16 @@ void editor_run(const char *initial_file) {
     setlocale(LC_ALL, "");
     initscr(); raw(); noecho();
     keypad(stdscr, TRUE);
-
     set_escdelay(25);
     curs_set(0);
+
     colors_init();
-    use_default_colors();  
+    use_default_colors();
     hex_colors_init();
     fi_colors_init();
+    hl_colors_init();
 
-    printf("\033[?2004h"); 
+    printf("\033[?2004h");  
     fflush(stdout);
     layout_windows();
 
@@ -767,17 +834,16 @@ void editor_run(const char *initial_file) {
         def_prog_mode();
     }
 
-    bool in_paste  = false;
+    bool in_paste   = false;
     char paste_batch[1 << 18];
-    int  paste_len = 0;
+    int  paste_len  = 0;
 
     while (E.running) {
-        WINDOW *iw = E.panes[E.active]->win;
-        int key = wgetch(iw ? iw : stdscr);
+        WINDOW *iw  = E.panes[E.active]->win;
+        int     key = wgetch(iw ? iw : stdscr);
 
         if (key == 0 || key == ERR || key == 0x16) continue;
 
-        
         E_notify[0] = '\0';
 
         if (key == KEY_RESIZE) {
@@ -787,7 +853,6 @@ void editor_run(const char *initial_file) {
         }
 
         
-
         if (key == 27) {
             WINDOW *ew = iw ? iw : stdscr;
             wtimeout(ew, 5);
@@ -802,95 +867,81 @@ void editor_run(const char *initial_file) {
             bool consumed = false;
 
             if (sn >= 1 && sq[0] == '[') {
-
                 
                 if (!consumed && sn >= 2 && sq[1] == 'Z') {
-                    for (int si = sn-1; si >= 2; si--)
-                        if (sq[si]!=ERR) ungetch(sq[si]);
+                    for (int si = sn - 1; si >= 2; si--)
+                        if (sq[si] != ERR) ungetch(sq[si]);
                     key = KEY_BTAB; consumed = true;
                 }
-
                 
                 if (!consumed && sn >= 6
                         && sq[1]=='2' && sq[2]=='7'
                         && sq[3]==';' && sq[4]=='5' && sq[5]==';') {
-                    int n9  = (sn > 6) ? sq[6] : ERR;
-                    int ntl = (sn > 7) ? sq[7] : ERR;
+                    int n9 = (sn > 6) ? sq[6] : ERR, ntl = (sn > 7) ? sq[7] : ERR;
                     if (n9 == '9') {
                         if (ntl != '~' && ntl != ERR) ungetch(ntl);
                         key = KEY_BTAB; consumed = true;
                     }
                 }
-
                 
                 if (!consumed && sn >= 5
                         && sq[1]=='1' && sq[2]==';' && sq[3]=='5' && sq[4]=='I') {
-                    for (int si = sn-1; si >= 5; si--)
-                        if (sq[si]!=ERR) ungetch(sq[si]);
+                    for (int si = sn - 1; si >= 5; si--)
+                        if (sq[si] != ERR) ungetch(sq[si]);
                     key = KEY_BTAB; consumed = true;
                 }
-
                 
                 if (!consumed && sn >= 5
                         && sq[1]=='9' && sq[2]==';' && sq[3]=='5' && sq[4]=='u') {
-                    for (int si = sn-1; si >= 5; si--)
-                        if (sq[si]!=ERR) ungetch(sq[si]);
+                    for (int si = sn - 1; si >= 5; si--)
+                        if (sq[si] != ERR) ungetch(sq[si]);
                     key = KEY_BTAB; consumed = true;
                 }
-
                 
                 if (!consumed && sn >= 5
-                        && sq[1]=='2' && sq[2]=='0'
-                        && sq[3]=='0' && sq[4]=='~') {
-                    in_paste=true; paste_len=0;
-                    if (sn > 5 && sq[5]!=ERR
-                            && paste_len<(int)sizeof(paste_batch)-1)
-                        paste_batch[paste_len++]=(char)sq[5];
-                    for (int si = sn-1; si >= 6; si--)
-                        if (sq[si]!=ERR) ungetch(sq[si]);
+                        && sq[1]=='2' && sq[2]=='0' && sq[3]=='0' && sq[4]=='~') {
+                    in_paste = true; paste_len = 0;
+                    if (sn > 5 && sq[5] != ERR && paste_len < (int)sizeof(paste_batch) - 1)
+                        paste_batch[paste_len++] = (char)sq[5];
+                    for (int si = sn - 1; si >= 6; si--)
+                        if (sq[si] != ERR) ungetch(sq[si]);
                     consumed = true;
                     continue;
                 }
-
                 
                 if (!consumed && sn >= 5
-                        && sq[1]=='2' && sq[2]=='0'
-                        && sq[3]=='1' && sq[4]=='~') {
-                    if (in_paste && paste_len>0 && E.mode==MODE_NORMAL) {
-                        paste_batch[paste_len]='\0';
-                        Pane *ap2=E.panes[E.active];
-                        if (!ap2->hex_mode)
+                        && sq[1]=='2' && sq[2]=='0' && sq[3]=='1' && sq[4]=='~') {
+                    if (in_paste && paste_len > 0 && E.mode == MODE_NORMAL) {
+                        paste_batch[paste_len] = '\0';
+                        Pane *ap2 = E.panes[E.active];
+                        if (!ap2->hex_mode) {
                             pane_insert_str(ap2, paste_batch, paste_len);
+                            if (E.hl && E.hl->visible) E.hl->dirty = true;
+                        }
                     }
-                    in_paste=false; paste_len=0;
-                    for (int si = sn-1; si >= 5; si--)
-                        if (sq[si]!=ERR) ungetch(sq[si]);
+                    in_paste = false; paste_len = 0;
+                    for (int si = sn - 1; si >= 5; si--)
+                        if (sq[si] != ERR) ungetch(sq[si]);
                     consumed = true;
                     full_redraw(true); continue;
                 }
-
-                
                 if (!consumed) {
-                    for (int si = sn-1; si >= 0; si--)
-                        if (sq[si]!=ERR) ungetch(sq[si]);
+                    for (int si = sn - 1; si >= 0; si--)
+                        if (sq[si] != ERR) ungetch(sq[si]);
                 }
             } else {
-                
-                for (int si = sn-1; si >= 0; si--)
-                    if (sq[si]!=ERR) ungetch(sq[si]);
+                for (int si = sn - 1; si >= 0; si--)
+                    if (sq[si] != ERR) ungetch(sq[si]);
             }
             (void)consumed;
         }
 
         if (in_paste) {
-            if (key!=ERR && paste_len<(int)sizeof(paste_batch)-1)
-                paste_batch[paste_len++]=(char)key;
+            if (key != ERR && paste_len < (int)sizeof(paste_batch) - 1)
+                paste_batch[paste_len++] = (char)key;
             continue;
         }
 
-        
-        Pane *ap = E.panes[E.active];
-        (void)ap;
         EditorMode prev_mode = E.mode;
         if (E.mode == MODE_NORMAL) handle_key_normal(key);
         else                       handle_key_dialog(key);
@@ -899,7 +950,7 @@ void editor_run(const char *initial_file) {
         full_redraw(force);
     }
 
-    printf("\033[?2004l"); 
+    printf("\033[?2004l");  
     fflush(stdout);
     endwin();
 }

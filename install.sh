@@ -15,43 +15,43 @@ warn() { echo -e "${YELLOW}[!]${NC} $*"; }
 fail() { echo -e "${RED}[x]${NC} $*"; exit 1; }
 
 # ---------------------------------------------------------------------------
-# Chemins
+# Paths
 # ---------------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CMD_DIR="$SCRIPT_DIR/cmd"
-BIN_DIR="$SCRIPT_DIR/cmd/bin"
+BIN_DIR="$SCRIPT_DIR/bin"
 SCRIPTS_DIR="$SCRIPT_DIR/scripts"
 
 SYS_BIN="/usr/local/bin"
 USER_BIN="$HOME/bin"
 
 # ---------------------------------------------------------------------------
-# Droits root
+# Root check
 # ---------------------------------------------------------------------------
 if [ "$EUID" -ne 0 ]; then
-    fail "Ce script doit être exécuté en tant que root. Relancez avec : sudo $0"
+    fail "This script must be run as root. Re-run with: sudo $0"
 fi
 
 # ---------------------------------------------------------------------------
-# Détection du gestionnaire de paquets
+# Package manager detection
 # ---------------------------------------------------------------------------
 detect_pkg_manager() {
     if command -v apt &>/dev/null; then
         PKG_MANAGER="apt"
-        info "Package manager détecté : apt (Debian/Ubuntu)"
+        info "Package manager detected: apt (Debian/Ubuntu)"
     elif command -v pacman &>/dev/null; then
         PKG_MANAGER="pacman"
-        info "Package manager détecté : pacman (Arch)"
+        info "Package manager detected: pacman (Arch)"
     else
-        fail "Aucun gestionnaire de paquets supporté (apt / pacman). Abandon."
+        fail "No supported package manager found (apt / pacman). Aborting."
     fi
 }
 
 # ---------------------------------------------------------------------------
-# Dépendances système
+# System dependencies
 # ---------------------------------------------------------------------------
 install_system_deps() {
-    info "Installation des dépendances système..."
+    info "Installing system dependencies..."
 
     if [ "$PKG_MANAGER" = "apt" ]; then
         apt update -qq
@@ -63,6 +63,7 @@ install_system_deps() {
             python3-pip \
             xclip \
             xsel \
+            wireless-tools \
             net-tools
     elif [ "$PKG_MANAGER" = "pacman" ]; then
         pacman -Sy --noconfirm \
@@ -72,17 +73,18 @@ install_system_deps() {
             python-pip \
             xclip \
             xsel \
+            wireless_tools \
             net-tools
     fi
 
-    ok "Dépendances système installées."
+    ok "System dependencies installed."
 }
 
 # ---------------------------------------------------------------------------
-# Dépendances Python
+# Python dependencies
 # ---------------------------------------------------------------------------
 install_python_deps() {
-    info "Installation des dépendances Python..."
+    info "Installing Python dependencies..."
 
     pip install --break-system-packages \
         rich \
@@ -90,61 +92,61 @@ install_python_deps() {
         pygments \
         psutil
 
-    ok "Dépendances Python installées."
+    ok "Python dependencies installed."
 }
 
 # ---------------------------------------------------------------------------
-# Compilation
+# Build
 # ---------------------------------------------------------------------------
 build_all() {
-    info "Compilation des binaires C..."
+    info "Building C binaries..."
 
-    [ -f "$SCRIPT_DIR/Makefile" ] || fail "Makefile introuvable dans $SCRIPT_DIR."
+    [ -f "$SCRIPT_DIR/Makefile" ] || fail "Makefile not found in $SCRIPT_DIR."
 
     cd "$SCRIPT_DIR"
     make clean && make
 
-    ok "Compilation terminée."
+    ok "Build complete."
 }
 
 # ---------------------------------------------------------------------------
-# Installation vers une destination
+# Install to a destination directory
 # ---------------------------------------------------------------------------
 install_to() {
     local dest="$1"
     mkdir -p "$dest"
 
-    # --- Binaires compilés (racine du projet) ---
+    # Compiled binaries (project root)
     for bin in abyss lsc lsc-config; do
         if [ -f "$SCRIPT_DIR/$bin" ]; then
             install -m 755 "$SCRIPT_DIR/$bin" "$dest/$bin"
             ok "$bin  ->  $dest/$bin"
         else
-            warn "$bin introuvable, ignoré."
+            warn "$bin not found, skipping."
         fi
     done
 
-    # --- Commandes shell : cmd/ ---
+    # Shell commands: cmd/
     for cmd in wipe clip compil redem tree; do
         if [ -f "$CMD_DIR/$cmd" ]; then
             install -m 755 "$CMD_DIR/$cmd" "$dest/$cmd"
             ok "$cmd  ->  $dest/$cmd"
         else
-            warn "$cmd introuvable dans cmd/, ignoré."
+            warn "$cmd not found in cmd/, skipping."
         fi
     done
 
-    # --- Jeux : cmd/bin/ ---
+    # Games: bin/
     for game in blackjack minesweeper; do
         if [ -f "$BIN_DIR/$game" ]; then
             install -m 755 "$BIN_DIR/$game" "$dest/$game"
             ok "$game  ->  $dest/$game"
         else
-            warn "$game introuvable dans cmd/bin/, ignoré."
+            warn "$game not found in bin/, skipping."
         fi
     done
 
-    # --- Scripts Python : scripts/ (wrappers shell) ---
+    # Python scripts: scripts/ (shell wrappers)
     declare -A PY_SCRIPTS=(
         ["monitoring"]="monitoring.py"
         ["wifi_monitoring"]="wifi_monitoring.py"
@@ -160,80 +162,88 @@ WRAPPER
             chmod +x "$dest/$cmd"
             ok "$cmd  ->  $dest/$cmd"
         else
-            warn "${PY_SCRIPTS[$cmd]} introuvable dans scripts/, ignoré."
+            warn "${PY_SCRIPTS[$cmd]} not found in scripts/, skipping."
         fi
     done
 }
 
 # ---------------------------------------------------------------------------
-# Nettoyage des .o après installation
-# ---------------------------------------------------------------------------
-cleanup_objects() {
-    info "Suppression des fichiers objets (.o)..."
-    cd "$SCRIPT_DIR"
-    make clean_obj
-    ok "Fichiers .o supprimés."
-}
-
-# ---------------------------------------------------------------------------
-# Orchestration
+# Install to both user-local and system-wide
 # ---------------------------------------------------------------------------
 install_binaries() {
-    # user-local
     mkdir -p "$USER_BIN"
     if [[ ":$PATH:" != *":$USER_BIN:"* ]]; then
-        warn "$USER_BIN n'est pas dans votre PATH. Ajoutez à ~/.bashrc ou ~/.zshrc :"
+        warn "$USER_BIN is not in your PATH. Add to ~/.bashrc or ~/.zshrc:"
         echo -e "  ${CYAN}export PATH=\"\$HOME/bin:\$PATH\"${NC}"
     fi
 
-    info "Installation dans $USER_BIN (utilisateur)..."
+    info "Installing to $USER_BIN (user-local)..."
     install_to "$USER_BIN"
 
-    info "Installation dans $SYS_BIN (système)..."
+    info "Installing to $SYS_BIN (system-wide)..."
     install_to "$SYS_BIN"
 
-    ok "Toutes les commandes disponibles ont été installées."
+    ok "All available commands installed."
 }
 
 # ---------------------------------------------------------------------------
-# Résumé
+# Final cleanup: remove .o files and compiled binaries from project root
+# ---------------------------------------------------------------------------
+cleanup_build() {
+    info "Removing object files (.o)..."
+    cd "$SCRIPT_DIR"
+    make clean_obj
+    ok "Object files removed."
+
+    info "Removing compiled binaries from project root..."
+    for bin in abyss lsc lsc-config; do
+        if [ -f "$SCRIPT_DIR/$bin" ]; then
+            rm -f "$SCRIPT_DIR/$bin"
+            ok "Removed $SCRIPT_DIR/$bin"
+        fi
+    done
+    ok "Project root clean."
+}
+
+# ---------------------------------------------------------------------------
+# Summary
 # ---------------------------------------------------------------------------
 print_summary() {
     echo ""
     echo -e "${BOLD}${GREEN}=======================================${NC}"
-    echo -e "${BOLD}${GREEN}   Vanilla_CLI Suite - Installation OK ${NC}"
+    echo -e "${BOLD}${GREEN}   Vanilla_CLI Suite - Install Complete ${NC}"
     echo -e "${BOLD}${GREEN}=======================================${NC}"
     echo ""
-    echo -e "  Commandes disponibles globalement :"
-    echo -e "  ${CYAN}abyss${NC}            - Éditeur de texte (C)"
-    echo -e "  ${CYAN}compil${NC}           - Compilateur/runner intelligent"
-    echo -e "  ${CYAN}clip${NC}             - Copie un fichier dans le presse-papier"
-    echo -e "  ${CYAN}wipe${NC}             - Vide le contenu d'un fichier"
-    echo -e "  ${CYAN}tree${NC}             - Vue arborescente d'un répertoire"
-    echo -e "  ${CYAN}redem${NC}            - Reset pilote WiFi"
-    echo -e "  ${CYAN}monitoring${NC}       - Dashboard système"
-    echo -e "  ${CYAN}wifi_monitoring${NC}  - Moniteur réseau"
-    echo -e "  ${CYAN}blackjack${NC}        - Jeu Blackjack"
-    echo -e "  ${CYAN}minesweeper${NC}      - Jeu Démineur"
-    echo -e "  ${CYAN}lsc${NC}              - ls avec couleurs custom (~/.colorrc)"
-    echo -e "  ${CYAN}lsc-config${NC}       - Éditeur TUI pour les règles lsc"
+    echo -e "  Commands available globally:"
+    echo -e "  ${CYAN}abyss${NC}            - Text editor (C)"
+    echo -e "  ${CYAN}compil${NC}           - Smart compiler/runner"
+    echo -e "  ${CYAN}clip${NC}             - Copy file to clipboard"
+    echo -e "  ${CYAN}wipe${NC}             - Clear file contents"
+    echo -e "  ${CYAN}tree${NC}             - Directory tree view"
+    echo -e "  ${CYAN}redem${NC}            - WiFi driver reset"
+    echo -e "  ${CYAN}monitoring${NC}       - System dashboard"
+    echo -e "  ${CYAN}wifi_monitoring${NC}  - Network monitor"
+    echo -e "  ${CYAN}blackjack${NC}        - Blackjack game"
+    echo -e "  ${CYAN}minesweeper${NC}      - Minesweeper game"
+    echo -e "  ${CYAN}lsc${NC}              - Colorized ls (~/.colorrc)"
+    echo -e "  ${CYAN}lsc-config${NC}       - TUI editor for lsc color rules"
     echo ""
-    echo -e "  Installé dans :"
-    echo -e "  ${CYAN}~/bin${NC}            (utilisateur)"
-    echo -e "  ${CYAN}/usr/local/bin${NC}   (système)"
+    echo -e "  Installed to:"
+    echo -e "  ${CYAN}~/bin${NC}            (user-local)"
+    echo -e "  ${CYAN}/usr/local/bin${NC}   (system-wide)"
     echo ""
-    echo -e "  Tip — ajoutez à ~/.bashrc pour remplacer ls :"
+    echo -e "  Tip - add to ~/.bashrc to replace ls:"
     echo -e "  ${CYAN}alias ls='lsc'${NC}"
     echo -e "  ${CYAN}alias lsconfig='lsc-config'${NC}"
     echo ""
 }
 
 # ---------------------------------------------------------------------------
-# Point d'entrée
+# Entry point
 # ---------------------------------------------------------------------------
 echo ""
-echo -e "${BOLD}${CYAN}  Vanilla_CLI Suite - Installeur${NC}"
-echo -e "${CYAN}  --------------------------------${NC}"
+echo -e "${BOLD}${CYAN}  Vanilla_CLI Suite - Installer${NC}"
+echo -e "${CYAN}  ------------------------------${NC}"
 echo ""
 
 detect_pkg_manager
@@ -241,5 +251,5 @@ install_system_deps
 install_python_deps
 build_all
 install_binaries
-cleanup_objects
+cleanup_build
 print_summary

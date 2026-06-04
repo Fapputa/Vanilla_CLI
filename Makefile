@@ -15,7 +15,8 @@ SRC     = gap_buf.c  \
           filetree.c \
           fileinfo.c \
           beautify.c \
-          editor.c
+          editor.c \
+          highlight.c
 
 OBJ     = $(SRC:.c=.o)
 TARGET  = abyss

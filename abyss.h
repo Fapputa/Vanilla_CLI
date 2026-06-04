@@ -128,12 +128,12 @@ typedef struct {
     char       search_word[256];
 } SynCtx;
 
-SynCtx  *syn_new(Language lang);
-void     syn_free(SynCtx *s);
-void     syn_mark_dirty_from(SynCtx *s, size_t line);
-void     syn_ensure_line(SynCtx *s, size_t line, const GapBuf *g,
-                         const LineIdx *li);
-Language lang_from_ext(const char *ext);
+SynCtx   *syn_new(Language lang);
+void      syn_free(SynCtx *s);
+void      syn_mark_dirty_from(SynCtx *s, size_t line);
+void      syn_ensure_line(SynCtx *s, size_t line, const GapBuf *g,
+                          const LineIdx *li);
+Language  lang_from_ext(const char *ext);
 TokenType syn_search_tok(TokenType base);
 
 typedef struct {
@@ -164,7 +164,7 @@ typedef struct {
     size_t    scroll_row;
     char      filename[4096];
     bool      modified;
-    
+
     char      search_query[256];
     size_t   *search_results;
     size_t    search_count;
@@ -181,6 +181,72 @@ void     hex_render(HexPane *h, WINDOW *win, int win_h, int win_w);
 bool     hex_handle_key(HexPane *h, int key, int win_h);
 void     hex_colors_init(void);
 
+typedef enum {
+    HLCAT_HTTP = 0,
+    HLCAT_SENSITIVE,
+    HLCAT_IP,
+    HLCAT_DATE,
+    HLCAT_WORD,
+    HLCAT_COUNT
+} HLCat;
+
+typedef struct {
+    size_t  offset;
+    size_t  len;
+    HLCat   cat;
+    int     cp;
+    char    text[64];
+} HLMatch;
+
+#define HL_MAX_MATCHES 131072
+#define HL_TOP_WORDS   40
+
+typedef struct {
+    char   word[64];
+    size_t count;
+    HLCat  cat;
+} HLWordCount;
+
+#define HL_KW_MAX 128
+
+typedef struct {
+    const char *word;
+    size_t      count;
+} HLKwCount;
+
+typedef struct HLCtx {
+    HLMatch     matches[HL_MAX_MATCHES];
+    size_t      nmatch;
+
+    HLWordCount top[HL_TOP_WORDS];
+    int         ntop;
+
+    size_t      cat_count[HLCAT_COUNT];
+
+    
+    HLKwCount   http_kw[HL_KW_MAX];
+    int         http_nkw;
+    HLKwCount   sens_kw[HL_KW_MAX];
+    int         sens_nkw;
+
+    bool        dirty;
+    bool        visible;
+    int         width;
+    int         scroll;
+    WINDOW     *win;
+} HLCtx;
+
+HLCtx      *hl_new(void);
+void        hl_free(HLCtx *h);
+void        hl_scan(HLCtx *h, const GapBuf *g);
+void        hl_render(HLCtx *h, WINDOW *win, int win_h, int win_w);
+void        hl_colors_init(void);
+const HLMatch *hl_match_at(const HLCtx *h, size_t byte_off);
+
+#define HIGHLIGHT_DEFAULT_W  34
+#define HIGHLIGHT_MIN_W      28
+#define HIGHLIGHT_MAX_W      52
+
 typedef struct {
     GapBuf    *buf;
     LineIdx   *li;
@@ -189,35 +255,34 @@ typedef struct {
     SearchCtx  search;
     Clipboard  clip;
 
-    char    filename[4096];
-    bool    modified;
-    bool    crlf;         
+    char     filename[4096];
+    bool     modified;
+    bool     crlf;
     Language lang;
 
-    size_t  cursor;
-    size_t  cursor_line;
-    size_t  cursor_col;
-    size_t  preferred_col;   
+    size_t   cursor;
+    size_t   cursor_line;
+    size_t   cursor_col;
+    size_t   preferred_col;
 
-    size_t  scroll_line;
-    size_t  scroll_col;
+    size_t   scroll_line;
+    size_t   scroll_col;
 
-    bool    sel_active;
-    size_t  sel_anchor;
+    bool     sel_active;
+    size_t   sel_anchor;
 
-    WINDOW *win;
-    int     win_y, win_x, win_h, win_w;
+    WINDOW  *win;
+    int      win_y, win_x, win_h, win_w;
 
-    bool   *line_dirty;
-    char  **prev_render;
-    int     prev_render_rows;
-    size_t  last_cursor_row;
+    bool    *line_dirty;
+    char   **prev_render;
+    int      prev_render_rows;
+    size_t   last_cursor_row;
 
-    bool    show_line_numbers;
+    bool     show_line_numbers;
 
-    
-    bool      hex_mode;
-    HexPane  *hex;
+    bool     hex_mode;
+    HexPane *hex;
 } Pane;
 
 Pane *pane_new(void);
@@ -289,7 +354,7 @@ typedef struct {
     bool    has_data;
     bool    visible;
     int     width;
-    int     scroll_row;   
+    int     scroll_row;
     WINDOW *win;
 } FileInfo;
 
@@ -335,16 +400,20 @@ typedef struct {
     bool       running;
     bool       show_shortcuts;
 
-    bool       tree_focus;   
+    bool       tree_focus;
     FileTree  *tree;
 
-    FileInfo  *finfo;        
+    FileInfo  *finfo;
 
-    pthread_t  save_thread;
-    bool       save_pending;
-    char       save_path[4096];
-    char      *save_buf;
-    size_t     save_len;
+    
+    HLCtx     *hl;
+    bool       hl_focus;
+
+    pthread_t       save_thread;
+    bool            save_pending;
+    char            save_path[4096];
+    char           *save_buf;
+    size_t          save_len;
     pthread_mutex_t save_mutex;
 } Editor;
 
@@ -361,34 +430,34 @@ void editor_resize_panes(void);
 void run_file(const char *path, Language lang, char *out_buf, size_t out_max);
 void run_async(const char *path, Language lang);
 
-#define COLOR_PAIR_NORMAL          1
-#define COLOR_PAIR_KEYWORD         2
-#define COLOR_PAIR_TYPE            3
-#define COLOR_PAIR_PREPROC         4
-#define COLOR_PAIR_STRING          5
-#define COLOR_PAIR_COMMENT         6
-#define COLOR_PAIR_NUMBER          7
-#define COLOR_PAIR_IDENT           8
-#define COLOR_PAIR_SEARCH          9
-#define COLOR_PAIR_TITLE          10
-#define COLOR_PAIR_STATUS         11
-#define COLOR_PAIR_LINENUM        12
-#define COLOR_PAIR_CURSOR         13
-#define COLOR_PAIR_OPERATOR       14
-#define COLOR_PAIR_ACTIVE_BORDER  15
+#define COLOR_PAIR_NORMAL           1
+#define COLOR_PAIR_KEYWORD          2
+#define COLOR_PAIR_TYPE             3
+#define COLOR_PAIR_PREPROC          4
+#define COLOR_PAIR_STRING           5
+#define COLOR_PAIR_COMMENT          6
+#define COLOR_PAIR_NUMBER           7
+#define COLOR_PAIR_IDENT            8
+#define COLOR_PAIR_SEARCH           9
+#define COLOR_PAIR_TITLE           10
+#define COLOR_PAIR_STATUS          11
+#define COLOR_PAIR_LINENUM         12
+#define COLOR_PAIR_CURSOR          13
+#define COLOR_PAIR_OPERATOR        14
+#define COLOR_PAIR_ACTIVE_BORDER   15
 #define COLOR_PAIR_INACTIVE_BORDER 16
-#define COLOR_PAIR_SELECTION      17
-#define COLOR_PAIR_CHAR           18
+#define COLOR_PAIR_SELECTION       17
+#define COLOR_PAIR_CHAR            18
 
-#define HEX_CP_OFFSET             19
-#define HEX_CP_ZERO               20
-#define HEX_CP_PRINT              21
-#define HEX_CP_NONPRINT           22
-#define HEX_CP_CURSOR_H           23
-#define HEX_CP_CURSOR_A           24
-#define HEX_CP_PEER               25
-#define HEX_CP_MODIFIED           26
-#define HEX_CP_HEADER             27
+#define HEX_CP_OFFSET              19
+#define HEX_CP_ZERO                20
+#define HEX_CP_PRINT               21
+#define HEX_CP_NONPRINT            22
+#define HEX_CP_CURSOR_H            23
+#define HEX_CP_CURSOR_A            24
+#define HEX_CP_PEER                25
+#define HEX_CP_MODIFIED            26
+#define HEX_CP_HEADER              27
 
 void colors_init(void);
 int  tok_to_color_pair(TokenType t);
@@ -409,4 +478,4 @@ void   arena_free(Arena *a);
 static inline size_t min_sz(size_t a, size_t b) { return a < b ? a : b; }
 static inline size_t max_sz(size_t a, size_t b) { return a > b ? a : b; }
 
-#endif 
+#endif

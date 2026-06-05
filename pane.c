@@ -378,12 +378,22 @@ void pane_render(Pane *p, bool force) {
             bool cur = (byte_pos == p->cursor);
 
             wstandend(p->win);
-            if      (cur) wattron(p->win, A_REVERSE);
-            else if (sel) wattron(p->win, COLOR_PAIR(COLOR_PAIR_SELECTION));
-            else {
-                int color_pair = tok_to_color_pair(tok);
-                wattron(p->win, COLOR_PAIR(color_pair));
-                if (tok == TOK_KEYWORD || tok == TOK_TYPE) wattron(p->win, A_BOLD);
+            if (cur) {
+                wattron(p->win, A_REVERSE);
+            } else if (sel) {
+                wattron(p->win, COLOR_PAIR(COLOR_PAIR_SELECTION));
+            } else {
+                
+                extern Editor E;
+                const HLMatch *hlm = (E.hl && E.hl->visible)
+                                     ? hl_match_at(E.hl, byte_pos) : NULL;
+                if (hlm) {
+                    wattron(p->win, COLOR_PAIR(hlm->cp) | A_BOLD);
+                } else {
+                    int color_pair = tok_to_color_pair(tok);
+                    wattron(p->win, COLOR_PAIR(color_pair));
+                    if (tok == TOK_KEYWORD || tok == TOK_TYPE) wattron(p->win, A_BOLD);
+                }
             }
 
             if (cp == '\t') {

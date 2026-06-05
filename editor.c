@@ -406,10 +406,8 @@ static void dialog_confirm(void) {
 
         case MODE_SEARCH_DIALOG:
             if (strcmp(E.dialog_buf, ap->search.query) != 0) {
-                snprintf(ap->search.query,    sizeof ap->search.query,    "%s", E.dialog_buf);
-                snprintf(ap->syn->search_word, sizeof ap->syn->search_word, "%s", E.dialog_buf);
+                snprintf(ap->search.query,     sizeof ap->search.query,     "%s", E.dialog_buf);
                 search_find(&ap->search, ap->buf);
-                syn_mark_dirty_from(ap->syn, 0);
                 if (ap->search.count > 0) {
                     ap->search.current = 0;
                     ap->cursor = ap->search.matches[0];
@@ -419,6 +417,9 @@ static void dialog_confirm(void) {
             } else {
                 pane_search_next(ap);
             }
+            
+            snprintf(ap->syn->search_word, sizeof ap->syn->search_word, "%s", ap->search.query);
+            syn_mark_dirty_from(ap->syn, 0);
             full_redraw(true);
             return;
 
@@ -588,7 +589,10 @@ static void handle_key_normal(int key) {
         }
 
         case KEY_BACKSPACE: case 127: case '\b': pane_delete_char(ap);    break;
-        case KEY_DC:                             pane_delete_forward(ap); break;
+        case KEY_DC:
+            if (ap->search.query[0]) pane_search_prev(ap);
+            else                     pane_delete_forward(ap);
+            break;
         case '\n': case '\r':                    pane_insert_char(ap, '\n'); break;
         case '\t':                               pane_insert_str(ap, "    ", 4); break;
 
@@ -693,10 +697,10 @@ static void handle_key_normal(int key) {
 
         case 27:
             ap->sel_active = false;
-            search_clear(&ap->search);
-            ap->search.query[0]      = '\0';
-            ap->syn->search_word[0]  = '\0';
-            syn_mark_dirty_from(ap->syn, 0);
+            if (ap->search.query[0]) {
+                ap->syn->search_word[0] = '\0';
+                syn_mark_dirty_from(ap->syn, 0);
+            }
             break;
 
         default:
@@ -714,19 +718,65 @@ static void handle_key_dialog(int key) {
         case 27:
             if (E.mode == MODE_SEARCH_DIALOG) {
                 Pane *ap = E.panes[E.active];
-                search_clear(&ap->search);
-                ap->search.query[0]     = '\0';
                 ap->syn->search_word[0] = '\0';
                 syn_mark_dirty_from(ap->syn, 0);
             }
             E.mode = MODE_NORMAL;
             break;
         case KEY_BACKSPACE: case 127: case '\b': dialog_backspace(); break;
+        case KEY_DC:
+            if (E.mode == MODE_SEARCH_DIALOG) {
+                Pane *ap = E.panes[E.active];
+                if (strcmp(E.dialog_buf, ap->search.query) != 0) {
+                    snprintf(ap->search.query, sizeof ap->search.query, "%s", E.dialog_buf);
+                    search_find(&ap->search, ap->buf);
+                }
+                snprintf(ap->syn->search_word, sizeof ap->syn->search_word, "%s", ap->search.query);
+                syn_mark_dirty_from(ap->syn, 0);
+                if (ap->search.count > 0) {
+                    int idx = (int)ap->search.count - 1;
+                    for (int i = (int)ap->search.count - 1; i >= 0; i--) {
+                        if (ap->search.matches[i] < ap->cursor) { idx = i; break; }
+                    }
+                    ap->search.current = (idx + 1) % (int)ap->search.count;
+                }
+                pane_search_prev(ap);
+                full_redraw(true);
+            }
+            break;
         case KEY_LEFT:
             if (E.dialog_cursor > 0) E.dialog_cursor--;
             break;
         case KEY_RIGHT:
             if (E.dialog_cursor < strlen(E.dialog_buf)) E.dialog_cursor++;
+            break;
+        case 'n' & 0x1f:
+            if (E.mode == MODE_SEARCH_DIALOG) {
+                dialog_confirm();
+            }
+            break;
+        case 'p' & 0x1f:
+            if (E.mode == MODE_SEARCH_DIALOG) {
+                Pane *ap = E.panes[E.active];
+                if (strcmp(E.dialog_buf, ap->search.query) != 0) {
+                    snprintf(ap->search.query, sizeof ap->search.query, "%s", E.dialog_buf);
+                    search_find(&ap->search, ap->buf);
+                }
+                snprintf(ap->syn->search_word, sizeof ap->syn->search_word, "%s", ap->search.query);
+                syn_mark_dirty_from(ap->syn, 0);
+                
+                if (ap->search.count > 0) {
+                    int idx = (int)ap->search.count - 1;
+                    for (int i = (int)ap->search.count - 1; i >= 0; i--) {
+                        if (ap->search.matches[i] < ap->cursor) { idx = i; break; }
+                    }
+                    
+
+                    ap->search.current = (idx + 1) % (int)ap->search.count;
+                }
+                pane_search_prev(ap);
+                full_redraw(true);
+            }
             break;
         default:
             if (key >= 32 && key < 127) dialog_insert((char)key);

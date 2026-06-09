@@ -198,7 +198,7 @@ typedef struct {
     char    text[64];
 } HLMatch;
 
-#define HL_MAX_MATCHES 131072
+#define HL_MAX_MATCHES 524288
 #define HL_TOP_WORDS   40
 
 typedef struct {
@@ -207,15 +207,20 @@ typedef struct {
     HLCat  cat;
 } HLWordCount;
 
-#define HL_KW_MAX 128
+#define HL_KW_MAX  128
+#define HL_IP_MAX  4096
+#define HL_DT_MAX  2048
 
 typedef struct {
     const char *word;
     size_t      count;
 } HLKwCount;
 
+typedef struct { char ip[64]; size_t cnt; } HLIPEntry;
+typedef struct { char dt[64]; size_t cnt; } HLDTEntry;
+
 typedef struct HLCtx {
-    HLMatch     matches[HL_MAX_MATCHES];
+    HLMatch    *matches;       
     size_t      nmatch;
 
     HLWordCount top[HL_TOP_WORDS];
@@ -223,11 +228,16 @@ typedef struct HLCtx {
 
     size_t      cat_count[HLCAT_COUNT];
 
-    
     HLKwCount   http_kw[HL_KW_MAX];
     int         http_nkw;
     HLKwCount   sens_kw[HL_KW_MAX];
     int         sens_nkw;
+
+    
+    HLIPEntry   ips[HL_IP_MAX];
+    int         nips;
+    HLDTEntry   dts[HL_DT_MAX];
+    int         ndts;
 
     bool        dirty;
     bool        visible;

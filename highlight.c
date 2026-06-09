@@ -3,19 +3,18 @@
 #include <stdlib.h>
 #include <ctype.h>
 #include <stdio.h>
-#include <regex.h>
 
 #define HL_CP_BASE        130
 #define HL_CP_BORDER      (HL_CP_BASE + 0)
 #define HL_CP_HEADER      (HL_CP_BASE + 1)
 #define HL_CP_SECTION     (HL_CP_BASE + 2)
-#define HL_CP_HTTP        (HL_CP_BASE + 3)   
-#define HL_CP_SENSITIVE   (HL_CP_BASE + 4)   
-#define HL_CP_IP          (HL_CP_BASE + 5)   
-#define HL_CP_DATE        (HL_CP_BASE + 6)   
-#define HL_CP_WORD        (HL_CP_BASE + 7)   
-#define HL_CP_COUNT       (HL_CP_BASE + 8)   
-#define HL_CP_MATCH_HTTP  (HL_CP_BASE + 9)   
+#define HL_CP_HTTP        (HL_CP_BASE + 3)
+#define HL_CP_SENSITIVE   (HL_CP_BASE + 4)
+#define HL_CP_IP          (HL_CP_BASE + 5)
+#define HL_CP_DATE        (HL_CP_BASE + 6)
+#define HL_CP_WORD        (HL_CP_BASE + 7)
+#define HL_CP_COUNT       (HL_CP_BASE + 8)
+#define HL_CP_MATCH_HTTP  (HL_CP_BASE + 9)
 #define HL_CP_MATCH_SENS  (HL_CP_BASE + 10)
 #define HL_CP_MATCH_IP    (HL_CP_BASE + 11)
 #define HL_CP_MATCH_DATE  (HL_CP_BASE + 12)
@@ -31,7 +30,6 @@ void hl_colors_init(void) {
     init_pair(HL_CP_DATE,       COLOR_YELLOW,  -1);
     init_pair(HL_CP_WORD,       COLOR_WHITE,   -1);
     init_pair(HL_CP_COUNT,      COLOR_GREEN,   -1);
-    
     init_pair(HL_CP_MATCH_HTTP, COLOR_BLACK,   COLOR_CYAN);
     init_pair(HL_CP_MATCH_SENS, COLOR_WHITE,   COLOR_RED);
     init_pair(HL_CP_MATCH_IP,   COLOR_BLACK,   COLOR_MAGENTA);
@@ -39,191 +37,50 @@ void hl_colors_init(void) {
     init_pair(HL_CP_MATCH_WORD, COLOR_BLACK,   COLOR_WHITE);
 }
 
-HLCtx *hl_new(void) {
-    HLCtx *h = calloc(1, sizeof *h);
-    h->dirty   = true;
-    h->visible = false;
-    h->width   = 34;
-    return h;
-}
+typedef struct { const char *w; size_t len; } KW;
 
-void hl_free(HLCtx *h) {
-    if (!h) return;
-    if (h->win) delwin(h->win);
-    free(h);
-}
-
-static bool is_word_char(char c) {
-    return isalnum((unsigned char)c) || c == '_';
-}
-
-static size_t extract_word(const GapBuf *g, size_t off, char *out, size_t max) {
-    size_t len = gb_len(g);
-    size_t n = 0;
-    while (off + n < len && n < max - 1 && is_word_char(gb_at(g, off + n)))
-        n++;
-    gb_get_range(g, off, n, out);
-    out[n] = '\0';
-    return n;
-}
-
-static void add_match(HLCtx *h, const GapBuf *g, size_t off, size_t len, HLCat cat) {
-    if (h->nmatch >= HL_MAX_MATCHES) return;
-    int cp;
-    switch (cat) {
-        case HLCAT_HTTP:      cp = HL_CP_MATCH_HTTP; break;
-        case HLCAT_SENSITIVE: cp = HL_CP_MATCH_SENS; break;
-        case HLCAT_IP:        cp = HL_CP_MATCH_IP;   break;
-        case HLCAT_DATE:      cp = HL_CP_MATCH_DATE; break;
-        default:              cp = HL_CP_MATCH_WORD; break;
-    }
-    HLMatch *m = &h->matches[h->nmatch++];
-    m->offset = off;
-    m->len    = len;
-    m->cat    = cat;
-    m->cp     = cp;
-    size_t n  = len < 63 ? len : 63;
-    gb_get_range(g, off, n, m->text);
-    m->text[n] = '\0';
-    h->cat_count[cat]++;
-}
+static KW HTTP_KW[16];
+static int HTTP_KW_N = 0;
+static KW SENS_KW[128];
+static int SENS_KW_N = 0;
+static KW MONTH_KW[32];
+static int MONTH_KW_N = 0;
 
 static const char *HTTP_METHODS[] = {
-    "GET","POST","PUT","DELETE","PATCH","HEAD","OPTIONS","CONNECT","TRACE",
-    NULL
+    "GET","POST","PUT","DELETE","PATCH","HEAD","OPTIONS","CONNECT","TRACE", NULL
 };
-
 static const char *SENSITIVE_WORDS[] = {
-    
     "user","username","password","passwd","pass","token","key","secret",
     "auth","bearer","api_key","apikey","session","cookie","jwt","hash",
     "salt","credential","credentials","login","email","phone","ssn",
     "credit_card","cvv","pin","otp","mfa","2fa","private_key","public_key",
-    
     "host","hostname","port","proxy","gateway","firewall","subnet","dns",
     "ssl","tls","cert","certificate","cipher","handshake","vpn","tunnel",
-    
     "error","err","errno","exception","fatal","panic","crash","segfault",
     "debug","trace","warn","warning","critical","alert","failure","timeout",
-    
     "database","db","query","sql","injection","payload","schema","table",
     "root","admin","sudo","superuser","privilege","escalation","exploit",
-    
     "header","referer","origin","cors","xss","csrf","redirect","callback",
-    "endpoint","webhook","request","response","status","code",
-    NULL
+    "endpoint","webhook","request","response","status","code", NULL
 };
-
 static const char *MONTH_NAMES[] = {
     "jan","feb","mar","apr","may","jun",
     "jul","aug","sep","oct","nov","dec",
     "january","february","march","april","june","july",
-    "august","september","october","november","december",
-    NULL
+    "august","september","october","november","december", NULL
 };
 
-static bool match_word_boundary(const GapBuf *g, size_t off, const char *word, size_t wlen) {
-    size_t buflen = gb_len(g);
-    if (off + wlen > buflen) return false;
-    
-    if (off > 0 && is_word_char(gb_at(g, off - 1))) return false;
-    
-    if (off + wlen < buflen && is_word_char(gb_at(g, off + wlen))) return false;
-    for (size_t i = 0; i < wlen; i++) {
-        if (tolower((unsigned char)gb_at(g, off + i)) != tolower((unsigned char)word[i]))
-            return false;
-    }
-    return true;
+static void kw_tables_init(void) {
+    if (HTTP_KW_N) return; 
+    for (int i = 0; HTTP_METHODS[i]; i++)
+        HTTP_KW[HTTP_KW_N++] = (KW){ HTTP_METHODS[i], strlen(HTTP_METHODS[i]) };
+    for (int i = 0; SENSITIVE_WORDS[i]; i++)
+        SENS_KW[SENS_KW_N++] = (KW){ SENSITIVE_WORDS[i], strlen(SENSITIVE_WORDS[i]) };
+    for (int i = 0; MONTH_NAMES[i]; i++)
+        MONTH_KW[MONTH_KW_N++] = (KW){ MONTH_NAMES[i], strlen(MONTH_NAMES[i]) };
 }
 
-static bool scan_ipv4_at(const GapBuf *g, size_t off, size_t *out_len) {
-    size_t buflen = gb_len(g);
-    size_t pos = off;
-    
-    if (off > 0 && is_word_char(gb_at(g, off - 1))) return false;
-
-    for (int octet = 0; octet < 4; octet++) {
-        if (pos >= buflen || !isdigit((unsigned char)gb_at(g, pos))) return false;
-        int digits = 0;
-        while (pos < buflen && isdigit((unsigned char)gb_at(g, pos))) {
-            pos++; digits++;
-            if (digits > 3) return false;
-        }
-        if (octet < 3) {
-            if (pos >= buflen || gb_at(g, pos) != '.') return false;
-            pos++;
-        }
-    }
-    
-    if (pos < buflen && (gb_at(g, pos) == '.' || isalpha((unsigned char)gb_at(g, pos)))) return false;
-    *out_len = pos - off;
-    return true;
-}
-
-static bool scan_date_at(const GapBuf *g, size_t off, size_t *out_len) {
-    size_t buflen = gb_len(g);
-    if (off > 0 && isdigit((unsigned char)gb_at(g, off - 1))) return false;
-
-    
-    if (off + 8 > buflen) return false;
-
-    
-    char tmp[20];
-    size_t n = 0;
-    size_t pos = off;
-    while (pos < buflen && n < 19) {
-        char c = gb_at(g, pos);
-        if (isdigit((unsigned char)c) || c == '/' || c == '-' || c == ':') {
-            tmp[n++] = c;
-            pos++;
-        } else break;
-    }
-    tmp[n] = '\0';
-
-    
-    if (n >= 8) {
-        
-        if (n >= 10 && tmp[2]=='/' && tmp[5]=='/' && isdigit((unsigned char)tmp[6])) {
-            *out_len = 10;
-            return true;
-        }
-        
-        if (n >= 10 && tmp[4]=='-' && tmp[7]=='-') {
-            *out_len = 10;
-            return true;
-        }
-        
-        if (n >= 10 && tmp[2]=='-' && tmp[5]=='-' && isdigit((unsigned char)tmp[6])) {
-            *out_len = 10;
-            return true;
-        }
-        
-        if (n >= 8 && tmp[2]==':' && tmp[5]==':') {
-            *out_len = 8;
-            return true;
-        }
-        
-        if (n >= 5 && tmp[2]==':' && isdigit((unsigned char)tmp[3])) {
-            *out_len = 5;
-            return true;
-        }
-    }
-    return false;
-}
-
-#define FREQ_BUCKETS 1024
-typedef struct FreqNode {
-    char            word[64];
-    size_t          count;
-    struct FreqNode *next;
-} FreqNode;
-
-static unsigned str_hash(const char *s) {
-    unsigned h = 5381;
-    while (*s) h = ((h << 5) + h) ^ (unsigned char)*s++;
-    return h % FREQ_BUCKETS;
-}
-
+#define STOP_HT_SIZE 256
 static const char *STOP_WORDS[] = {
     "the","a","an","is","it","in","of","to","and","or","for",
     "if","do","int","char","void","return","true","false","null",
@@ -232,14 +89,132 @@ static const char *STOP_WORDS[] = {
     "with","from","that","have","had","has","was","were","are",
     "been","but","also","when","who","they","their","than","can",
     "will","more","some","into","over","out","get","set","use",
-    "var","let","def","fn","pub","mod","use","type","size",
-    NULL
+    "var","let","def","fn","pub","mod","type","size", NULL
 };
 
+static uint8_t stop_ht[STOP_HT_SIZE]; 
+static char    stop_ht_keys[STOP_HT_SIZE][16];
+
+static unsigned stop_hash(const char *s) {
+    unsigned h = 2166136261u;
+    while (*s) h = (h ^ (unsigned char)*s++) * 16777619u;
+    return h & (STOP_HT_SIZE - 1);
+}
+
+static void stop_ht_init(void) {
+    for (int i = 0; STOP_WORDS[i]; i++) {
+        unsigned slot = stop_hash(STOP_WORDS[i]);
+        
+        while (stop_ht[slot] && strcmp(stop_ht_keys[slot], STOP_WORDS[i]) != 0)
+            slot = (slot + 1) & (STOP_HT_SIZE - 1);
+        stop_ht[slot] = 1;
+        strncpy(stop_ht_keys[slot], STOP_WORDS[i], 15);
+    }
+}
+
 static bool is_stop(const char *w) {
-    for (int i = 0; STOP_WORDS[i]; i++)
-        if (strcasecmp(w, STOP_WORDS[i]) == 0) return true;
+    unsigned slot = stop_hash(w);
+    while (stop_ht[slot]) {
+        if (strcmp(stop_ht_keys[slot], w) == 0) return true;
+        slot = (slot + 1) & (STOP_HT_SIZE - 1);
+    }
     return false;
+}
+
+HLCtx *hl_new(void) {
+    kw_tables_init();
+    stop_ht_init();
+    HLCtx *h = calloc(1, sizeof *h);
+    if (!h) return NULL;
+    h->matches = calloc(HL_MAX_MATCHES, sizeof(HLMatch));
+    if (!h->matches) { free(h); return NULL; }
+    h->dirty   = true;
+    h->visible = false;
+    h->width   = HIGHLIGHT_DEFAULT_W;
+    return h;
+}
+
+void hl_free(HLCtx *h) {
+    if (!h) return;
+    if (h->win) delwin(h->win);
+    free(h->matches);
+    free(h);
+}
+
+static inline bool is_word_char(char c) {
+    return isalnum((unsigned char)c) || c == '_';
+}
+
+static bool scan_ipv4(const char *buf, size_t off, size_t buflen, size_t *out_len) {
+    if (off > 0 && is_word_char(buf[off - 1])) return false;
+    size_t pos = off;
+    for (int oct = 0; oct < 4; oct++) {
+        if (pos >= buflen || !isdigit((unsigned char)buf[pos])) return false;
+        int digits = 0;
+        while (pos < buflen && isdigit((unsigned char)buf[pos])) {
+            pos++; digits++;
+            if (digits > 3) return false;
+        }
+        if (oct < 3) {
+            if (pos >= buflen || buf[pos] != '.') return false;
+            pos++;
+        }
+    }
+    if (pos < buflen && (buf[pos] == '.' || isalpha((unsigned char)buf[pos]))) return false;
+    *out_len = pos - off;
+    return true;
+}
+
+static bool scan_date(const char *buf, size_t off, size_t buflen, size_t *out_len) {
+    if (off > 0 && isdigit((unsigned char)buf[off - 1])) return false;
+    if (off + 8 > buflen) return false;
+    char tmp[20]; size_t n = 0, pos = off;
+    while (pos < buflen && n < 19) {
+        char c = buf[pos];
+        if (isdigit((unsigned char)c) || c == '/' || c == '-' || c == ':')
+            { tmp[n++] = c; pos++; }
+        else break;
+    }
+    tmp[n] = '\0';
+    if (n >= 10 && tmp[2]=='/' && tmp[5]=='/' && isdigit((unsigned char)tmp[6])) { *out_len=10; return true; }
+    if (n >= 10 && tmp[4]=='-' && tmp[7]=='-')                                    { *out_len=10; return true; }
+    if (n >= 10 && tmp[2]=='-' && tmp[5]=='-' && isdigit((unsigned char)tmp[6])) { *out_len=10; return true; }
+    if (n >= 8  && tmp[2]==':' && tmp[5]==':')                                    { *out_len=8;  return true; }
+    if (n >= 5  && tmp[2]==':' && isdigit((unsigned char)tmp[3]))                 { *out_len=5;  return true; }
+    return false;
+}
+
+#define FREQ_BUCKETS 4096   
+typedef struct FreqNode { char word[64]; size_t count; struct FreqNode *next; } FreqNode;
+
+#define FREQ_POOL_SIZE 65536
+typedef struct FreqPool { FreqNode nodes[FREQ_POOL_SIZE]; size_t used; } FreqPool;
+
+static unsigned str_hash(const char *s) {
+    unsigned h = 2166136261u;
+    while (*s) h = (h ^ (unsigned char)*s++) * 16777619u;
+    return h & (FREQ_BUCKETS - 1);
+}
+
+#define IP_DEDUP_BUCKETS  2048
+#define DT_DEDUP_BUCKETS  512
+
+typedef struct IPNode { char ip[64]; size_t cnt; struct IPNode *next; } IPNode;
+typedef struct DTNode { char dt[64]; size_t cnt; struct DTNode *next; } DTNode;
+
+static inline void add_match_fast(HLCtx *h, size_t off, size_t len, HLCat cat, int cp,
+                                   const char *text)
+{
+    if (h->nmatch >= HL_MAX_MATCHES) return;
+    HLMatch *m = &h->matches[h->nmatch++];
+    m->offset = off;
+    m->len    = len;
+    m->cat    = cat;
+    m->cp     = cp;
+    size_t n  = len < 63 ? len : 63;
+    memcpy(m->text, text, n);
+    m->text[n] = '\0';
+    h->cat_count[cat]++;
 }
 
 void hl_scan(HLCtx *h, const GapBuf *g) {
@@ -253,47 +228,108 @@ void hl_scan(HLCtx *h, const GapBuf *g) {
     if (buflen == 0) { h->dirty = false; return; }
 
     
-    FreqNode *buckets[FREQ_BUCKETS];
-    memset(buckets, 0, sizeof buckets);
+    char *buf = gb_to_str(g);  
+    if (!buf) { h->dirty = false; return; }
 
     
+    FreqNode *buckets[FREQ_BUCKETS];
+    memset(buckets, 0, sizeof buckets);
+    FreqPool *pool = calloc(1, sizeof *pool);
+    if (!pool) { free(buf); h->dirty = false; return; }
+
+    
+    IPNode *ip_bkts[IP_DEDUP_BUCKETS];
+    DTNode *dt_bkts[DT_DEDUP_BUCKETS];
+    memset(ip_bkts, 0, sizeof ip_bkts);
+    memset(dt_bkts, 0, sizeof dt_bkts);
+    
+    IPNode *ip_pool = malloc(8192 * sizeof(IPNode));
+    DTNode *dt_pool = malloc(4096 * sizeof(DTNode));
+    int ip_pool_used = 0, dt_pool_used = 0;
+    int ip_pool_cap  = ip_pool ? 8192 : 0;
+    int dt_pool_cap  = dt_pool ? 4096 : 0;
+
     size_t i = 0;
     while (i < buflen) {
-        char c = gb_at(g, i);
+        unsigned char c = (unsigned char)buf[i];
 
         
-        if (isdigit((unsigned char)c)) {
+        if (isdigit(c)) {
             size_t iplen = 0;
-            if (scan_ipv4_at(g, i, &iplen)) {
-                add_match(h, g, i, iplen, HLCAT_IP);
+            if (scan_ipv4(buf, i, buflen, &iplen)) {
+                
+                add_match_fast(h, i, iplen, HLCAT_IP, HL_CP_MATCH_IP, buf + i);
+
+                
+                if (ip_pool) {
+                    char tmp[64];
+                    size_t n = iplen < 63 ? iplen : 63;
+                    memcpy(tmp, buf + i, n); tmp[n] = '\0';
+                    unsigned slot = str_hash(tmp) & (IP_DEDUP_BUCKETS - 1);
+                    IPNode *nd = ip_bkts[slot];
+                    while (nd && strcmp(nd->ip, tmp) != 0) nd = nd->next;
+                    if (!nd && ip_pool_used < ip_pool_cap) {
+                        nd = &ip_pool[ip_pool_used++];
+                        memcpy(nd->ip, tmp, n + 1);
+                        nd->cnt  = 0;
+                        nd->next = ip_bkts[slot];
+                        ip_bkts[slot] = nd;
+                    }
+                    if (nd) nd->cnt++;
+                }
+
                 i += iplen;
                 continue;
             }
-        }
-
-        
-        if (isdigit((unsigned char)c)) {
             size_t dlen = 0;
-            if (scan_date_at(g, i, &dlen)) {
-                add_match(h, g, i, dlen, HLCAT_DATE);
+            if (scan_date(buf, i, buflen, &dlen)) {
+                add_match_fast(h, i, dlen, HLCAT_DATE, HL_CP_MATCH_DATE, buf + i);
+
+                if (dt_pool) {
+                    char tmp[64];
+                    size_t n = dlen < 63 ? dlen : 63;
+                    memcpy(tmp, buf + i, n); tmp[n] = '\0';
+                    unsigned slot = str_hash(tmp) & (DT_DEDUP_BUCKETS - 1);
+                    DTNode *nd = dt_bkts[slot];
+                    while (nd && strcmp(nd->dt, tmp) != 0) nd = nd->next;
+                    if (!nd && dt_pool_used < dt_pool_cap) {
+                        nd = &dt_pool[dt_pool_used++];
+                        memcpy(nd->dt, tmp, n + 1);
+                        nd->cnt  = 0;
+                        nd->next = dt_bkts[slot];
+                        dt_bkts[slot] = nd;
+                    }
+                    if (nd) nd->cnt++;
+                }
+
                 i += dlen;
                 continue;
             }
+            i++;
+            continue;
         }
 
         
-        if (isalpha((unsigned char)c) || c == '_') {
+        if (isalpha(c) || c == '_') {
+            
+            size_t wstart = i;
+            while (i < buflen && is_word_char(buf[i])) i++;
+            size_t wlen = i - wstart;
+            if (wlen == 0) continue;
+            if (wlen >= 64) continue; 
+
             char word[64];
-            size_t wlen = extract_word(g, i, word, sizeof word);
-            if (wlen == 0) { i++; continue; }
+            memcpy(word, buf + wstart, wlen);
+            word[wlen] = '\0';
 
             bool found_cat = false;
 
             
-            for (int m = 0; HTTP_METHODS[m]; m++) {
-                size_t ml = strlen(HTTP_METHODS[m]);
-                if (wlen == ml && match_word_boundary(g, i, HTTP_METHODS[m], ml)) {
-                    add_match(h, g, i, ml, HLCAT_HTTP);
+            for (int m = 0; m < HTTP_KW_N; m++) {
+                if (wlen == HTTP_KW[m].len &&
+                    memcmp(word, HTTP_KW[m].w, wlen) == 0)
+                {
+                    add_match_fast(h, wstart, wlen, HLCAT_HTTP, HL_CP_MATCH_HTTP, word);
                     found_cat = true;
                     break;
                 }
@@ -301,45 +337,50 @@ void hl_scan(HLCtx *h, const GapBuf *g) {
 
             if (!found_cat) {
                 
-                for (int m = 0; SENSITIVE_WORDS[m]; m++) {
-                    size_t ml = strlen(SENSITIVE_WORDS[m]);
-                    if (wlen == ml && match_word_boundary(g, i, SENSITIVE_WORDS[m], ml)) {
-                        add_match(h, g, i, ml, HLCAT_SENSITIVE);
-                        found_cat = true;
-                        break;
-                    }
-                }
-            }
-
-            if (!found_cat) {
-                
-                for (int m = 0; MONTH_NAMES[m]; m++) {
-                    size_t ml = strlen(MONTH_NAMES[m]);
-                    if (wlen == ml && match_word_boundary(g, i, MONTH_NAMES[m], ml)) {
-                        add_match(h, g, i, ml, HLCAT_DATE);
-                        found_cat = true;
-                        break;
-                    }
-                }
-            }
-
-            
-            if (wlen >= 3 && wlen < 63 && !is_stop(word)) {
                 char lw[64];
-                for (size_t k = 0; k <= wlen; k++) lw[k] = (char)tolower((unsigned char)word[k]);
-                unsigned slot = str_hash(lw);
-                FreqNode *fn = buckets[slot];
-                while (fn && strcmp(fn->word, lw) != 0) fn = fn->next;
-                if (!fn) {
-                    fn = calloc(1, sizeof *fn);
-                    strncpy(fn->word, lw, 63);
-                    fn->next = buckets[slot];
-                    buckets[slot] = fn;
-                }
-                fn->count++;
-            }
+                for (size_t k = 0; k < wlen; k++) lw[k] = (char)tolower((unsigned char)word[k]);
+                lw[wlen] = '\0';
 
-            i += wlen;
+                for (int m = 0; m < SENS_KW_N; m++) {
+                    if (wlen == SENS_KW[m].len &&
+                        memcmp(lw, SENS_KW[m].w, wlen) == 0)
+                    {
+                        add_match_fast(h, wstart, wlen, HLCAT_SENSITIVE, HL_CP_MATCH_SENS, word);
+                        found_cat = true;
+                        break;
+                    }
+                }
+
+                if (!found_cat) {
+                    
+                    for (int m = 0; m < MONTH_KW_N; m++) {
+                        if (wlen == MONTH_KW[m].len &&
+                            memcmp(lw, MONTH_KW[m].w, wlen) == 0)
+                        {
+                            add_match_fast(h, wstart, wlen, HLCAT_DATE, HL_CP_MATCH_DATE, word);
+                            found_cat = true;
+                            break;
+                        }
+                    }
+                }
+
+                
+                if (wlen >= 3 && !is_stop(lw)) {
+                    unsigned slot = str_hash(lw);
+                    FreqNode *fn = buckets[slot];
+                    while (fn && strcmp(fn->word, lw) != 0) fn = fn->next;
+                    if (!fn) {
+                        if (pool->used < FREQ_POOL_SIZE) {
+                            fn = &pool->nodes[pool->used++];
+                            memcpy(fn->word, lw, wlen + 1);
+                            fn->count = 0;
+                            fn->next  = buckets[slot];
+                            buckets[slot] = fn;
+                        }
+                    }
+                    if (fn) fn->count++;
+                }
+            }
             continue;
         }
 
@@ -347,55 +388,91 @@ void hl_scan(HLCtx *h, const GapBuf *g) {
     }
 
     
+    h->nips = 0;
+    if (ip_pool) {
+        
+        for (int b = 0; b < IP_DEDUP_BUCKETS && h->nips < HL_IP_MAX; b++) {
+            for (IPNode *nd = ip_bkts[b]; nd && h->nips < HL_IP_MAX; nd = nd->next) {
+                h->ips[h->nips++] = (HLIPEntry){ .cnt = nd->cnt };
+                strncpy(h->ips[h->nips - 1].ip, nd->ip, 63);
+            }
+        }
+        
+        for (int a = 1; a < h->nips; a++) {
+            HLIPEntry key = h->ips[a]; int b = a - 1;
+            while (b >= 0 && h->ips[b].cnt < key.cnt) { h->ips[b+1] = h->ips[b]; b--; }
+            h->ips[b+1] = key;
+        }
+        free(ip_pool);
+    }
+
+    
+    h->ndts = 0;
+    if (dt_pool) {
+        for (int b = 0; b < DT_DEDUP_BUCKETS && h->ndts < HL_DT_MAX; b++) {
+            for (DTNode *nd = dt_bkts[b]; nd && h->ndts < HL_DT_MAX; nd = nd->next) {
+                h->dts[h->ndts++] = (HLDTEntry){ .cnt = nd->cnt };
+                strncpy(h->dts[h->ndts - 1].dt, nd->dt, 63);
+            }
+        }
+        for (int a = 1; a < h->ndts; a++) {
+            HLDTEntry key = h->dts[a]; int b = a - 1;
+            while (b >= 0 && h->dts[b].cnt < key.cnt) { h->dts[b+1] = h->dts[b]; b--; }
+            h->dts[b+1] = key;
+        }
+        free(dt_pool);
+    }
+
     
     size_t total_words = 0;
-    
     for (int b = 0; b < FREQ_BUCKETS; b++)
         for (FreqNode *fn = buckets[b]; fn; fn = fn->next) total_words++;
-    FreqNode **all_nodes = malloc(total_words * sizeof *all_nodes);
-    if (!all_nodes) { h->dirty = false; goto cleanup; }
-    total_words = 0;
-    for (int b = 0; b < FREQ_BUCKETS; b++)
-        for (FreqNode *fn = buckets[b]; fn; fn = fn->next)
-            all_nodes[total_words++] = fn;
-    
-    for (size_t a = 1; a < total_words; a++) {
-        FreqNode *key = all_nodes[a];
-        long j = (long)a - 1;
-        while (j >= 0 && all_nodes[j]->count < key->count) {
-            all_nodes[j + 1] = all_nodes[j]; j--;
-        }
-        all_nodes[j + 1] = key;
-    }
 
-    
-    int added = 0;
-    for (size_t a = 0; a < total_words && added < HL_TOP_WORDS; a++) {
-        FreqNode *fn = all_nodes[a];
-        if (fn->count < 2) break; 
+    FreqNode **all_nodes = malloc(total_words * sizeof *all_nodes);
+    if (all_nodes) {
+        size_t idx = 0;
+        for (int b = 0; b < FREQ_BUCKETS; b++)
+            for (FreqNode *fn = buckets[b]; fn; fn = fn->next)
+                all_nodes[idx++] = fn;
 
         
-        bool skip = false;
-        for (int m = 0; HTTP_METHODS[m]; m++)
-            if (strcasecmp(fn->word, HTTP_METHODS[m]) == 0) { skip = true; break; }
-        if (!skip)
-            for (int m = 0; SENSITIVE_WORDS[m]; m++)
-                if (strcasecmp(fn->word, SENSITIVE_WORDS[m]) == 0) { skip = true; break; }
-        if (skip) continue;
+        size_t limit = total_words < (size_t)HL_TOP_WORDS ? total_words : (size_t)HL_TOP_WORDS;
+        for (size_t a = 0; a < limit; a++) {
+            size_t best = a;
+            for (size_t bb = a + 1; bb < total_words; bb++)
+                if (all_nodes[bb]->count > all_nodes[best]->count) best = bb;
+            if (best != a) { FreqNode *tmp = all_nodes[a]; all_nodes[a] = all_nodes[best]; all_nodes[best] = tmp; }
+        }
 
-        h->top[added++] = (HLWordCount){ .count = fn->count, .cat = HLCAT_WORD };
-        strncpy(h->top[added - 1].word, fn->word, 63);
+        int added = 0;
+        for (size_t a = 0; a < limit && added < HL_TOP_WORDS; a++) {
+            FreqNode *fn = all_nodes[a];
+            if (fn->count < 2) break;
+            bool skip = false;
+            for (int m = 0; m < HTTP_KW_N && !skip; m++)
+                if (strcasecmp(fn->word, HTTP_KW[m].w) == 0) skip = true;
+            for (int m = 0; m < SENS_KW_N && !skip; m++)
+                if (strcasecmp(fn->word, SENS_KW[m].w) == 0) skip = true;
+            if (skip) continue;
+            h->top[added] = (HLWordCount){ .count = fn->count, .cat = HLCAT_WORD };
+            strncpy(h->top[added].word, fn->word, 63);
+            added++;
+        }
+        h->ntop = added;
+        free(all_nodes);
     }
-    h->ntop = added;
 
     
     for (int t = 0; t < h->ntop; t++) {
         size_t wlen = strlen(h->top[t].word);
-        for (size_t pos = 0; pos < buflen; ) {
-            char c2 = gb_at(g, pos);
-            if (isalpha((unsigned char)c2) || c2 == '_') {
-                if (match_word_boundary(g, pos, h->top[t].word, wlen)) {
-                    add_match(h, g, pos, wlen, HLCAT_WORD);
+        for (size_t pos = 0; pos + wlen <= buflen; ) {
+            unsigned char c2 = (unsigned char)buf[pos];
+            if (isalpha(c2) || c2 == '_') {
+                
+                bool lb = (pos == 0 || !is_word_char(buf[pos - 1]));
+                bool rb = (pos + wlen >= buflen || !is_word_char(buf[pos + wlen]));
+                if (lb && rb && strncasecmp(buf + pos, h->top[t].word, wlen) == 0) {
+                    add_match_fast(h, pos, wlen, HLCAT_WORD, HL_CP_MATCH_WORD, buf + pos);
                     pos += wlen;
                     continue;
                 }
@@ -405,65 +482,34 @@ void hl_scan(HLCtx *h, const GapBuf *g) {
     }
 
     
-cleanup:
-    free(all_nodes);
-    for (int b = 0; b < FREQ_BUCKETS; b++) {
-        FreqNode *fn = buckets[b];
-        while (fn) { FreqNode *nx = fn->next; free(fn); fn = nx; }
+    for (int m = 0; m < HTTP_KW_N && h->http_nkw < HL_KW_MAX; m++) {
+        size_t cnt = 0;
+        for (size_t ii = 0; ii < h->nmatch; ii++)
+            if (h->matches[ii].cat == HLCAT_HTTP && h->matches[ii].len == HTTP_KW[m].len) cnt++;
+        if (cnt) { h->http_kw[h->http_nkw].word = HTTP_KW[m].w; h->http_kw[h->http_nkw++].count = cnt; }
+    }
+    for (int m = 0; m < SENS_KW_N && h->sens_nkw < HL_KW_MAX; m++) {
+        size_t cnt = 0;
+        for (size_t ii = 0; ii < h->nmatch; ii++)
+            if (h->matches[ii].cat == HLCAT_SENSITIVE && h->matches[ii].len == SENS_KW[m].len) cnt++;
+        if (cnt) { h->sens_kw[h->sens_nkw].word = SENS_KW[m].w; h->sens_kw[h->sens_nkw++].count = cnt; }
     }
 
-    
-    for (int m = 0; HTTP_METHODS[m] && h->http_nkw < HL_KW_MAX; m++) {
-        size_t cnt = 0, ml = strlen(HTTP_METHODS[m]);
-        for (size_t ii = 0; ii < h->nmatch; ii++) {
-            if (h->matches[ii].cat == HLCAT_HTTP && h->matches[ii].len == ml)
-                cnt++;
-        }
-        if (cnt > 0) {
-            h->http_kw[h->http_nkw].word  = HTTP_METHODS[m];
-            h->http_kw[h->http_nkw].count = cnt;
-            h->http_nkw++;
-        }
-    }
-    for (int m = 0; SENSITIVE_WORDS[m] && h->sens_nkw < HL_KW_MAX; m++) {
-        size_t cnt = 0, ml = strlen(SENSITIVE_WORDS[m]);
-        for (size_t ii = 0; ii < h->nmatch; ii++) {
-            if (h->matches[ii].cat == HLCAT_SENSITIVE && h->matches[ii].len == ml)
-                cnt++;
-        }
-        if (cnt > 0) {
-            h->sens_kw[h->sens_nkw].word  = SENSITIVE_WORDS[m];
-            h->sens_kw[h->sens_nkw].count = cnt;
-            h->sens_nkw++;
-        }
-    }
-
+    free(buf);
+    free(pool);
     h->dirty = false;
-}
-
-int hl_match_cp(HLCat cat) {
-    switch (cat) {
-        case HLCAT_HTTP:      return HL_CP_MATCH_HTTP;
-        case HLCAT_SENSITIVE: return HL_CP_MATCH_SENS;
-        case HLCAT_IP:        return HL_CP_MATCH_IP;
-        case HLCAT_DATE:      return HL_CP_MATCH_DATE;
-        default:              return HL_CP_MATCH_WORD;
-    }
 }
 
 const HLMatch *hl_match_at(const HLCtx *h, size_t byte_off) {
     if (h->nmatch == 0) return NULL;
-
-    
     size_t lo = 0, hi = h->nmatch;
     while (lo + 1 < hi) {
         size_t mid = lo + (hi - lo) / 2;
         if (h->matches[mid].offset <= byte_off) lo = mid;
-        else                                     hi = mid;
+        else hi = mid;
     }
     const HLMatch *m = &h->matches[lo];
-    if (byte_off >= m->offset && byte_off < m->offset + m->len)
-        return m;
+    if (byte_off >= m->offset && byte_off < m->offset + m->len) return m;
     return NULL;
 }
 
@@ -490,20 +536,16 @@ void hl_render(HLCtx *h, WINDOW *win, int win_h, int win_w) {
     if (!win || win_h < 3 || win_w < 12) return;
     werase(win);
 
-    
     wattron(win, COLOR_PAIR(HL_CP_BORDER));
     box(win, 0, 0);
     wattroff(win, COLOR_PAIR(HL_CP_BORDER));
 
-    
     wattron(win, COLOR_PAIR(HL_CP_HEADER) | A_BOLD);
     mvwprintw(win, 0, 2, " Smart Highlight ");
     wattroff(win, COLOR_PAIR(HL_CP_HEADER) | A_BOLD);
 
-    int row    = 0;
-    int scroll = h->scroll;
+    int row = 0, scroll = h->scroll;
 
-    
     if (h->cat_count[HLCAT_HTTP] > 0) {
         if (row - scroll >= 0 && row - scroll < win_h - 2) {
             wattron(win, COLOR_PAIR(HL_CP_SECTION) | A_BOLD);
@@ -515,7 +557,6 @@ void hl_render(HLCtx *h, WINDOW *win, int win_h, int win_w) {
             PANEL_ROW(h->http_kw[m].word, HL_CP_HTTP, "", HL_CP_HTTP, h->http_kw[m].count);
     }
 
-    
     if (h->cat_count[HLCAT_SENSITIVE] > 0) {
         if (row - scroll >= 0 && row - scroll < win_h - 2) {
             wattron(win, COLOR_PAIR(HL_CP_SECTION) | A_BOLD);
@@ -527,7 +568,6 @@ void hl_render(HLCtx *h, WINDOW *win, int win_h, int win_w) {
             PANEL_ROW(h->sens_kw[m].word, HL_CP_SENSITIVE, "", HL_CP_SENSITIVE, h->sens_kw[m].count);
     }
 
-    
     if (h->cat_count[HLCAT_IP] > 0) {
         if (row - scroll >= 0 && row - scroll < win_h - 2) {
             wattron(win, COLOR_PAIR(HL_CP_SECTION) | A_BOLD);
@@ -535,35 +575,11 @@ void hl_render(HLCtx *h, WINDOW *win, int win_h, int win_w) {
             wattroff(win, COLOR_PAIR(HL_CP_SECTION) | A_BOLD);
         }
         row++;
-
         
-        typedef struct { char ip[64]; size_t cnt; } IPEntry;
-        IPEntry ips[256]; int nips = 0;
-        for (size_t i = 0; i < h->nmatch; i++) {
-            const HLMatch *mm = &h->matches[i];
-            if (mm->cat != HLCAT_IP) continue;
-            bool found = false;
-            for (int k = 0; k < nips; k++) {
-                if (strcmp(ips[k].ip, mm->text) == 0) { ips[k].cnt++; found = true; break; }
-            }
-            if (!found && nips < 256) {
-                strncpy(ips[nips].ip, mm->text, 63);
-                ips[nips].ip[63] = '\0';
-                ips[nips].cnt = 1;
-                nips++;
-            }
-        }
-        
-        for (int a = 1; a < nips; a++) {
-            IPEntry key = ips[a]; int b = a - 1;
-            while (b >= 0 && ips[b].cnt < key.cnt) { ips[b+1] = ips[b]; b--; }
-            ips[b+1] = key;
-        }
-        for (int k = 0; k < nips; k++)
-            PANEL_ROW(ips[k].ip, HL_CP_IP, "", HL_CP_IP, ips[k].cnt);
+        for (int k = 0; k < h->nips; k++)
+            PANEL_ROW(h->ips[k].ip, HL_CP_IP, "", HL_CP_IP, h->ips[k].cnt);
     }
 
-    
     if (h->cat_count[HLCAT_DATE] > 0) {
         if (row - scroll >= 0 && row - scroll < win_h - 2) {
             wattron(win, COLOR_PAIR(HL_CP_SECTION) | A_BOLD);
@@ -571,32 +587,10 @@ void hl_render(HLCtx *h, WINDOW *win, int win_h, int win_w) {
             wattroff(win, COLOR_PAIR(HL_CP_SECTION) | A_BOLD);
         }
         row++;
-        typedef struct { char dt[64]; size_t cnt; } DTEntry;
-        DTEntry dts[128]; int ndts = 0;
-        for (size_t i = 0; i < h->nmatch; i++) {
-            const HLMatch *mm = &h->matches[i];
-            if (mm->cat != HLCAT_DATE) continue;
-            bool found = false;
-            for (int k = 0; k < ndts; k++) {
-                if (strcmp(dts[k].dt, mm->text) == 0) { dts[k].cnt++; found = true; break; }
-            }
-            if (!found && ndts < 128) {
-                strncpy(dts[ndts].dt, mm->text, 63);
-                dts[ndts].dt[63] = '\0';
-                dts[ndts].cnt = 1;
-                ndts++;
-            }
-        }
-        for (int a = 1; a < ndts; a++) {
-            DTEntry key = dts[a]; int b = a - 1;
-            while (b >= 0 && dts[b].cnt < key.cnt) { dts[b+1] = dts[b]; b--; }
-            dts[b+1] = key;
-        }
-        for (int k = 0; k < ndts; k++)
-            PANEL_ROW(dts[k].dt, HL_CP_DATE, "", HL_CP_DATE, dts[k].cnt);
+        for (int k = 0; k < h->ndts; k++)
+            PANEL_ROW(h->dts[k].dt, HL_CP_DATE, "", HL_CP_DATE, h->dts[k].cnt);
     }
 
-    
     if (h->ntop > 0) {
         if (row - scroll >= 0 && row - scroll < win_h - 2) {
             wattron(win, COLOR_PAIR(HL_CP_SECTION) | A_BOLD);
@@ -604,16 +598,13 @@ void hl_render(HLCtx *h, WINDOW *win, int win_h, int win_w) {
             wattroff(win, COLOR_PAIR(HL_CP_SECTION) | A_BOLD);
         }
         row++;
-        for (int t = 0; t < h->ntop; t++) {
+        for (int t = 0; t < h->ntop; t++)
             PANEL_ROW(h->top[t].word, HL_CP_WORD, "", HL_CP_WORD, h->top[t].count);
-        }
     }
 
     wattron(win, COLOR_PAIR(HL_CP_BORDER));
-    if (scroll > 0)
-        mvwprintw(win, 1, win_w - 4, " ▲ ");
-    if (row - scroll > win_h - 2)
-        mvwprintw(win, win_h - 2, win_w - 4, " ▼ ");
+    if (scroll > 0)                    mvwprintw(win, 1,        win_w - 4, " ▲ ");
+    if (row - scroll > win_h - 2)      mvwprintw(win, win_h-2,  win_w - 4, " ▼ ");
     wattroff(win, COLOR_PAIR(HL_CP_BORDER));
 
     wnoutrefresh(win);

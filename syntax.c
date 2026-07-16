@@ -376,8 +376,10 @@ void syn_free(SynCtx *s) {
     free(s);
 }
 
+/* O(1) invalidation: just lower the "valid" watermark. Lines from here on are
+ * recomputed lazily (in order) by syn_ensure_line during the next render. */
 void syn_mark_dirty_from(SynCtx *s, size_t line) {
-    for (size_t i=line; i<s->count; i++) s->lines[i].dirty=true;
+    if (line < s->valid_upto) s->valid_upto = line;
 }
 
 static void ensure_line_cap(SynCtx *s, size_t line) {
@@ -396,10 +398,10 @@ static void ensure_line_cap(SynCtx *s, size_t line) {
 void syn_ensure_line(SynCtx *s, size_t line, const GapBuf *g, const LineIdx *li) {
     ensure_line_cap(s, line);
     LineAttr *la = &s->lines[line];
-    if (!la->dirty) return;
+    if (line < s->valid_upto) return;   /* already computed & valid */
 
     size_t lcount = li_line_count(li);
-    if (line >= lcount) { la->dirty=false; return; }
+    if (line >= lcount) { if (line == s->valid_upto) s->valid_upto = line + 1; return; }
 
     size_t start = li_line_start(li, line);
     size_t end = (line+1 < lcount) ? li_line_start(li, line+1)-1 : gb_len(g);
@@ -446,8 +448,9 @@ void syn_ensure_line(SynCtx *s, size_t line, const GapBuf *g, const LineIdx *li)
     }
 
     free(tmp);
-    la->dirty = false;
 
-    if (line+1 < s->count && s->lines[line+1].lex_state_start != ls.state)
-        s->lines[line+1].dirty = true;
+    /* Advance the watermark only when this is the next contiguous line, so the
+     * carried lex state (block comments/strings) stays correct. Lines are
+     * always ensured in increasing order from render's pre-pass. */
+    if (line == s->valid_upto) s->valid_upto = line + 1;
 }

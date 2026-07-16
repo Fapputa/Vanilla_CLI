@@ -124,6 +124,7 @@ typedef struct {
     LineAttr  *lines;
     size_t     count;
     size_t     cap;
+    size_t     valid_upto;   /* lines [0, valid_upto) are computed & up to date */
     Language   lang;
     char       search_word[256];
 } SynCtx;
@@ -241,10 +242,14 @@ typedef struct HLCtx {
 
     bool        dirty;
     bool        visible;
+    bool        partial;    /* true when the scan was capped (huge file) */
     int         width;
     int         scroll;
     WINDOW     *win;
 } HLCtx;
+
+/* Max bytes scanned by the Smart Highlight panel on a single pass. */
+#define HL_SCAN_BUDGET  (4u * 1024u * 1024u)
 
 HLCtx      *hl_new(void);
 void        hl_free(HLCtx *h);
@@ -471,6 +476,13 @@ void run_async(const char *path, Language lang);
 
 void colors_init(void);
 int  tok_to_color_pair(TokenType t);
+
+/* Inline color swatches (VSCode-style): map a 24-bit RGB to an ncurses color
+ * pair whose foreground is that color. Returns 0 when unsupported/exhausted. */
+#define SWATCH_PAIR_BASE 200
+#define SWATCH_MAX       48
+void colors_swatch_init(void);
+int  colors_swatch_pair(unsigned rgb);
 
 typedef struct ArenaBlock {
     struct ArenaBlock *next;

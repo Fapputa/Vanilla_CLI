@@ -224,12 +224,19 @@ void hl_scan(HLCtx *h, const GapBuf *g) {
     h->sens_nkw = 0;
     memset(h->cat_count, 0, sizeof h->cat_count);
 
-    size_t buflen = gb_len(g);
-    if (buflen == 0) { h->dirty = false; return; }
+    size_t total = gb_len(g);
+    if (total == 0) { h->dirty = false; return; }
 
-    
-    char *buf = gb_to_str(g);  
+    /* On very large files, aggregating over the whole buffer (and allocating a
+     * full copy of it) freezes the UI. Cap the scan to a byte budget: the panel
+     * summarises the head of the file instead of choking on all of it. */
+    size_t buflen = total > HL_SCAN_BUDGET ? HL_SCAN_BUDGET : total;
+    h->partial = (buflen < total);
+
+    char *buf = malloc(buflen + 1);
     if (!buf) { h->dirty = false; return; }
+    gb_get_range(g, 0, buflen, buf);
+    buf[buflen] = '\0';
 
     
     FreqNode *buckets[FREQ_BUCKETS];
@@ -513,19 +520,46 @@ const HLMatch *hl_match_at(const HLCtx *h, size_t byte_off) {
     return NULL;
 }
 
+/* Copy s into out, clamped to at most cap display columns; append '~' when
+ * truncated. Backs off UTF-8 continuation bytes so a multibyte sequence is
+ * never cut in half. Keeps panel content inside the box border. */
+static void hl_fit(char *out, size_t outsz, const char *s, int cap) {
+    if (cap < 1) cap = 1;
+    if ((size_t)cap >= outsz) cap = (int)outsz - 1;
+    int slen = (int)strlen(s);
+    if (slen <= cap) { memcpy(out, s, (size_t)slen); out[slen] = '\0'; return; }
+    int keep = cap - 1;                 /* leave a column for '~' */
+    if (keep < 0) keep = 0;
+    while (keep > 0 && ((unsigned char)s[keep] & 0xC0) == 0x80) keep--;
+    memcpy(out, s, (size_t)keep);
+    out[keep] = '~';
+    out[keep + 1] = '\0';
+}
+
 #define PANEL_ROW(label, cp_label, val, cp_val, cnt)                     \
     do {                                                                  \
+        (void)(cp_val); (void)(val);                                      \
         if (row - scroll >= 0 && row - scroll < win_h - 2) {            \
             int r = row - scroll + 1;                                    \
+            int wcap = win_w - 6;                                        \
+            char _cb[24]; int _cx = 0;                                  \
+            if ((cnt) > 0) {                                             \
+                /* "×" is 2 bytes but a single column */                \
+                int _n = snprintf(_cb, sizeof _cb, "×%zu", (size_t)(cnt)); \
+                int _dcols = _n - 1;                                    \
+                _cx  = win_w - 1 - _dcols;   /* ends at col win_w-2 */  \
+                if (_cx < 3) _cx = 3;                                   \
+                wcap = _cx - 3;              /* word + 1-col gap */     \
+            }                                                            \
+            if (wcap < 1) wcap = 1;                                     \
+            char _lbl[128];                                             \
+            hl_fit(_lbl, sizeof _lbl, (label), wcap);                   \
             wattron(win, COLOR_PAIR(cp_label));                          \
-            mvwprintw(win, r, 2, "%-14s", (label));                     \
+            mvwprintw(win, r, 2, "%-*s", wcap, _lbl);                   \
             wattroff(win, COLOR_PAIR(cp_label));                         \
-            wattron(win, COLOR_PAIR(cp_val) | A_BOLD);                   \
-            mvwprintw(win, r, 16, "%-*s", win_w - 18, (val));           \
-            wattroff(win, COLOR_PAIR(cp_val) | A_BOLD);                  \
             if ((cnt) > 0) {                                             \
                 wattron(win, COLOR_PAIR(HL_CP_COUNT));                   \
-                mvwprintw(win, r, win_w - 6, "×%-4zu", (size_t)(cnt));  \
+                mvwprintw(win, r, _cx, "%s", _cb);                     \
                 wattroff(win, COLOR_PAIR(HL_CP_COUNT));                  \
             }                                                            \
         }                                                                \
@@ -541,7 +575,7 @@ void hl_render(HLCtx *h, WINDOW *win, int win_h, int win_w) {
     wattroff(win, COLOR_PAIR(HL_CP_BORDER));
 
     wattron(win, COLOR_PAIR(HL_CP_HEADER) | A_BOLD);
-    mvwprintw(win, 0, 2, " Smart Highlight ");
+    mvwprintw(win, 0, 2, h->partial ? " Smart Highlight (head 4M) " : " Smart Highlight ");
     wattroff(win, COLOR_PAIR(HL_CP_HEADER) | A_BOLD);
 
     int row = 0, scroll = h->scroll;

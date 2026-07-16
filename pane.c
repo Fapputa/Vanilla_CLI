@@ -274,8 +274,63 @@ void pane_scroll_to_cursor(Pane *p) {
         p->scroll_col = (size_t)(cc - text_w + 1);
 }
 
+static int hex_digit_val(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+static bool is_word_byte(char c) {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') ||
+           (c >= 'A' && c <= 'Z') || c == '_';
+}
+
+/* Detect a color literal starting at byte `pos` (bounded by [start,end)):
+ *   #rgb   #rrggbb   0xRRGGBB   0XRRGGBB
+ * On success fills *rgb (24-bit) and returns the literal's byte length; else 0.
+ * Rejects word-char neighbours so "#define" / an identifier isn't a color. */
+static int hex_color_at(const GapBuf *g, size_t pos, size_t start, size_t end,
+                        unsigned *rgb) {
+    if (pos >= end) return 0;
+    if (pos > start && is_word_byte(gb_at(g, pos - 1))) return 0;
+
+    char c0 = gb_at(g, pos);
+    size_t p;
+    bool zerox = false;
+
+    if (c0 == '#') {
+        p = pos + 1;
+    } else if (c0 == '0' && pos + 1 < end &&
+               (gb_at(g, pos + 1) == 'x' || gb_at(g, pos + 1) == 'X')) {
+        p = pos + 2;
+        zerox = true;                    /* 0x form: require exactly 6 digits */
+    } else {
+        return 0;
+    }
+
+    int d[6], n = 0;
+    while (p < end && n < 6) {
+        int v = hex_digit_val(gb_at(g, p));
+        if (v < 0) break;
+        d[n++] = v; p++;
+    }
+    if (zerox ? (n != 6) : (n != 3 && n != 6)) return 0;
+    if (p < end) {
+        char nc = gb_at(g, p);
+        if (hex_digit_val(nc) >= 0 || is_word_byte(nc)) return 0;
+    }
+    if (n == 3)
+        *rgb = ((unsigned)(d[0] * 17) << 16) |
+               ((unsigned)(d[1] * 17) <<  8) |  (unsigned)(d[2] * 17);
+    else
+        *rgb = ((unsigned)((d[0] << 4) | d[1]) << 16) |
+               ((unsigned)((d[2] << 4) | d[3]) <<  8) |
+                (unsigned)((d[4] << 4) | d[5]);
+    return (int)(p - pos);
+}
+
 void pane_render(Pane *p, bool force) {
-    
+
     if (p->hex_mode && p->hex) {
         hex_render(p->hex, p->win, p->win_h, p->win_w);
         return;
@@ -290,7 +345,9 @@ void pane_render(Pane *p, bool force) {
     size_t nlines = li_line_count(p->li);
     size_t buflen  = gb_len(p->buf);
 
-    for (size_t i = 0; i < p->scroll_line && i < nlines; i++)
+    /* Prime lexer state up to the viewport. Start at the valid watermark so we
+     * don't re-walk already-computed lines every frame (crucial on huge files). */
+    for (size_t i = p->syn->valid_upto; i < p->scroll_line && i < nlines; i++)
         syn_ensure_line(p->syn, i, p->buf, p->li);
 
     for (int row = 0; row < p->win_h; row++) {
@@ -342,9 +399,30 @@ void pane_render(Pane *p, bool force) {
         }
 
         
-        int screen_col = 0; 
+        int screen_col = 0;
         while (byte_pos < line_start + line_len && screen_col < text_w - 1) {
-            
+
+            /* Inline color swatch (VSCode-style): purely a rendered decoration,
+             * never stored in the buffer — so it can't be deleted and is never
+             * saved. Drawn just before the color literal, tinted with its RGB. */
+            if (screen_col + 2 <= text_w) {
+                unsigned rgb;
+                if (hex_color_at(p->buf, byte_pos, line_start,
+                                 line_start + line_len, &rgb)) {
+                    int sp = colors_swatch_pair(rgb);
+                    if (sp) {
+                        wstandend(p->win);
+                        wattron(p->win, COLOR_PAIR(sp) | A_BOLD);
+                        waddstr(p->win, "▣");   /* ▣ */
+                        wstandend(p->win);
+                        waddch(p->win, ' ');
+                        screen_col += 2;
+                        vis_col    += 2;
+                        if (screen_col >= text_w - 1) break;
+                    }
+                }
+            }
+
             char tmp[4]; uint32_t cp;
             int blen_cp = utf8_byte_len((unsigned char)gb_at(p->buf, byte_pos));
             int avail = (int)(line_start + line_len - byte_pos);

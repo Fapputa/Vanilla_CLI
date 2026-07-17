@@ -1,6 +1,7 @@
 #include "abyss.h"
 #include <string.h>
 #include <locale.h>
+#include <time.h>
 
 Editor E;
 char E_notify[256] = "";
@@ -8,6 +9,35 @@ char E_notify[256] = "";
 static void handle_key_normal(int key);
 static void handle_key_dialog(int key);
 static void full_redraw(bool force);
+
+/* Deferred Smart Highlight rescan: on buffers larger than HL_DEFER_BYTES the
+ * scan is postponed until the keyboard goes idle instead of running on every
+ * keystroke. `pending` arms a short input timeout in the main loop; `forced`
+ * lets the idle path run the scan through full_redraw. */
+static bool hl_scan_pending = false;
+static bool hl_scan_forced  = false;
+
+/* Braille spinner shown in the top-right corner of the title bar while a
+ * long-running scan (Smart Highlight) is in progress. Called from inside the
+ * scan loop, so it draws and refreshes the title window directly; the next
+ * full_redraw repaints the title bar and erases it. Throttled to ~80 ms. */
+static void hl_spinner_tick(size_t done, size_t total) {
+    (void)done; (void)total;
+    static const char *frames[] = {"⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"};
+    static int fi = 0;
+    static struct timespec last;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    long ms = (now.tv_sec - last.tv_sec) * 1000 + (now.tv_nsec - last.tv_nsec) / 1000000;
+    if (last.tv_sec != 0 && ms < 80) return;
+    last = now;
+
+    if (!E.title_win) return;
+    int w = getmaxx(E.title_win);
+    mvwaddstr(E.title_win, 0, w - 3, frames[fi]);
+    fi = (fi + 1) % 10;
+    wrefresh(E.title_win);
+}
 static void layout_windows(void);
 static void force_full_dirty(void);
 
@@ -272,7 +302,7 @@ static void full_redraw(bool force) {
     if (E.hl && E.hl->visible && E.hl->win) {
         Pane *ap = E.panes[E.active];
         if (!ap->hex_mode && E.hl->dirty) {
-            
+
             static size_t last_len  = (size_t)-1;
             static unsigned last_fp = 0;
 
@@ -285,15 +315,26 @@ static void full_redraw(bool force) {
             }
 
             if (len != last_len || fp != last_fp) {
-                hl_scan(E.hl, ap->buf);
-                last_len = len;
-                last_fp  = fp;
+                if (len > HL_DEFER_BYTES && !hl_scan_forced) {
+                    hl_scan_pending = true;
+                } else {
+                    hl_scan(E.hl, ap->buf);
+                    last_len = len;
+                    last_fp  = fp;
+                    hl_scan_pending = false;
+                }
             } else {
-                E.hl->dirty = false; 
+                E.hl->dirty = false;
+                hl_scan_pending = false;
             }
+            hl_scan_forced = false;
+        } else if (ap->hex_mode) {
+            hl_scan_pending = false;
         }
         int hl_w = getmaxx(E.hl->win);
         hl_render(E.hl, E.hl->win, edit_h, hl_w);
+    } else {
+        hl_scan_pending = false;
     }
 
     render_pane_borders();
@@ -506,7 +547,13 @@ static void handle_key_normal(int key) {
     }
     if (!E.hl || !E.hl->visible) E.hl_focus = false;
 
-    
+
+    if (key == '\t' && E.hl && E.hl->visible && !E.hl_focus && !E.tree_focus) {
+        E.hl_focus = true;
+        return;
+    }
+
+
     if (E.tree_focus && E.tree && E.tree->visible) {
         char open_path[4096] = "";
         bool consumed = ft_handle_key(E.tree, key, open_path, sizeof open_path);
@@ -590,8 +637,8 @@ static void handle_key_normal(int key) {
 
         case KEY_BACKSPACE: case 127: case '\b': pane_delete_char(ap);    break;
         case KEY_DC:
-            if (ap->search.query[0]) pane_search_prev(ap);
-            else                     pane_delete_forward(ap);
+            if (ap->syn->search_word[0]) pane_search_prev(ap);
+            else                         pane_delete_forward(ap);
             break;
         case '\n': case '\r':                    pane_insert_char(ap, '\n'); break;
         case '\t':                               pane_insert_str(ap, "    ", 4); break;
@@ -796,6 +843,7 @@ void editor_init(void) {
     E.finfo      = fi_new();
     E.hl         = hl_new();
     E.hl_focus   = false;
+    hl_progress_fn = hl_spinner_tick;
 }
 
 void editor_split(void) {
@@ -890,7 +938,18 @@ void editor_run(const char *initial_file) {
 
     while (E.running) {
         WINDOW *iw  = E.panes[E.active]->win;
-        int     key = wgetch(iw ? iw : stdscr);
+        WINDOW *kw  = iw ? iw : stdscr;
+
+        if (hl_scan_pending) wtimeout(kw, 300);
+        int key = wgetch(kw);
+        if (hl_scan_pending) {
+            wtimeout(kw, -1);
+            if (key == ERR) {
+                hl_scan_forced = true;
+                full_redraw(false);
+                continue;
+            }
+        }
 
         if (key == 0 || key == ERR || key == 0x16) continue;
 

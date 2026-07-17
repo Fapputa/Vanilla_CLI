@@ -242,14 +242,16 @@ typedef struct HLCtx {
 
     bool        dirty;
     bool        visible;
-    bool        partial;    /* true when the scan was capped (huge file) */
     int         width;
     int         scroll;
     WINDOW     *win;
 } HLCtx;
 
-/* Max bytes scanned by the Smart Highlight panel on a single pass. */
-#define HL_SCAN_BUDGET  (4u * 1024u * 1024u)
+/* Above this buffer size, Smart Highlight rescans triggered by edits are
+ * deferred until the keyboard goes idle, so typing never blocks on a scan. */
+#define HL_DEFER_BYTES  (4u * 1024u * 1024u)
+
+extern void (*hl_progress_fn)(size_t done, size_t total);
 
 HLCtx      *hl_new(void);
 void        hl_free(HLCtx *h);

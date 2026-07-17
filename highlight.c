@@ -141,6 +141,10 @@ void hl_free(HLCtx *h) {
     free(h);
 }
 
+/* Optional hook called periodically during hl_scan so the UI can animate a
+ * busy indicator while a large file is being aggregated. */
+void (*hl_progress_fn)(size_t done, size_t total) = NULL;
+
 static inline bool is_word_char(char c) {
     return isalnum((unsigned char)c) || c == '_';
 }
@@ -150,11 +154,13 @@ static bool scan_ipv4(const char *buf, size_t off, size_t buflen, size_t *out_le
     size_t pos = off;
     for (int oct = 0; oct < 4; oct++) {
         if (pos >= buflen || !isdigit((unsigned char)buf[pos])) return false;
-        int digits = 0;
+        int digits = 0, val = 0;
         while (pos < buflen && isdigit((unsigned char)buf[pos])) {
+            val = val * 10 + (buf[pos] - '0');
             pos++; digits++;
             if (digits > 3) return false;
         }
+        if (val > 255) return false;
         if (oct < 3) {
             if (pos >= buflen || buf[pos] != '.') return false;
             pos++;
@@ -165,9 +171,35 @@ static bool scan_ipv4(const char *buf, size_t off, size_t buflen, size_t *out_le
     return true;
 }
 
+static bool month3_ok(const char *p) {
+    static const char months[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
+    for (int m = 0; m < 12; m++)
+        if (memcmp(p, months + 3 * m, 3) == 0) return true;
+    return false;
+}
+
 static bool scan_date(const char *buf, size_t off, size_t buflen, size_t *out_len) {
     if (off > 0 && isdigit((unsigned char)buf[off - 1])) return false;
     if (off + 8 > buflen) return false;
+
+    /* Apache/CLF: dd/Mon/yyyy[:hh:mm:ss] */
+    if (off + 11 <= buflen
+        && isdigit((unsigned char)buf[off]) && isdigit((unsigned char)buf[off + 1])
+        && buf[off + 2] == '/' && month3_ok(buf + off + 3) && buf[off + 6] == '/'
+        && isdigit((unsigned char)buf[off + 7])  && isdigit((unsigned char)buf[off + 8])
+        && isdigit((unsigned char)buf[off + 9])  && isdigit((unsigned char)buf[off + 10])) {
+        size_t len = 11;
+        if (off + 20 <= buflen && buf[off + 11] == ':'
+            && isdigit((unsigned char)buf[off + 12]) && isdigit((unsigned char)buf[off + 13])
+            && buf[off + 14] == ':'
+            && isdigit((unsigned char)buf[off + 15]) && isdigit((unsigned char)buf[off + 16])
+            && buf[off + 17] == ':'
+            && isdigit((unsigned char)buf[off + 18]) && isdigit((unsigned char)buf[off + 19]))
+            len = 20;
+        *out_len = len;
+        return true;
+    }
+
     char tmp[20]; size_t n = 0, pos = off;
     while (pos < buflen && n < 19) {
         char c = buf[pos];
@@ -205,6 +237,7 @@ typedef struct DTNode { char dt[64]; size_t cnt; struct DTNode *next; } DTNode;
 static inline void add_match_fast(HLCtx *h, size_t off, size_t len, HLCat cat, int cp,
                                    const char *text)
 {
+    h->cat_count[cat]++;
     if (h->nmatch >= HL_MAX_MATCHES) return;
     HLMatch *m = &h->matches[h->nmatch++];
     m->offset = off;
@@ -214,7 +247,6 @@ static inline void add_match_fast(HLCtx *h, size_t off, size_t len, HLCat cat, i
     size_t n  = len < 63 ? len : 63;
     memcpy(m->text, text, n);
     m->text[n] = '\0';
-    h->cat_count[cat]++;
 }
 
 void hl_scan(HLCtx *h, const GapBuf *g) {
@@ -227,11 +259,7 @@ void hl_scan(HLCtx *h, const GapBuf *g) {
     size_t total = gb_len(g);
     if (total == 0) { h->dirty = false; return; }
 
-    /* On very large files, aggregating over the whole buffer (and allocating a
-     * full copy of it) freezes the UI. Cap the scan to a byte budget: the panel
-     * summarises the head of the file instead of choking on all of it. */
-    size_t buflen = total > HL_SCAN_BUDGET ? HL_SCAN_BUDGET : total;
-    h->partial = (buflen < total);
+    size_t buflen = total;
 
     char *buf = malloc(buflen + 1);
     if (!buf) { h->dirty = false; return; }
@@ -257,7 +285,12 @@ void hl_scan(HLCtx *h, const GapBuf *g) {
     int dt_pool_cap  = dt_pool ? 4096 : 0;
 
     size_t i = 0;
+    size_t next_tick = 0;
     while (i < buflen) {
+        if (hl_progress_fn && i >= next_tick) {
+            hl_progress_fn(i, buflen);
+            next_tick = i + (256u << 10);
+        }
         unsigned char c = (unsigned char)buf[i];
 
         
@@ -575,7 +608,7 @@ void hl_render(HLCtx *h, WINDOW *win, int win_h, int win_w) {
     wattroff(win, COLOR_PAIR(HL_CP_BORDER));
 
     wattron(win, COLOR_PAIR(HL_CP_HEADER) | A_BOLD);
-    mvwprintw(win, 0, 2, h->partial ? " Smart Highlight (head 4M) " : " Smart Highlight ");
+    mvwprintw(win, 0, 2, " Smart Highlight ");
     wattroff(win, COLOR_PAIR(HL_CP_HEADER) | A_BOLD);
 
     int row = 0, scroll = h->scroll;

@@ -23,7 +23,13 @@ BIN_DIR="$SCRIPT_DIR/bin"
 SCRIPTS_DIR="$SCRIPT_DIR/scripts"
 
 SYS_BIN="/usr/local/bin"
-USER_BIN="$HOME/bin"
+
+# Le script tourne en root : $HOME vaut alors /root et l'installation
+# "user-local" atterrirait dans /root/bin. On cible le vrai utilisateur.
+REAL_USER="${SUDO_USER:-$USER}"
+REAL_HOME="$(getent passwd "$REAL_USER" | cut -d: -f6)"
+[ -n "$REAL_HOME" ] || REAL_HOME="$HOME"
+USER_BIN="$REAL_HOME/bin"
 
 # ---------------------------------------------------------------------------
 # Root check
@@ -61,16 +67,29 @@ install_system_deps() {
             libncursesw5-dev \
             python3 \
             python3-pip \
+            python3-rich \
+            python3-prompt-toolkit \
+            python3-pygments \
+            python3-psutil \
             xclip \
             xsel \
             wireless-tools \
             net-tools
     elif [ "$PKG_MANAGER" = "pacman" ]; then
-        pacman -Sy --noconfirm \
+        # -Syu et non -Sy : sur Arch, installer un paquet apres un simple -Sy
+        # produit une mise a jour partielle (ex. python compile contre une glibc
+        # plus recente que celle installee -> ImportError GLIBC_x.yz not found).
+        # La base de donnees et le systeme doivent etre mis a jour ensemble.
+        warn "Arch: a full system upgrade (-Syu) is required to install safely."
+        pacman -Syu --needed --noconfirm \
             base-devel \
             ncurses \
             python \
             python-pip \
+            python-rich \
+            python-prompt_toolkit \
+            python-pygments \
+            python-psutil \
             xclip \
             xsel \
             wireless_tools \
@@ -82,17 +101,59 @@ install_system_deps() {
 
 # ---------------------------------------------------------------------------
 # Python dependencies
+#
+# Les paquets de la distribution sont installes ci-dessus : pip n'intervient
+# qu'en dernier recours, uniquement pour ce qui manque encore. Lancer
+# "pip install --break-system-packages" en root ecrase des fichiers geres par
+# le gestionnaire de paquets et casse l'environnement Python du systeme.
 # ---------------------------------------------------------------------------
 install_python_deps() {
-    info "Installing Python dependencies..."
+    info "Checking Python dependencies..."
 
-    pip install --break-system-packages \
-        rich \
-        prompt_toolkit \
-        pygments \
-        psutil
+    local py
+    py="$(command -v python3 || command -v python)" \
+        || { warn "No Python interpreter found, skipping Python dependencies."; return 0; }
 
-    ok "Python dependencies installed."
+    if ! "$py" -c 'import sys' &>/dev/null; then
+        warn "$py is present but cannot run (broken installation?)."
+        warn "Fix the system Python first, then re-run this installer."
+        return 0
+    fi
+
+    declare -A PY_MODULES=(
+        ["rich"]="rich"
+        ["prompt_toolkit"]="prompt_toolkit"
+        ["pygments"]="pygments"
+        ["psutil"]="psutil"
+    )
+
+    local missing=()
+    for mod in "${!PY_MODULES[@]}"; do
+        if "$py" -c "import $mod" &>/dev/null; then
+            ok "$mod already available."
+        else
+            missing+=("${PY_MODULES[$mod]}")
+        fi
+    done
+
+    if [ ${#missing[@]} -eq 0 ]; then
+        ok "All Python dependencies satisfied by system packages."
+        return 0
+    fi
+
+    warn "Missing from system packages: ${missing[*]}"
+    info "Falling back to pip for those only..."
+
+    if ! command -v pip &>/dev/null && ! "$py" -m pip --version &>/dev/null; then
+        warn "pip unavailable; install manually: ${missing[*]}"
+        return 0
+    fi
+
+    if ! "$py" -m pip install --break-system-packages "${missing[@]}"; then
+        warn "pip install failed. Install manually: ${missing[*]}"
+    else
+        ok "Python dependencies installed."
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -179,6 +240,7 @@ install_binaries() {
 
     info "Installing to $USER_BIN (user-local)..."
     install_to "$USER_BIN"
+    chown -R "$REAL_USER" "$USER_BIN" 2>/dev/null || true
 
     info "Installing to $SYS_BIN (system-wide)..."
     install_to "$SYS_BIN"

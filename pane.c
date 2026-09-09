@@ -507,6 +507,35 @@ static void mark_dirty(Pane *p) {
     p->modified = true;
 }
 
+/* true si [ls, end) ne contient que des blancs */
+static bool line_all_blank(const GapBuf *g, size_t ls, size_t end) {
+    for (size_t i = ls; i < end; i++) {
+        char c = gb_at(g, i);
+        if (c != ' ' && c != '\t' && c != '\r') return false;
+    }
+    return true;
+}
+
+/* true si la ligne [ls, end) se termine par ':' (hors chaine et hors commentaire) */
+static bool py_opens_block(const GapBuf *g, size_t ls, size_t end) {
+    char quote = 0, last = 0;
+    bool esc = false;
+    for (size_t i = ls; i < end; i++) {
+        char c = gb_at(g, i);
+        if (quote) {
+            if (esc)                 esc = false;
+            else if (c == '\\')      esc = true;
+            else if (c == quote)     quote = 0;
+            last = c;
+            continue;
+        }
+        if (c == '#') break;
+        if (c == '"' || c == '\'') { quote = c; last = c; continue; }
+        if (c != ' ' && c != '\t' && c != '\r') last = c;
+    }
+    return last == ':';
+}
+
 static void auto_indent_newline(Pane *p) {
     if (p->li->dirty) li_rebuild(p->li, p->buf);
     size_t ls = li_line_start(p->li, p->cursor_line);
@@ -516,10 +545,26 @@ static void auto_indent_newline(Pane *p) {
         char c = gb_at(p->buf, ls + indent);
         if (c == ' ' || c == '\t') indent++; else break;
     }
-    if (indent > 255) indent = 255;
-    char spaces[256] = {0}; memset(spaces, ' ', indent);
     char prev_c = p->cursor > 0    ? gb_at(p->buf, p->cursor-1) : 0;
     char next_c = p->cursor < blen ? gb_at(p->buf, p->cursor)   : 0;
+
+    /* Python : deuxieme Entree sur une ligne vide -> on repart sans indentation */
+    if (p->lang == LANG_PY && indent > 0 && line_all_blank(p->buf, ls, p->cursor)) {
+        pane_push_undo(p);
+        gb_delete(p->buf, ls, indent);          /* efface l'indentation orpheline */
+        p->cursor = ls;
+        gb_insert_char(p->buf, p->cursor, '\n');
+        p->cursor++;
+        mark_dirty(p);
+        li_rebuild(p->li, p->buf);
+        cursor_update_line_col(p);
+        p->preferred_col = p->cursor_col;
+        pane_scroll_to_cursor(p);
+        return;
+    }
+
+    if (indent > 251) indent = 251;
+    char spaces[256] = {0}; memset(spaces, ' ', indent);
     pane_push_undo(p);
     if (prev_c == '{' && next_c == '}') {
         size_t n = 1 + indent + 4 + 1 + indent;
@@ -534,7 +579,8 @@ static void auto_indent_newline(Pane *p) {
         p->cursor += 1 + indent + 4;
         free(ins);
     } else {
-        bool extra = (prev_c == '{');
+        bool extra = (prev_c == '{') ||
+                     (p->lang == LANG_PY && py_opens_block(p->buf, ls, p->cursor));
         gb_insert_char(p->buf, p->cursor, '\n'); p->cursor++;
         gb_insert_str(p->buf, p->cursor, spaces, indent); p->cursor += indent;
         if (extra) { gb_insert_str(p->buf, p->cursor, "    ", 4); p->cursor += 4; }

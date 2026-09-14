@@ -6,8 +6,18 @@
 Editor E;
 char E_notify[256] = "";
 
+/* ^B builds and runs; ^B pressed twice within BUILD_DOUBLE_TAP_MS opens the
+ * build-options menu instead (F5 too). The first ^B only arms
+ * `build_tap_pending`; the main loop then waits that long for the second
+ * one, and falls back to a plain build & run on timeout or any other key. */
+#define BUILD_DOUBLE_TAP_MS 350
+static bool build_tap_pending = false;
+
 static void handle_key_normal(int key);
 static void handle_key_dialog(int key);
+static void handle_key_build_menu(int key);
+static void build_menu_open(void);
+static void build_and_run(void);
 static void full_redraw(bool force);
 
 /* Deferred Smart Highlight rescan: on buffers larger than HL_DEFER_BYTES the
@@ -137,7 +147,7 @@ static void render_title(void) {
                 "  ^S:Save  F2:Exit Hex  ^Q:Quit");
         else
             wprintw(E.title_win,
-                " ^O:SaveAs  ^S:Save  ^K:Line  ^B:Run  ^F:Find  ^Z:Undo"
+                " ^O:SaveAs  ^S:Save  ^K:Line  ^B:Run  ^B^B/F5:Flags  ^F:Find  ^Z:Undo"
                 "  ^R:LN  ^W:Wipe  ^D:Fmt  F1:Tree  F2:Hex  F3:Info  F4:HL  ^A:Help  ^Q:Quit");
     } else {
         bool mod         = ap->hex_mode ? (ap->hex && ap->hex->modified) : ap->modified;
@@ -175,7 +185,7 @@ static void render_status(void) {
         pane_cursor_line_col(ap, &line, &col);
         static const char *lang_names[] = {
             "C","C++","Python","Shell","JS","JSON","SQL","ASM",
-            "HTML","CSS","PHP","C#","HEX","Plain"
+            "HTML","CSS","PHP","C#","Rust","HEX","Plain"
         };
         const char *lname = lang_names[ap->lang <= LANG_NONE ? ap->lang : LANG_NONE];
         size_t nlines = li_line_count(ap->li);
@@ -272,6 +282,178 @@ static void render_dialog(const char *title) {
     delwin(dw2);
 }
 
+/* ─── Build & run (^B) ────────────────────────────────────────────
+ * Saves first — the compiler reads the file from disk, not the buffer. */
+static void build_and_run(void) {
+    Pane *ap = E.panes[E.active];
+    if (!ap->filename[0]) return;
+
+    pane_save_file(ap, NULL);
+    E.out_visible = true;
+    E.out_scroll  = 0;
+    layout_windows();
+    free(E.out_text);
+    E.out_text    = malloc(1 << 16);
+    E.out_text[0] = '\0';
+
+    if (build_is_compiled(ap->lang)) {
+        char flags[1024];
+        build_flags_string(ap->lang, flags, sizeof flags);
+        /* bounded: the notification area is one status-bar line */
+        snprintf(E_notify, sizeof E_notify, "%.16s %.200s",
+                 build_compiler_name(ap->lang), flags);
+        render_status();
+        doupdate();
+    }
+    char timing[128];
+    run_file(ap->filename, ap->lang, E.out_text, 1 << 16, timing, sizeof timing);
+    snprintf(E_notify, sizeof E_notify, "%s", timing);
+}
+
+static void build_menu_open(void) {
+    Pane *ap = E.panes[E.active];
+    if (!build_is_compiled(ap->lang)) {
+        snprintf(E_notify, sizeof E_notify,
+                 "No build flags: this file is interpreted, not compiled");
+        return;
+    }
+    E.mode         = MODE_BUILD_MENU;
+    E.build_sel    = 0;
+    E.build_scroll = 0;
+}
+
+/* Visible rows of the flag list, given the terminal height. */
+static int build_menu_rows(int count) {
+    int rows = getmaxy(stdscr);
+    int avail = rows / 2 - 4;          /* keep the editor at least half-visible */
+    if (avail < 3) avail = 3;
+    return count < avail ? count : avail;
+}
+
+/* The dropdown itself: anchored at the bottom, just above the status bar. */
+static void render_build_menu(void) {
+    Pane *ap = E.panes[E.active];
+    int count = 0;
+    const BuildFlag *tbl = build_flag_table(ap->lang, &count);
+    const bool *state    = build_flag_state(ap->lang);
+    if (!tbl || !state) return;
+
+    int rows, cols; getmaxyx(stdscr, rows, cols);
+    int list_h = build_menu_rows(count);
+    int mh = list_h + 4;                       /* borders + header + preview */
+    int mw = cols;
+    int my = rows - 1 - mh;
+    if (my < 1) { my = 1; mh = rows - 2; if (mh < 4) return; list_h = mh - 4; }
+
+    WINDOW *mwin = newwin(mh, mw, my, 0);
+    wbkgd(mwin, ' ' | COLOR_PAIR(COLOR_PAIR_NORMAL));
+    wattron(mwin, COLOR_PAIR(COLOR_PAIR_ACTIVE_BORDER));
+    box(mwin, 0, 0);
+    wattroff(mwin, COLOR_PAIR(COLOR_PAIR_ACTIVE_BORDER));
+
+    static const char *lang_label[] = {
+        "C","C++","Python","Shell","JS","JSON","SQL","ASM",
+        "HTML","CSS","PHP","C#","Rust","HEX","Plain"
+    };
+    wattron(mwin, COLOR_PAIR(COLOR_PAIR_TITLE) | A_BOLD);
+    mvwprintw(mwin, 0, 2, " Build options - %s (%s) ",
+              lang_label[ap->lang <= LANG_NONE ? ap->lang : LANG_NONE],
+              build_compiler_name(ap->lang));
+    wattroff(mwin, COLOR_PAIR(COLOR_PAIR_TITLE) | A_BOLD);
+
+    wattron(mwin, COLOR_PAIR(COLOR_PAIR_COMMENT));
+    const char *help = " Space:toggle  Up/Down:move  Enter:build & run  Esc:close ";
+    int hx = mw - (int)strlen(help) - 3;
+    if (hx > 2) mvwaddstr(mwin, mh - 1, hx, help);
+    wattroff(mwin, COLOR_PAIR(COLOR_PAIR_COMMENT));
+
+    /* keep the cursor inside the visible window */
+    if (E.build_sel < E.build_scroll) E.build_scroll = E.build_sel;
+    if (E.build_sel >= E.build_scroll + list_h) E.build_scroll = E.build_sel - list_h + 1;
+    if (E.build_scroll < 0) E.build_scroll = 0;
+
+    for (int r = 0; r < list_h; r++) {
+        int i = E.build_scroll + r;
+        if (i >= count) break;
+        bool sel = (i == E.build_sel);
+        /* radio (exclusive group) vs checkbox (independent) */
+        const char *mark = tbl[i].group
+                         ? (state[i] ? "(*)" : "( )")
+                         : (state[i] ? "[x]" : "[ ]");
+
+        if (sel) wattron(mwin, A_REVERSE);
+        mvwprintw(mwin, 1 + r, 2, "%-*s", mw - 4, "");
+        wattron(mwin, state[i] ? A_BOLD : A_NORMAL);
+        mvwprintw(mwin, 1 + r, 2, "%s %-22.22s", mark, tbl[i].label);
+        wattroff(mwin, A_BOLD);
+        if (!sel) wattron(mwin, COLOR_PAIR(COLOR_PAIR_TYPE));
+        wprintw(mwin, "%-18.18s", tbl[i].flag);
+        if (!sel) {
+            wattroff(mwin, COLOR_PAIR(COLOR_PAIR_TYPE));
+            wattron(mwin, COLOR_PAIR(COLOR_PAIR_COMMENT));
+        }
+        /* mark+label is 26 columns, the flag column 18; whatever is left
+         * inside the box goes to the hint, so it never eats the border. */
+        int left = mw - 4 - 26 - 18;
+        if (left > 2) wprintw(mwin, "%-*.*s", left, left, tbl[i].hint);
+        if (!sel) wattroff(mwin, COLOR_PAIR(COLOR_PAIR_COMMENT));
+        if (sel) wattroff(mwin, A_REVERSE);
+    }
+
+    /* live preview of the command ^B would run */
+    char flags[1024];
+    build_flags_string(ap->lang, flags, sizeof flags);
+    wattron(mwin, COLOR_PAIR(COLOR_PAIR_STRING));
+    mvwprintw(mwin, mh - 2, 2, "%-*.*s", mw - 4, mw - 4, flags[0] ? flags : "(no flags)");
+    wattroff(mwin, COLOR_PAIR(COLOR_PAIR_STRING));
+
+    if (count > list_h) {
+        wattron(mwin, COLOR_PAIR(COLOR_PAIR_COMMENT));
+        mvwprintw(mwin, 0, mw - 12, " %d/%d ", E.build_sel + 1, count);
+        wattroff(mwin, COLOR_PAIR(COLOR_PAIR_COMMENT));
+    }
+
+    wnoutrefresh(mwin);
+    delwin(mwin);
+}
+
+static void handle_key_build_menu(int key) {
+    Pane *ap = E.panes[E.active];
+    int count = 0;
+    build_flag_table(ap->lang, &count);
+    if (count <= 0) { E.mode = MODE_NORMAL; return; }
+
+    switch (key) {
+        case KEY_UP:   if (E.build_sel > 0) E.build_sel--; break;
+        case KEY_DOWN: if (E.build_sel + 1 < count) E.build_sel++; break;
+        case KEY_HOME: E.build_sel = 0; break;
+        case KEY_END:  E.build_sel = count - 1; break;
+        case KEY_PPAGE: E.build_sel -= 5; if (E.build_sel < 0) E.build_sel = 0; break;
+        case KEY_NPAGE: E.build_sel += 5; if (E.build_sel >= count) E.build_sel = count - 1; break;
+
+        case ' ':
+        case 'x': case 'X':
+            build_flag_toggle(ap->lang, E.build_sel);
+            break;
+
+        case '\n': case '\r':
+            E.mode = MODE_NORMAL;
+            build_and_run();
+            break;
+
+        case 27:
+        case 'q' & 0x1f:
+            E.mode = MODE_NORMAL;
+            break;
+
+        case KEY_F(5):
+            E.mode = MODE_NORMAL;
+            break;
+
+        default: break;
+    }
+}
+
 static void full_redraw(bool force) {
     int rows, cols;
     getmaxyx(stdscr, rows, cols);
@@ -342,7 +524,9 @@ static void full_redraw(bool force) {
     render_status();
     render_output();
 
-    if (E.mode != MODE_NORMAL) {
+    if (E.mode == MODE_BUILD_MENU) {
+        render_build_menu();
+    } else if (E.mode != MODE_NORMAL) {
         static const char *titles[] = {
             "",
             "Save As",
@@ -663,15 +847,11 @@ static void handle_key_normal(int key) {
         case 'n' & 0x1f: pane_search_next(ap); break;
         case 'p' & 0x1f: pane_search_prev(ap); break;
         case 'b' & 0x1f:
-            if (ap->filename[0]) {
-                pane_save_file(ap, NULL);
-                E.out_visible = true;
-                layout_windows();
-                free(E.out_text);
-                E.out_text    = malloc(1 << 16);
-                E.out_text[0] = '\0';
-                run_file(ap->filename, ap->lang, E.out_text, 1 << 16);
-            }
+            build_tap_pending = true;          /* resolved by the main loop */
+            break;
+
+        case KEY_F(5):
+            build_menu_open();
             break;
         case 'r' & 0x1f:
             ap->show_line_numbers = !ap->show_line_numbers;
@@ -915,6 +1095,12 @@ void editor_run(const char *initial_file) {
     hl_colors_init();
 
     printf("\033[?2004h");  
+    /* Kitty keyboard protocol, level 1 ("disambiguate escape codes"): makes
+     * the terminal report modifiers for keys the legacy encoding folds
+     * together (Ctrl+I vs Tab, Ctrl+M vs Enter, ...).
+     * Only ambiguous keys change shape (plain text is untouched), and those
+     * are decoded back below; terminals without support ignore the push. */
+    printf("\033[>1u");
     fflush(stdout);
     layout_windows();
 
@@ -940,10 +1126,19 @@ void editor_run(const char *initial_file) {
         WINDOW *iw  = E.panes[E.active]->win;
         WINDOW *kw  = iw ? iw : stdscr;
 
-        if (hl_scan_pending) wtimeout(kw, 300);
+        int tmo = build_tap_pending ? BUILD_DOUBLE_TAP_MS
+                : hl_scan_pending   ? 300 : -1;
+        if (tmo >= 0) wtimeout(kw, tmo);
         int key = wgetch(kw);
+        if (tmo >= 0) wtimeout(kw, -1);
+
+        if (build_tap_pending && key == ERR) {      /* single ^B */
+            build_tap_pending = false;
+            build_and_run();
+            full_redraw(true);
+            continue;
+        }
         if (hl_scan_pending) {
-            wtimeout(kw, -1);
             if (key == ERR) {
                 hl_scan_forced = true;
                 full_redraw(false);
@@ -965,8 +1160,8 @@ void editor_run(const char *initial_file) {
         if (key == 27) {
             WINDOW *ew = iw ? iw : stdscr;
             wtimeout(ew, 5);
-            int sq[8]; int sn = 0;
-            for (; sn < 8; sn++) {
+            int sq[16]; int sn = 0;
+            for (; sn < 16; sn++) {
                 sq[sn] = wgetch(ew);
                 if (sq[sn] == ERR) { sn--; break; }
             }
@@ -976,7 +1171,6 @@ void editor_run(const char *initial_file) {
             bool consumed = false;
 
             if (sn >= 1 && sq[0] == '[') {
-                
                 if (!consumed && sn >= 2 && sq[1] == 'Z') {
                     for (int si = sn - 1; si >= 2; si--)
                         if (sq[si] != ERR) ungetch(sq[si]);
@@ -1034,6 +1228,54 @@ void editor_run(const char *initial_file) {
                     consumed = true;
                     full_redraw(true); continue;
                 }
+                /* CSI <codepoint> [;<modifiers>] u — the shape every
+                 * ambiguous key takes once the protocol above is on.
+                 * modifiers-1 is a bitmask: 1 shift, 2 alt, 4 ctrl. */
+                if (!consumed) {
+                    char seq[17]; int sl = 0;
+                    for (int si = 0; si < sn && sq[si] != ERR; si++)
+                        seq[sl++] = (char)sq[si];
+                    seq[sl] = '\0';
+
+                    if (sl >= 3 && seq[sl - 1] == 'u') {
+                        const char *q = seq + 1;
+                        int cp = 0, mod = 1;
+                        bool has_cp = isdigit((unsigned char)*q);
+                        while (isdigit((unsigned char)*q)) cp = cp * 10 + (*q++ - '0');
+                        if (*q == ':')                       /* alternate key codes */
+                            while (*q && *q != ';' && *q != 'u') q++;
+                        if (*q == ';') {
+                            q++; mod = 0;
+                            while (isdigit((unsigned char)*q)) mod = mod * 10 + (*q++ - '0');
+                            if (mod < 1) mod = 1;
+                            if (*q == ':')                   /* event type (press/repeat) */
+                                while (*q && *q != 'u') q++;
+                        }
+                        if (has_cp && *q == 'u') {
+                            int  m     = mod - 1;
+                            bool shift = (m & 1) != 0;
+                            bool alt   = (m & 2) != 0;
+                            bool ctrl  = (m & 4) != 0;
+                            int  base  = cp;
+                            int  mapped;
+
+                            if (ctrl && isalpha(base))
+                                mapped = tolower(base) & 0x1f;
+                            else if (base == 13)  mapped = '\n';
+                            else if (base == 9)   mapped = shift ? KEY_BTAB : '\t';
+                            else if (base == 27)  mapped = 27;
+                            else if (base == 127) mapped = KEY_BACKSPACE;
+                            else if (!alt && base >= 32 && base < 127)
+                                mapped = shift ? toupper(base) : base;
+                            else
+                                mapped = 0;
+
+                            if (mapped) { key = mapped; consumed = true; }
+                            else        { consumed = true; continue; }
+                        }
+                    }
+                }
+
                 if (!consumed) {
                     for (int si = sn - 1; si >= 0; si--)
                         if (sq[si] != ERR) ungetch(sq[si]);
@@ -1045,6 +1287,17 @@ void editor_run(const char *initial_file) {
             (void)consumed;
         }
 
+        if (build_tap_pending && !in_paste) {
+            build_tap_pending = false;
+            if (key == ('b' & 0x1f) && E.mode == MODE_NORMAL) {
+                build_menu_open();                  /* ^B ^B */
+                full_redraw(true);
+                continue;
+            }
+            build_and_run();                        /* ^B then another key */
+            full_redraw(true);
+        }
+
         if (in_paste) {
             if (key != ERR && paste_len < (int)sizeof(paste_batch) - 1)
                 paste_batch[paste_len++] = (char)key;
@@ -1052,14 +1305,18 @@ void editor_run(const char *initial_file) {
         }
 
         EditorMode prev_mode = E.mode;
-        if (E.mode == MODE_NORMAL) handle_key_normal(key);
-        else                       handle_key_dialog(key);
+        if (E.mode == MODE_NORMAL)           handle_key_normal(key);
+        else if (E.mode == MODE_BUILD_MENU)  handle_key_build_menu(key);
+        else                                 handle_key_dialog(key);
+
+        if (prev_mode == MODE_BUILD_MENU && E.mode == MODE_NORMAL) force_full_dirty();
 
         bool force = (prev_mode != MODE_NORMAL && E.mode == MODE_NORMAL);
         full_redraw(force);
     }
 
     printf("\033[?2004l");  
+    printf("\033[<u");      /* pop the keyboard-protocol flags */
     fflush(stdout);
     endwin();
 }

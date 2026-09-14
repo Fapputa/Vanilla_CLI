@@ -108,6 +108,7 @@ typedef enum {
     LANG_C, LANG_CPP, LANG_PY, LANG_SH,
     LANG_JS, LANG_JSON, LANG_SQL, LANG_ASM,
     LANG_HTML, LANG_CSS, LANG_PHP, LANG_CS,
+    LANG_RUST,
     LANG_HEX,
     LANG_NONE
 } Language;
@@ -391,6 +392,7 @@ typedef enum {
     MODE_GOTO_LINE,
     MODE_HEX_JUMP,
     MODE_HEX_SEARCH,
+    MODE_BUILD_MENU,
 } EditorMode;
 
 typedef struct {
@@ -416,6 +418,10 @@ typedef struct {
 
     bool       running;
     bool       show_shortcuts;
+
+    /* ^B ^B build-options menu */
+    int        build_sel;
+    int        build_scroll;
 
     bool       tree_focus;
     FileTree  *tree;
@@ -444,8 +450,32 @@ void editor_close_split(void);
 void editor_focus_next(void);
 void editor_resize_panes(void);
 
-void run_file(const char *path, Language lang, char *out_buf, size_t out_max);
+void run_file(const char *path, Language lang, char *out_buf, size_t out_max,
+              char *timing, size_t timing_sz);
 void run_async(const char *path, Language lang);
+
+/* ─── Build options (^B ^B menu) ───────────────────────────
+ * Compiled languages get a per-language table of toggleable compiler
+ * flags (optimisation level, SIMD/vector ISA, LTO, sanitizers...).
+ * Flags sharing a non-zero `group` are mutually exclusive: selecting
+ * one clears the others, the way -O2/-O3/-Ofast would fight. */
+
+#define BUILD_MAX_FLAGS 20
+
+typedef struct {
+    const char *label;   /* menu entry                      */
+    const char *flag;    /* what lands on the command line  */
+    const char *hint;    /* short explanation, shown inline */
+    int         group;   /* 0 = independent, >0 = radio group */
+    bool        on;      /* default state                   */
+} BuildFlag;
+
+bool             build_is_compiled(Language lang);
+const BuildFlag *build_flag_table(Language lang, int *count);
+bool            *build_flag_state(Language lang);
+void             build_flag_toggle(Language lang, int idx);
+void             build_flags_string(Language lang, char *out, size_t out_sz);
+const char      *build_compiler_name(Language lang);
 
 #define COLOR_PAIR_NORMAL           1
 #define COLOR_PAIR_KEYWORD          2

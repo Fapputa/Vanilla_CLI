@@ -72,6 +72,22 @@ static const char *kw_cs[] = {
     "unchecked","unsafe","ushort","using","var","virtual","void",
     "volatile","while",NULL
 };
+static const char *kw_rust[] = {
+    "as","async","await","break","const","continue","crate","dyn","else",
+    "enum","extern","false","fn","for","if","impl","in","let","loop",
+    "match","mod","move","mut","pub","ref","return","self","Self","static",
+    "struct","super","trait","true","type","unsafe","use","where","while",
+    "union","macro","yield","box",NULL
+};
+static const char *ty_rust[] = {
+    "i8","i16","i32","i64","i128","isize",
+    "u8","u16","u32","u64","u128","usize",
+    "f32","f64","bool","char","str","String","Vec","Option","Result",
+    "Box","Rc","Arc","Cell","RefCell","Mutex","RwLock","HashMap","HashSet",
+    "BTreeMap","BTreeSet","VecDeque","Some","None","Ok","Err",
+    "Iterator","Into","From","Default","Clone","Copy","Debug","Display",
+    "Send","Sync","Sized","Drop","Fn","FnMut","FnOnce",NULL
+};
 static const char *kw_asm[] = {
     "mov","push","pop","call","ret","jmp","je","jne","jz","jnz",
     "jl","jle","jg","jge","cmp","test","add","sub","mul","div",
@@ -105,6 +121,7 @@ Language lang_from_ext(const char *ext) {
     if (strcmp(ext,".css")==0)  return LANG_CSS;
     if (strcmp(ext,".php")==0)  return LANG_PHP;
     if (strcmp(ext,".cs")==0)   return LANG_CS;
+    if (strcmp(ext,".rs")==0)   return LANG_RUST;
     
     if (strcmp(ext,".bin")==0  || strcmp(ext,".dump")==0 ||
         strcmp(ext,".dmp")==0  || strcmp(ext,".img")==0  ||
@@ -207,6 +224,127 @@ static void lex_line_c_like(
         cont:;
     }
     (void)lang;
+}
+
+/* Rust: C-like at heart, but with shapes of its own — nested block comments,
+ * attributes (#[derive(...)] / #![no_std]), raw strings (r"..." / r#"..."#)
+ * and lifetimes ('a), which must not be read as unterminated char literals.
+ * Carried states use their own range so they never collide with the C or
+ * Python ones: 9 = string spanning lines, >=10 = block comment (depth-9). */
+static void lex_line_rust(const char *line, int len, LexState *ls, TokenType *out) {
+    int i = 0;
+    while (i < len) {
+        if (ls->state >= 10) {
+            int depth = ls->state - 9;
+            while (i < len) {
+                if (i+1 < len && line[i]=='/' && line[i+1]=='*') {
+                    out[i] = out[i+1] = TOK_COMMENT; i += 2; depth++; continue;
+                }
+                if (i+1 < len && line[i]=='*' && line[i+1]=='/') {
+                    out[i] = out[i+1] = TOK_COMMENT; i += 2; depth--;
+                    if (depth <= 0) { ls->state = 0; goto cont; }
+                    continue;
+                }
+                out[i++] = TOK_COMMENT;
+            }
+            ls->state = 9 + depth;
+            goto cont;
+        }
+        if (ls->state == 9) {
+            while (i < len) {
+                out[i] = TOK_STRING;
+                if (line[i] == '\\') { i++; if (i<len) out[i++]=TOK_STRING; continue; }
+                if (line[i++] == '"') { ls->state = 0; break; }
+            }
+            goto cont;
+        }
+
+        char c = line[i];
+
+        if (c=='/' && i+1<len && line[i+1]=='/') {
+            while (i<len) out[i++]=TOK_COMMENT;
+            goto cont;
+        }
+        if (c=='/' && i+1<len && line[i+1]=='*') {
+            out[i++]=TOK_COMMENT; out[i++]=TOK_COMMENT;
+            ls->state = 10;                      /* depth 1 */
+            goto cont;
+        }
+        if (c=='#' && i+1<len && (line[i+1]=='[' || line[i+1]=='!')) {
+            int depth = 0;
+            while (i<len) {
+                if (line[i]=='[') depth++;
+                else if (line[i]==']') { out[i++]=TOK_PREPROC; if (--depth<=0) break; continue; }
+                out[i++]=TOK_PREPROC;
+            }
+            goto cont;
+        }
+        if ((c=='r' || c=='b') && i+1<len && (line[i+1]=='"' || line[i+1]=='#')) {
+            int j = i + 1, hashes = 0;
+            while (j<len && line[j]=='#') { hashes++; j++; }
+            if (j<len && line[j]=='"') {
+                for (int k=i;k<=j;k++) out[k]=TOK_STRING;
+                i = j + 1;
+                while (i<len) {
+                    out[i]=TOK_STRING;
+                    if (line[i]=='"') {
+                        int h = 0, k = i+1;
+                        while (k<len && h<hashes && line[k]=='#') { h++; k++; }
+                        if (h == hashes) { for (int m=i;m<k;m++) out[m]=TOK_STRING; i=k; goto cont; }
+                    }
+                    i++;
+                }
+                if (hashes == 0) ls->state = 9;  /* plain r"..." may span lines */
+                goto cont;
+            }
+        }
+        if (c=='"') {
+            out[i++]=TOK_STRING; ls->state = 9;
+            goto cont;
+        }
+        if (c=='\'') {
+            int j = i + 1;
+            if (j<len && (isalpha((unsigned char)line[j]) || line[j]=='_')) {
+                int k = j;
+                while (k<len && (isalnum((unsigned char)line[k])||line[k]=='_')) k++;
+                if (k >= len || line[k] != '\'') {   /* no closing quote => lifetime */
+                    for (int m=i;m<k;m++) out[m]=TOK_TYPE;
+                    i = k;
+                    goto cont;
+                }
+            }
+            out[i++]=TOK_CHAR;
+            while (i<len) {
+                out[i]=TOK_CHAR;
+                if (line[i]=='\\') { i++; if(i<len) out[i++]=TOK_CHAR; continue; }
+                if (line[i++]=='\'') break;
+            }
+            goto cont;
+        }
+        if (isdigit((unsigned char)c)) {
+            /* 1_000_000, 0xFF, 3.5f32, 1u8 ... */
+            while (i<len && (isalnum((unsigned char)line[i])||line[i]=='_'||line[i]=='.'))
+                out[i++]=TOK_NUMBER;
+            goto cont;
+        }
+        if (isalpha((unsigned char)c)||c=='_') {
+            int start=i;
+            while (i<len && (isalnum((unsigned char)line[i])||line[i]=='_')) i++;
+            int wlen=i-start;
+            TokenType tt=TOK_IDENT;
+            if (kw_match(kw_rust, line+start, wlen))      tt=TOK_KEYWORD;
+            else if (kw_match(ty_rust, line+start, wlen)) tt=TOK_TYPE;
+            else if (i<len && line[i]=='!')               tt=TOK_PREPROC;  /* println! */
+            for(int j=start;j<i;j++) out[j]=tt;
+            if (tt==TOK_PREPROC && i<len && line[i]=='!') out[i++]=TOK_PREPROC;
+            goto cont;
+        }
+        if (strchr("+-*/%=<>!&|^~?:;,.{}[]()@",c))
+            { out[i++]=TOK_OPERATOR; goto cont; }
+
+        out[i++]=TOK_NORMAL;
+        cont:;
+    }
 }
 
 static void lex_line_python(const char *line, int len, LexState *ls, TokenType *out) {
@@ -430,6 +568,7 @@ void syn_ensure_line(SynCtx *s, size_t line, const GapBuf *g, const LineIdx *li)
         case LANG_CS:  lex_line_c_like(tmp,(int)len,&ls,la->attrs,LANG_CS,true); break;
         case LANG_JS:
         case LANG_PHP: lex_line_c_like(tmp,(int)len,&ls,la->attrs,LANG_JS,true); break;
+        case LANG_RUST:lex_line_rust(tmp,(int)len,&ls,la->attrs); break;
         case LANG_PY:  lex_line_python(tmp,(int)len,&ls,la->attrs); break;
         case LANG_SH:  lex_line_sh(tmp,(int)len,&ls,la->attrs); break;
         case LANG_SQL: lex_line_sql(tmp,(int)len,&ls,la->attrs); break;

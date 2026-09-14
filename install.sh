@@ -65,6 +65,8 @@ install_system_deps() {
             build-essential \
             libncurses-dev \
             libncursesw5-dev \
+            rustc \
+            cargo \
             python3 \
             python3-pip \
             python3-rich \
@@ -84,6 +86,7 @@ install_system_deps() {
         pacman -Syu --needed --noconfirm \
             base-devel \
             ncurses \
+            rust \
             python \
             python-pip \
             python-rich \
@@ -97,6 +100,32 @@ install_system_deps() {
     fi
 
     ok "System dependencies installed."
+}
+
+# ---------------------------------------------------------------------------
+# Rust toolchain
+#
+# abyss compiles and runs .rs files with ^B (rustc, or cargo when the file
+# belongs to a crate). The distribution package is installed above; this
+# only reports what actually landed, and points at rustup otherwise.
+# ---------------------------------------------------------------------------
+check_rust() {
+    info "Checking Rust toolchain..."
+
+    if command -v rustc &>/dev/null; then
+        ok "rustc $(rustc --version 2>/dev/null | awk '{print $2}') available."
+    else
+        warn "rustc not found after install."
+        warn "Install it manually, or via rustup:"
+        echo -e "  ${CYAN}curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh${NC}"
+        return 0
+    fi
+
+    if command -v cargo &>/dev/null; then
+        ok "cargo $(cargo --version 2>/dev/null | awk '{print $2}') available."
+    else
+        warn "cargo not found: .rs files inside a crate will not build with ^B."
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -278,6 +307,8 @@ print_summary() {
     echo ""
     echo -e "  Commands available globally:"
     echo -e "  ${CYAN}abyss${NC}            - Text editor (C)"
+    echo -e "                     ^B compiles & runs C / C++ / Rust / ASM / C#"
+    echo -e "                     ^B ^B (or F5) opens the build-flags menu"
     echo -e "  ${CYAN}compil${NC}           - Smart compiler/runner"
     echo -e "  ${CYAN}clip${NC}             - Copy file to clipboard"
     echo -e "  ${CYAN}wipe${NC}             - Clear file contents"
@@ -310,6 +341,7 @@ echo ""
 
 detect_pkg_manager
 install_system_deps
+check_rust
 install_python_deps
 build_all
 install_binaries

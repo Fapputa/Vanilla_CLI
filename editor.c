@@ -1228,6 +1228,25 @@ void editor_run(const char *initial_file) {
                     consumed = true;
                     full_redraw(true); continue;
                 }
+                /* F1-F4 under the keyboard protocol: CSI [1;<mod>] P/Q/R/S
+                 * and CSI 13 [;<mod>] ~ for F3 — none of which match the
+                 * terminfo SS3 forms ncurses would otherwise decode. */
+                if (!consumed) {
+                    int last = sn - 1;
+                    while (last > 0 && sq[last] == ERR) last--;
+                    int fk = 0, si = 1, num = 0;
+                    while (si < last && (isdigit(sq[si]) || sq[si] == ';')) si++;
+                    if (si == last) {
+                        for (int di = 1; di < last && isdigit(sq[di]); di++)
+                            num = num * 10 + (sq[di] - '0');
+                        int c = sq[last];
+                        if (c >= 'P' && c <= 'S' && (num == 0 || num == 1))
+                            fk = c - 'P' + 1;
+                        else if (c == '~' && num == 13)
+                            fk = 3;
+                    }
+                    if (fk) { key = KEY_F(fk); consumed = true; }
+                }
                 /* CSI <codepoint> [;<modifiers>] u — the shape every
                  * ambiguous key takes once the protocol above is on.
                  * modifiers-1 is a bitmask: 1 shift, 2 alt, 4 ctrl. */

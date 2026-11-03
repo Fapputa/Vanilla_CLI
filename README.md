@@ -2,7 +2,7 @@
 
 A high-performance, versatile toolkit designed to supercharge the Linux terminal experience. From low-level system monitoring to a high-speed C-engineered text editor, this suite brings efficiency and fun to the command line.
 
-![Demo](.rem.gif)
+![Demo](.lain.gif)
 
 ---
 
@@ -61,6 +61,34 @@ Engineered for zero-latency, Abyss is written in C and uses a **Gap Buffer** and
 - **Architecture:** Low-level memory management with `ncurses` for a flicker-free UI
 - **Features:** Undo/Redo, syntax highlighting, integrated compilation, hex view
 
+### Compiling and running
+
+`Ctrl + B` saves the buffer and builds it, with the output shown in a pane at
+the bottom:
+
+| Language | Toolchain |
+|----------|-----------|
+| C | `gcc` |
+| C++ | `g++` |
+| Rust | `rustc`, or `cargo run` when the file belongs to a crate (a `Cargo.toml` found up the tree) |
+| Assembly | `nasm` + `ld` |
+| C# | `mcs` + `mono` |
+
+Interpreted files (Python, shell, JS, PHP) are simply run.
+
+When it finishes, the compile and run times are shown in the status bar and at
+the end of the output pane (`-- compile 412 ms | run 1.27 s --`). A failed
+compilation reports only its compile time; a nonzero exit code is appended.
+
+Pressing `Ctrl + B` twice quickly (within 350 ms) — or `F5` — opens a dropdown at the bottom listing the compiler flags for the current
+language: optimisation level, SIMD/vector ISA (`-march=native`, `-mavx2 -mfma`,
+`-msse4.2`, or `-C target-cpu=native` for Rust), LTO, fast math, sanitizers,
+and so on. `Space` toggles a flag, `Enter` builds and runs with the selection,
+`Esc` closes. Bracketed entries `[x]` are independent; `(*)` entries belong to
+a group where only one can be active at a time (you cannot ask for `-O2` and
+`-O3` at once). The line above the border previews the exact flags that `^B`
+will pass to the compiler.
+
 ### Manual Build
 
 ```bash
@@ -89,13 +117,45 @@ abyss main.c
 | `Ctrl + Q` | Exit |
 | `Ctrl + Z` | Undo |
 | `Ctrl + Y` | Redo |
-| `Ctrl + B` | Compile and run (via `compil`) |
+| `Ctrl + B` | Compile and run the current file |
+| `Ctrl + B` `Ctrl + B` (or `F5`) | Build-flags menu for compiled languages |
 | `Ctrl + N` | Split screen view |
 | `Ctrl + K` | Delete current line |
 | `Ctrl + D` | Beautify / auto-format |
 | `F1` | File tree navigator |
 | `F2` | Hex view |
 | `F3` | File inspector |
+| `F4` | Smart highlight panel |
+| `F6` | Table view (CSV, JSON, SQL, SQLite...) |
+
+### Table view
+
+`F6` shows the current buffer as a grid, and `F6` again goes back to the
+text. Data-only files open in the table directly: `.csv`, `.tsv`, `.psv`,
+`.jsonl` / `.ndjson`, and SQLite databases (`.db`, `.sqlite`, or any file
+starting with the SQLite header).
+
+| Source | What becomes a table |
+|--------|----------------------|
+| CSV / TSV / PSV | Separator detected (`,` `;` tab `\|`), quoted fields, first line as header |
+| JSON | Arrays of objects (columns = union of keys), arrays of arrays, objects of objects; each array in an object gets its own table, leftover fields a `key \| value` table |
+| JSON Lines | One row per line |
+| SQL dump | `CREATE TABLE` column lists, `INSERT ... VALUES`, pg_dump `COPY ... FROM stdin` |
+| Markdown / psql | Pipe tables (`\| a \| b \|`, `a \| b` over `---+---`) |
+| SQLite | Every table and view, through the `sqlite3` CLI (read-only) |
+
+Files with another extension are sniffed. The view reads the buffer as it is,
+unsaved edits included; it is read-only, edits happen in the text.
+
+| Key | Action |
+|-----|--------|
+| Arrows / `hjkl` | Move between cells |
+| `PgUp` / `PgDn`, `g` / `G` | Page, first / last row |
+| `Home` / `End` | First / last column |
+| `Tab` / `Shift+Tab` | Next / previous table |
+| `Enter` | Show the full cell in the status bar |
+| `Ctrl + F`, `Ctrl + N` / `Ctrl + P` | Search cells, next / previous match |
+| `F2` | Hex view |
 
 ---
 

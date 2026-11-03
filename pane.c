@@ -78,6 +78,8 @@ Pane *pane_new(void) {
     p->last_cursor_row   = 0;
     p->hex_mode          = false;
     p->hex               = NULL;
+    p->table_mode        = false;
+    p->table             = NULL;
     return p;
 }
 
@@ -95,6 +97,7 @@ void pane_free(Pane *p) {
         free(p->prev_render);
     }
     hex_free(p->hex);
+    tbl_free(p->table);
     free(p);
 }
 
@@ -172,6 +175,18 @@ void pane_open_file(Pane *p, const char *path) {
     }
 
     li_rebuild(p->li, p->buf);
+
+    /* data files (and SQLite databases, whatever their name) open
+     * straight into the table view; F6 goes back to text / hex */
+    p->table_mode = false;
+    if (p->table) { tbl_free(p->table); p->table = NULL; }
+    bool sqlite = p->hex_mode && p->hex && tbl_is_sqlite(p->hex->data, p->hex->data_len);
+    if (sqlite || tbl_auto_ext(p->filename)) {
+        char keep[256];
+        snprintf(keep, sizeof keep, "%s", E_notify);
+        if (!pane_table_enter(p)) snprintf(E_notify, sizeof E_notify, "%s", keep);
+        else if (keep[0])         snprintf(E_notify, sizeof E_notify, "%s", keep);
+    }
 }
 
 typedef struct { char path[4096]; char *data; size_t len; } SaveArgs;
@@ -330,6 +345,11 @@ static int hex_color_at(const GapBuf *g, size_t pos, size_t start, size_t end,
 }
 
 void pane_render(Pane *p, bool force) {
+
+    if (p->table_mode && p->table) {
+        tbl_render(p->table, p->win, p->win_h, p->win_w);
+        return;
+    }
 
     if (p->hex_mode && p->hex) {
         hex_render(p->hex, p->win, p->win_h, p->win_w);

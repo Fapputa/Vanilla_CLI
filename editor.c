@@ -141,17 +141,21 @@ static void render_title(void) {
     Pane *ap = E.panes[E.active];
 
     if (E.show_shortcuts) {
-        if (ap->hex_mode)
+        if (ap->table_mode)
+            wprintw(E.title_win,
+                " [TABLE] Arrows/hjkl:Move  PgUp/PgDn  g/G:Top/Bottom  Home/End:Cols"
+                "  Tab:Next table  Enter:Cell  ^F:Find  ^N/^P:Next/Prev  F6:Exit Table  ^Q:Quit");
+        else if (ap->hex_mode)
             wprintw(E.title_win,
                 " [HEX] Tab:Switch  ^J:Jump  ^F:Search  ^N/^P:Next/Prev"
                 "  ^S:Save  F2:Exit Hex  ^Q:Quit");
         else
             wprintw(E.title_win,
                 " ^O:SaveAs  ^S:Save  ^K:Line  ^B:Run  ^B^B/F5:Flags  ^F:Find  ^Z:Undo"
-                "  ^R:LN  ^W:Wipe  ^D:Fmt  F1:Tree  F2:Hex  F3:Info  F4:HL  ^A:Help  ^Q:Quit");
+                "  ^R:LN  ^W:Wipe  ^D:Fmt  F1:Tree  F2:Hex  F3:Info  F4:HL  F6:Table  ^A:Help  ^Q:Quit");
     } else {
         bool mod         = ap->hex_mode ? (ap->hex && ap->hex->modified) : ap->modified;
-        const char *hex_tag  = ap->hex_mode ? "  [HEX]"  : "";
+        const char *hex_tag  = ap->table_mode ? "  [TABLE]" : ap->hex_mode ? "  [HEX]" : "";
         const char *tree_tag = (E.tree && E.tree->visible && E.tree_focus) ? "  [TREE]" : "";
         const char *hl_tag   = (E.hl   && E.hl->visible)                  ? "  [HL]"   : "";
         if (ap->filename[0])
@@ -171,7 +175,11 @@ static void render_status(void) {
     wattron(E.status_win, COLOR_PAIR(COLOR_PAIR_STATUS));
     Pane *ap = E.panes[E.active];
 
-    if (ap->hex_mode && ap->hex) {
+    if (ap->table_mode && ap->table) {
+        char info[512];
+        tbl_status(ap->table, info, sizeof info);
+        waddstr(E.status_win, info);
+    } else if (ap->hex_mode && ap->hex) {
         HexPane *h = ap->hex;
         const char *panel = (h->focus == HEX_FOCUS_HEX) ? "HEX" : "ASCII";
         wprintw(E.status_win,
@@ -466,7 +474,9 @@ static void full_redraw(bool force) {
     
     for (int i = 0; i < E.npanes; i++) {
         Pane *p = E.panes[i];
-        if (p->hex_mode && p->hex)
+        if (p->table_mode && p->table)
+            tbl_render(p->table, p->win, p->win_h, p->win_w);
+        else if (p->hex_mode && p->hex)
             hex_render(p->hex, p->win, p->win_h, p->win_w);
         else
             pane_render(p, force);
@@ -534,7 +544,9 @@ static void full_redraw(bool force) {
             "Open File",
             "Go to Line",
             "Jump to Offset  (decimal: 1024  or hex: 0x400)",
-            "Search ASCII"
+            "Search ASCII",
+            "",
+            "Search table"
         };
         render_dialog(titles[E.mode]);
     }
@@ -609,6 +621,11 @@ static void dialog_confirm(void) {
             full_redraw(true);
             return;
         }
+
+        case MODE_TABLE_SEARCH:
+            if (ap->table && !tbl_search(ap->table, E.dialog_buf, true))
+                snprintf(E_notify, sizeof E_notify, "Not found: %.200s", E.dialog_buf);
+            break;
 
         case MODE_SAVE_DIALOG:
             pane_save_file(ap, E.dialog_buf);
@@ -774,11 +791,56 @@ static void handle_key_normal(int key) {
 
     Pane *ap = E.panes[E.active];
 
+    /* Table view: read-only, so plain letters navigate. F2 drops to the
+     * hex dump, F6 back to whatever was underneath. */
+    if (ap->table_mode && ap->table) {
+        TableView *tv = ap->table;
+        if (key == ('q' & 0x1f)) { E.running = false; return; }
+        if (key == ('a' & 0x1f)) { E.show_shortcuts = !E.show_shortcuts; return; }
+        if (key == KEY_F(6))     { ap->table_mode = false; force_full_dirty(); return; }
+        if (key == KEY_F(2)) {
+            ap->table_mode = false;
+            if (ap->hex_mode) { force_full_dirty(); return; }
+        } else {
+            if (key == ('s' & 0x1f)) {
+                if (ap->filename[0]) pane_save_file(ap, NULL);
+                return;
+            }
+            if (key == ('f' & 0x1f)) {
+                open_dialog(MODE_TABLE_SEARCH, tv->search[0] ? tv->search : NULL);
+                return;
+            }
+            if (key == ('n' & 0x1f) || key == ('p' & 0x1f)) {
+                if (tv->search[0] && !tbl_search(tv, tv->search, key == ('n' & 0x1f)))
+                    snprintf(E_notify, sizeof E_notify, "Not found: %.200s", tv->search);
+                return;
+            }
+            if (key == '\n' || key == '\r') {
+                const char *c = tbl_cell(tv, tv->row, tv->col);
+                snprintf(E_notify, sizeof E_notify, "%.250s", c ? c : "(empty)");
+                for (char *q = E_notify; *q; q++) if (*q == '\n' || *q == '\t') *q = ' ';
+                return;
+            }
+            if (key == KEY_MOUSE) {
+                MEVENT ev;
+                if (getmouse(&ev) == OK) {
+                    int step = (ev.bstate & BUTTON4_PRESSED) ? KEY_UP
+                             : (ev.bstate & BUTTON5_PRESSED) ? KEY_DOWN : 0;
+                    for (int i = 0; step && i < 3; i++) tbl_handle_key(tv, step, ap->win_h);
+                }
+                return;
+            }
+            tbl_handle_key(tv, key, ap->win_h);
+            return;
+        }
+    }
+
     
     if (ap->hex_mode && ap->hex) {
         if (key == ('q' & 0x1f)) { E.running = false; return; }
         if (key == ('a' & 0x1f)) { E.show_shortcuts = !E.show_shortcuts; return; }
         if (key == KEY_F(2))     { ap->hex_mode = false; force_full_dirty(); return; }
+        if (key == KEY_F(6))     { pane_table_enter(ap); return; }
         if (key == ('s' & 0x1f)) { hex_save(ap->hex, NULL); return; }
         if (key == ('o' & 0x1f)) {
             open_dialog(MODE_SAVE_DIALOG, ap->hex->filename[0] ? ap->hex->filename : NULL);
@@ -852,6 +914,9 @@ static void handle_key_normal(int key) {
 
         case KEY_F(5):
             build_menu_open();
+            break;
+        case KEY_F(6):
+            pane_table_enter(ap);
             break;
         case 'r' & 0x1f:
             ap->show_line_numbers = !ap->show_line_numbers;
@@ -1217,7 +1282,7 @@ void editor_run(const char *initial_file) {
                     if (in_paste && paste_len > 0 && E.mode == MODE_NORMAL) {
                         paste_batch[paste_len] = '\0';
                         Pane *ap2 = E.panes[E.active];
-                        if (!ap2->hex_mode) {
+                        if (!ap2->hex_mode && !ap2->table_mode) {
                             pane_insert_str(ap2, paste_batch, paste_len);
                             if (E.hl && E.hl->visible) E.hl->dirty = true;
                         }
@@ -1244,6 +1309,10 @@ void editor_run(const char *initial_file) {
                             fk = c - 'P' + 1;
                         else if (c == '~' && num == 13)
                             fk = 3;
+                        else if (c == '~' && num == 15)
+                            fk = 5;
+                        else if (c == '~' && num == 17)
+                            fk = 6;
                     }
                     if (fk) { key = KEY_F(fk); consumed = true; }
                 }

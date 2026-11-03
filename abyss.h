@@ -261,6 +261,55 @@ void        hl_render(HLCtx *h, WINDOW *win, int win_h, int win_w);
 void        hl_colors_init(void);
 const HLMatch *hl_match_at(const HLCtx *h, size_t byte_off);
 
+/* ─── Table view (F6) ──────────────────────────────────────
+ * Read-only grid over structured data: CSV/TSV/PSV, JSON, JSON Lines,
+ * SQL dumps (CREATE TABLE / INSERT / COPY), Markdown & psql tables and
+ * SQLite databases (through the sqlite3 CLI). A source may hold several
+ * tables ("sheets"); Tab cycles them. Data-only formats open in it
+ * automatically, everything else toggles with F6. */
+
+#define TABLE_MAX_ROWS   200000
+#define TABLE_MAX_COLW   40
+#define TABLE_MAX_SHEETS 64
+
+typedef struct Arena Arena;
+
+typedef struct {
+    char    name[128];
+    char  **hdr;        /* ncols headers                            */
+    char  **cells;      /* nrows * ncols, row-major; NULL = missing */
+    size_t  nrows;
+    int     ncols;
+    int    *colw;       /* display width of each column             */
+    bool   *numeric;    /* mostly numbers: right-aligned            */
+    bool    truncated;  /* stopped at TABLE_MAX_ROWS                */
+} TblSheet;
+
+typedef struct {
+    Arena      *arena;
+    TblSheet   *sheets;
+    int         nsheets;
+    int         cur;
+    const char *fmt;
+    size_t      row, scroll_row;
+    int         col, scroll_col;
+    char        err[192];
+    char        search[256];
+} TableView;
+
+TableView  *tbl_new(void);
+void        tbl_free(TableView *tv);
+bool        tbl_load_text(TableView *tv, const char *path, const char *text,
+                          size_t len, Language lang);
+bool        tbl_load_sqlite(TableView *tv, const char *path);
+bool        tbl_is_sqlite(const unsigned char *data, size_t len);
+bool        tbl_auto_ext(const char *path);
+void        tbl_render(TableView *tv, WINDOW *win, int win_h, int win_w);
+bool        tbl_handle_key(TableView *tv, int key, int win_h);
+bool        tbl_search(TableView *tv, const char *query, bool forward);
+const char *tbl_cell(const TableView *tv, size_t row, int col);
+void        tbl_status(const TableView *tv, char *out, size_t out_sz);
+
 #define HIGHLIGHT_DEFAULT_W  34
 #define HIGHLIGHT_MIN_W      28
 #define HIGHLIGHT_MAX_W      52
@@ -301,6 +350,9 @@ typedef struct {
 
     bool     hex_mode;
     HexPane *hex;
+
+    bool       table_mode;
+    TableView *table;
 } Pane;
 
 Pane *pane_new(void);
@@ -329,6 +381,7 @@ void  pane_cursor_line_col(const Pane *p, size_t *line, size_t *col);
 void  pane_push_undo(Pane *p);
 void  pane_wipe_file(Pane *p);
 void  pane_beautify(Pane *p);
+bool  pane_table_enter(Pane *p);
 
 #define TREE_DEFAULT_W  26
 #define TREE_MIN_W      18
@@ -393,6 +446,7 @@ typedef enum {
     MODE_HEX_JUMP,
     MODE_HEX_SEARCH,
     MODE_BUILD_MENU,
+    MODE_TABLE_SEARCH,
 } EditorMode;
 
 typedef struct {
@@ -523,7 +577,7 @@ typedef struct ArenaBlock {
     char   data[];
 } ArenaBlock;
 
-typedef struct { ArenaBlock *head; } Arena;
+struct Arena { ArenaBlock *head; };
 
 Arena *arena_new(size_t block_size);
 void  *arena_alloc(Arena *a, size_t n);

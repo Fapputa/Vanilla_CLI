@@ -24,66 +24,11 @@ typedef struct {
     bool     truncated;
 } Build;
 
-/* cell string -> where it was read from in the source text */
-typedef struct {
-    const char *cell;
-    size_t      off;
-    uint32_t    len;
-    uint8_t     kind;
-} SpanEnt;
-
 typedef struct {
     TableView *tv;
     Build      b[TABLE_MAX_SHEETS];
     int        nb;
-    /* source text the parsers read (NULL: not editable, e.g. sqlite3 output) */
-    const char *base;
-    size_t      blen;
-    SpanEnt    *sp;          /* open-addressing hash keyed by cell pointer */
-    size_t      spn, spcap;
 } Loader;
-
-static size_t sp_hash(const char *p, size_t cap) {
-    uint64_t h = (uint64_t)(uintptr_t)p;
-    h ^= h >> 33; h *= 0xff51afd7ed558ccdULL; h ^= h >> 33;
-    return (size_t)h & (cap - 1);
-}
-
-static void sp_insert(SpanEnt *tab, size_t cap, const SpanEnt *e) {
-    size_t i = sp_hash(e->cell, cap);
-    while (tab[i].cell && tab[i].cell != e->cell) i = (i + 1) & (cap - 1);
-    tab[i] = *e;
-}
-
-/* Remembers that `cell` was decoded from src[0..n). Only spans inside the
- * text being loaded count; anything else (sqlite3 output...) is ignored. */
-static void ld_span(Loader *L, const char *cell, const char *src, size_t n, int kind) {
-    if (!L->base || !cell || src < L->base || src + n > L->base + L->blen) return;
-    if (n > UINT32_MAX) return;
-    if ((L->spn + 1) * 2 > L->spcap) {
-        size_t nc = L->spcap ? L->spcap * 2 : 4096;
-        SpanEnt *nt = calloc(nc, sizeof *nt);
-        if (!nt) return;
-        for (size_t i = 0; i < L->spcap; i++) if (L->sp[i].cell) sp_insert(nt, nc, &L->sp[i]);
-        free(L->sp);
-        L->sp = nt; L->spcap = nc;
-    }
-    SpanEnt e = { cell, (size_t)(src - L->base), (uint32_t)n, (uint8_t)kind };
-    size_t i = sp_hash(cell, L->spcap);
-    while (L->sp[i].cell && L->sp[i].cell != cell) i = (i + 1) & (L->spcap - 1);
-    if (!L->sp[i].cell) L->spn++;
-    L->sp[i] = e;
-}
-
-static const SpanEnt *ld_span_get(const Loader *L, const char *cell) {
-    if (!L->spcap || !cell) return NULL;
-    size_t i = sp_hash(cell, L->spcap);
-    while (L->sp[i].cell) {
-        if (L->sp[i].cell == cell) return &L->sp[i];
-        i = (i + 1) & (L->spcap - 1);
-    }
-    return NULL;
-}
 
 typedef struct { char **v; int n, cap; } Row;
 
@@ -153,8 +98,6 @@ static void b_add_row(Loader *L, Build *b, char **v, int n) {
 static void ld_free(Loader *L) {
     for (int i = 0; i < L->nb; i++) { free(L->b[i].rows); free(L->b[i].rlen); }
     L->nb = 0;
-    free(L->sp);
-    L->sp = NULL; L->spn = L->spcap = 0;
 }
 
 /* Display width of a cell as drawn: newlines become a one-column "↵". */
@@ -185,13 +128,14 @@ static void tbl_clear(TableView *tv) {
         free(tv->sheets[i].cells);
         free(tv->sheets[i].colw);
         free(tv->sheets[i].numeric);
-        free(tv->sheets[i].span);
-        free(tv->sheets[i].rowid);
         free(tv->sheets[i].perm);
     }
     free(tv->sheets);
     tv->sheets  = NULL;
     tv->nsheets = 0;
+    /* the dropdown's values live in the arena */
+    free(tv->menu.vals); free(tv->menu.idx); free(tv->menu.on);
+    memset(&tv->menu, 0, sizeof tv->menu);
     if (tv->arena) arena_free(tv->arena);
     tv->arena = arena_new(1 << 16);
     tv->err[0] = '\0';
@@ -212,6 +156,7 @@ static void tbl_finish(Loader *L) {
         snprintf(t->name, sizeof t->name, "%s", b->name);
         t->ncols     = ncols;
         t->nrows     = b->n;
+        t->nview     = b->n;
         t->truncated = b->truncated;
         t->hdr       = arena_alloc(tv->arena, (size_t)ncols * sizeof *t->hdr);
         for (int c = 0; c < ncols; c++) {
@@ -224,15 +169,6 @@ static void tbl_finish(Loader *L) {
         for (size_t r = 0; r < b->n; r++)
             memcpy(t->cells + r * (size_t)ncols, b->rows[r],
                    (size_t)b->rlen[r] * sizeof *t->cells);
-
-        if (L->spn) {
-            size_t total = t->nrows * (size_t)ncols;
-            t->span = calloc(total + 1, sizeof *t->span);
-            for (size_t k = 0; t->span && k < total; k++) {
-                const SpanEnt *e = ld_span_get(L, t->cells[k]);
-                if (e) { t->span[k].off = e->off; t->span[k].len = e->len; t->span[k].kind = e->kind; }
-            }
-        }
 
         t->colw    = calloc((size_t)ncols, sizeof *t->colw);
         t->numeric = calloc((size_t)ncols, sizeof *t->numeric);
@@ -304,7 +240,6 @@ static void parse_csv(Loader *L, const char *s, size_t len, char delim,
         row.n = 0;
         for (;;) {                                   /* one record */
             f.n = 0;
-            size_t fs = i;
             if (i < len && s[i] == '"') {
                 i++;
                 while (i < len) {
@@ -321,13 +256,7 @@ static void parse_csv(Loader *L, const char *s, size_t len, char delim,
                 if (s[i] != '\r') str_putc(&f, s[i]);
                 i++;
             }
-            {
-                char *cell = adup(L, f.s ? f.s : "", f.n);
-                size_t fe = i;
-                if (fe > fs && s[fe - 1] == '\r') fe--;
-                ld_span(L, cell, s + fs, fe - fs, SPK_CSV);
-                row_push(&row, cell);
-            }
+            row_push(&row, adup(L, f.s ? f.s : "", f.n));
             if (i < len && s[i] == delim) { i++; continue; }
             if (i < len) i++;                        /* the newline */
             break;
@@ -441,10 +370,8 @@ static JVal *jp_container(JP *p, bool obj) {
         if (obj) {
             jp_ws(p);
             if (p->i >= p->len || p->s[p->i] != '"') { p->err = true; break; }
-            size_t ks = p->i;
             key = jp_string(p);
             if (p->err) break;
-            ld_span(p->L, key, p->s + ks, p->i - ks, SPK_JSTR);
             jp_ws(p);
             if (p->i >= p->len || p->s[p->i] != ':') { p->err = true; break; }
             p->i++;
@@ -485,7 +412,6 @@ static JVal *jp_value(JP *p) {
         JVal *v = jp_new(p, J_STR, start);
         v->s = jp_string(p);
         v->rawlen = p->i - start;
-        if (!p->err) ld_span(p->L, v->s, v->raw, v->rawlen, SPK_JSTR);
         return v;
     }
     JType t;
@@ -502,7 +428,6 @@ static JVal *jp_value(JP *p) {
     JVal *v = jp_new(p, t, start);
     v->rawlen = p->i - start;
     v->s = adup(p->L, v->raw, v->rawlen);
-    ld_span(p->L, v->s, v->raw, v->rawlen, SPK_JRAW);
     return v;
 }
 
@@ -523,11 +448,8 @@ static char *j_cell(Loader *L, const JVal *v) {
             if (c == '"') inq = true;
         }
     }
-    bool cut = o >= cap && cap < v->rawlen;
-    if (cut) { memcpy(out + o, "…", 3); o += 3; }
+    if (o >= cap && cap < v->rawlen) { memcpy(out + o, "…", 3); o += 3; }
     out[o] = '\0';
-    /* a shortened value cannot be edited: writing it back would lose data */
-    if (!cut) ld_span(L, out, v->raw, v->rawlen, SPK_JRAW);
     return out;
 }
 
@@ -873,8 +795,6 @@ static bool sql_list(SqlLex *x, Row *row, bool names_only) {
         if (ntok == 0)                          v = adupz(x->L, "");
         else if (ntok == 1 || names_only)       v = tok_text(x, &first);
         else                                    v = adup(x->L, first.p, (size_t)(end - first.p));
-        if (ntok > 0 && !names_only)
-            ld_span(x->L, v, first.p, (size_t)(end - first.p), SPK_SQL);
         row_push(row, v);
         if (tok_is(&x->tok, ',')) { sql_next(x); continue; }
         if (tok_is(&x->tok, ')')) { sql_next(x); return true; }
@@ -1004,7 +924,6 @@ static void sql_copy(SqlLex *x) {
         size_t j = i;
         for (;;) {
             f.n = 0;
-            size_t fs = j;
             while (j < e && x->s[j] != '\t') {
                 char c = x->s[j++];
                 if (c == '\\' && j < e) {
@@ -1018,11 +937,7 @@ static void sql_copy(SqlLex *x) {
                 }
                 str_putc(&f, c);
             }
-            {
-                char *cell = adup(x->L, f.s ? f.s : "", f.n);
-                ld_span(x->L, cell, x->s + fs, j - fs, SPK_COPY);
-                row_push(&row, cell);
-            }
+            row_push(&row, adup(x->L, f.s ? f.s : "", f.n));
             if (j < e) { j++; continue; }
             break;
         }
@@ -1066,20 +981,13 @@ static void split_pipes(Loader *L, const char *s, size_t n, Row *row) {
     if (n && *s == '|') { s++; n--; }
     if (n && s[n - 1] == '|' && !(n >= 2 && s[n - 2] == '\\')) n--;
     Str f = {0};
-    size_t fs = 0;                       /* source index where the field starts */
     for (size_t i = 0; i <= n; i++) {
         if (i == n || s[i] == '|') {
             size_t a = 0, z = f.n;
             while (a < z && isspace((unsigned char)f.s[a])) a++;
             while (z > a && isspace((unsigned char)f.s[z - 1])) z--;
-            char *cell = adup(L, f.s ? f.s + a : "", z - a);
-            size_t sa = fs, sz = i;
-            while (sa < sz && isspace((unsigned char)s[sa])) sa++;
-            while (sz > sa && isspace((unsigned char)s[sz - 1])) sz--;
-            ld_span(L, cell, s + sa, sz - sa, SPK_MD);
-            row_push(row, cell);
+            row_push(row, adup(L, f.s ? f.s + a : "", z - a));
             f.n = 0;
-            fs = i + 1;
             continue;
         }
         if (s[i] == '\\' && i + 1 < n && s[i + 1] == '|') { str_putc(&f, '|'); i++; continue; }
@@ -1148,10 +1056,6 @@ static int run_capture(char *const argv[], char **out, size_t *out_len) {
     pid_t pid = fork();
     if (pid < 0) { close(fd[0]); close(fd[1]); return -1; }
     if (pid == 0) {
-        /* own session, no controlling terminal: helpers such as chafa
-         * would otherwise query /dev/tty directly, and the terminal's
-         * answers would land in the editor as keystrokes */
-        setsid();
         dup2(fd[1], STDOUT_FILENO);
         int dn = open("/dev/null", O_RDWR);
         if (dn >= 0) { dup2(dn, STDERR_FILENO); dup2(dn, STDIN_FILENO); }
@@ -1182,31 +1086,6 @@ static int run_capture(char *const argv[], char **out, size_t *out_len) {
     return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
 }
 
-int proc_capture(char *const argv[], char **out, size_t *out_len) {
-    return run_capture(argv, out, out_len);
-}
-
-bool proc_have(const char *prog) {
-    if (!prog || !*prog) return false;
-    if (strchr(prog, '/')) return access(prog, X_OK) == 0;
-    const char *path = getenv("PATH");
-    if (!path) return false;
-    char dir[4096];
-    while (*path) {
-        const char *sep = strchr(path, ':');
-        size_t n = sep ? (size_t)(sep - path) : strlen(path);
-        if (n == 0) { dir[0] = '.'; n = 1; } else {
-            if (n >= sizeof dir - 256) n = sizeof dir - 256;
-            memcpy(dir, path, n);
-        }
-        snprintf(dir + n, sizeof dir - n, "/%s", prog);
-        if (access(dir, X_OK) == 0) return true;
-        if (!sep) break;
-        path = sep + 1;
-    }
-    return false;
-}
-
 static void sql_quote(char *out, size_t sz, const char *name, char q) {
     size_t o = 0;
     if (o + 1 < sz) out[o++] = q;
@@ -1218,36 +1097,9 @@ static void sql_quote(char *out, size_t sz, const char *name, char q) {
     out[o] = '\0';
 }
 
-/* The rowid travels as a hidden first column ("__abyss_rowid"); it is
- * moved out of the grid into t->rowid so edits can target the row. */
-#define ROWID_COL "__abyss_rowid"
-
-static void sheet_take_rowid(TblSheet *t) {
-    if (t->ncols < 2 || strcmp(t->hdr[0], ROWID_COL) != 0) return;
-    int nc = t->ncols - 1;
-    t->rowid = calloc(t->nrows + 1, sizeof *t->rowid);
-    char **cells = calloc(t->nrows * (size_t)nc + 1, sizeof *cells);
-    for (size_t r = 0; r < t->nrows; r++) {
-        const char *id = t->cells[r * (size_t)t->ncols];
-        t->rowid[r] = id ? strtoll(id, NULL, 10) : 0;
-        memcpy(cells + r * (size_t)nc, t->cells + r * (size_t)t->ncols + 1,
-               (size_t)nc * sizeof *cells);
-    }
-    free(t->cells);
-    t->cells = cells;
-    memmove(t->hdr, t->hdr + 1, (size_t)nc * sizeof *t->hdr);
-    memmove(t->colw, t->colw + 1, (size_t)nc * sizeof *t->colw);
-    memmove(t->numeric, t->numeric + 1, (size_t)nc * sizeof *t->numeric);
-    free(t->span); t->span = NULL;
-    t->ncols = nc;
-}
-
 bool tbl_load_sqlite(TableView *tv, const char *path) {
     tbl_clear(tv);
     tv->fmt = "SQLite";
-    tv->sqlite = true;
-    tv->from_hex = false;
-    snprintf(tv->path, sizeof tv->path, "%s", path);
     Loader L = { .tv = tv };
 
     char *list; size_t llen;
@@ -1279,18 +1131,11 @@ bool tbl_load_sqlite(TableView *tv, const char *path) {
         char *ln = names.v[ti];
         char qn[512], query[700];
         sql_quote(qn, sizeof qn, ln, '"');
-        /* tables carry a rowid (needed to write edits back); views and
-         * WITHOUT ROWID tables do not, and are shown read-only */
-        snprintf(query, sizeof query, "SELECT rowid AS " ROWID_COL ", * FROM %s LIMIT %s;",
-                 qn, limit);
+        snprintf(query, sizeof query, "SELECT * FROM %s LIMIT %s;", qn, limit);
         char *qa[] = { "sqlite3", "-readonly", "-batch", "-csv", "-header",
                        (char *)path, query, NULL };
         char *csv; size_t clen;
-        if (run_capture(qa, &csv, &clen) != 0) {
-            free(csv);
-            snprintf(query, sizeof query, "SELECT * FROM %s LIMIT %s;", qn, limit);
-            run_capture(qa, &csv, &clen);
-        }
+        run_capture(qa, &csv, &clen);
         parse_csv(&L, csv, clen, ',', ln, true);
         free(csv);
 
@@ -1313,7 +1158,6 @@ bool tbl_load_sqlite(TableView *tv, const char *path) {
     free(names.v);
     free(list);
     tbl_finish(&L);
-    for (int i = 0; i < tv->nsheets; i++) sheet_take_rowid(&tv->sheets[i]);
     if (tv->nsheets == 0) {
         snprintf(tv->err, sizeof tv->err, "No tables in this database");
         return false;
@@ -1356,9 +1200,7 @@ static bool contains_ci(const char *s, size_t len, const char *needle) {
 
 bool tbl_load_text(TableView *tv, const char *path, const char *s, size_t len, Language lang) {
     tbl_clear(tv);
-    Loader L = { .tv = tv, .base = s, .blen = len };
-    tv->sqlite = false;
-    tv->delim  = 0;
+    Loader L = { .tv = tv };
     if (len >= 3 && memcmp(s, "\xEF\xBB\xBF", 3) == 0) { s += 3; len -= 3; }
 
     const char *e    = path_ext(path);
@@ -1368,17 +1210,14 @@ bool tbl_load_text(TableView *tv, const char *path, const char *s, size_t len, L
     if (!strcasecmp(e, ".csv")) {
         char d = csv_sniff(s, len, false);
         tv->fmt = "CSV";
-        tv->delim = d ? d : ',';
-        parse_csv(&L, s, len, tv->delim, name, true);
+        parse_csv(&L, s, len, d ? d : ',', name, true);
         ok = true;
     } else if (!strcasecmp(e, ".tsv") || !strcasecmp(e, ".tab")) {
         tv->fmt = "TSV";
-        tv->delim = '\t';
         parse_csv(&L, s, len, '\t', name, true);
         ok = true;
     } else if (!strcasecmp(e, ".psv")) {
         tv->fmt = "PSV";
-        tv->delim = '|';
         parse_csv(&L, s, len, '|', name, true);
         ok = true;
     } else if (!strcasecmp(e, ".jsonl") || !strcasecmp(e, ".ndjson")) {
@@ -1424,7 +1263,6 @@ bool tbl_load_text(TableView *tv, const char *path, const char *s, size_t len, L
             char d = csv_sniff(s, len, true);
             if (d) {
                 tv->fmt = d == '\t' ? "TSV" : d == '|' ? "PSV" : "CSV";
-                tv->delim = d;
                 parse_csv(&L, s, len, d, name, true);
                 ok = true;
             }
@@ -1444,28 +1282,30 @@ bool tbl_load_text(TableView *tv, const char *path, const char *s, size_t len, L
 TableView *tbl_new(void) {
     TableView *tv = calloc(1, sizeof *tv);
     tv->fmt = "Table";
-    tv->sort_col = -1;
     return tv;
 }
+
+static void filter_reset(TableView *tv);
 
 void tbl_free(TableView *tv) {
     if (!tv) return;
     tbl_clear(tv);
     arena_free(tv->arena);
+    filter_reset(tv);
     free(tv);
 }
 
-/* ─── Sorting ──────────────────────────────────────────────────── */
+/* ─── Sorting & filtering ──────────────────────────────────────── */
 
 size_t tbl_phys_row(const TblSheet *t, size_t r) {
-    return (t && t->perm && r < t->nrows) ? t->perm[r] : r;
+    return (t && t->perm && r < t->nview) ? t->perm[r] : r;
 }
 
 /* qsort has no context argument on every platform (qsort_r differs
  * between glibc and MSVCRT), so the comparison reads these. */
-static const TblSheet *g_st;
-static int             g_sc, g_sd;
-static bool            g_snum;
+static const TblSheet  *g_st;
+static const TableView *g_stv;
+static bool             g_snum;
 
 static bool cell_blank(const char *s) {
     return !s || !*s || !strcmp(s, "NULL") || !strcmp(s, "null");
@@ -1494,11 +1334,9 @@ static int natural_cmp(const char *a, const char *b) {
     return *a ? 1 : *b ? -1 : 0;
 }
 
-static int sort_cmp(const void *pa, const void *pb) {
-    size_t ra = *(const size_t *)pa, rb = *(const size_t *)pb;
-    size_t nc = (size_t)g_st->ncols;
-    const char *x = g_st->cells[ra * nc + (size_t)g_sc];
-    const char *y = g_st->cells[rb * nc + (size_t)g_sc];
+/* Order of two cell values (ascending), as the sort shows them: numbers
+ * numerically in a number column, text in natural order, blanks last. */
+static int value_cmp(const char *x, const char *y) {
     bool xe = cell_blank(x), ye = cell_blank(y);
     if (xe != ye) return xe ? 1 : -1;            /* blanks last, both ways */
     int r = 0;
@@ -1514,40 +1352,182 @@ static int sort_cmp(const void *pa, const void *pb) {
             r = natural_cmp(x, y);
         }
     }
-    if (r) return r * g_sd;
+    return r;
+}
+
+static int sort_cmp(const void *pa, const void *pb) {
+    size_t ra = *(const size_t *)pa, rb = *(const size_t *)pb;
+    size_t nc = (size_t)g_st->ncols;
+    for (int k = 0; k < g_stv->nsort; k++) {     /* main key first */
+        size_t c = (size_t)g_stv->sort[k].col;
+        g_snum = g_st->numeric[c];
+        int r = value_cmp(g_st->cells[ra * nc + c], g_st->cells[rb * nc + c]);
+        if (r) return r * g_stv->sort[k].dir;
+    }
     return ra < rb ? -1 : ra > rb ? 1 : 0;       /* stable */
 }
 
-/* Sorts the current sheet's display order on `col` (dir 1 = ascending,
- * -1 = descending, 0 = back to the source order), keeping the cursor on
- * the same record. The data itself never moves: edits and saves always
- * work on the source order. */
+int tbl_sort_key(const TableView *tv, int col) {
+    for (int k = 0; tv && k < tv->nsort; k++) if (tv->sort[k].col == col) return k;
+    return -1;
+}
+
+/* Drops the keys that no longer fit the sheet (fewer columns). */
+static void sort_prune(TableView *tv, const TblSheet *t) {
+    int n = 0;
+    for (int k = 0; k < tv->nsort; k++)
+        if (tv->sort[k].dir && tv->sort[k].col >= 0 && tv->sort[k].col < t->ncols)
+            tv->sort[n++] = tv->sort[k];
+    tv->nsort = n;
+}
+
+static int str_cmp_p(const void *pa, const void *pb) {
+    return strcmp(*(const char *const *)pa, *(const char *const *)pb);
+}
+
+/* Does a cell holding `s` pass filter `f`? */
+static bool filter_pass(const TblFilter *f, const char *s) {
+    if (!s) return f->missing;
+    return f->nvals && bsearch(&s, f->vals, (size_t)f->nvals, sizeof *f->vals, str_cmp_p);
+}
+
+/* Source row `r` passes every filter but the one on column `skip`. */
+static bool row_kept(const TableView *tv, const TblSheet *t, size_t r, int skip) {
+    for (int i = 0; i < tv->nfilt; i++) {
+        const TblFilter *f = &tv->filt[i];
+        if (f->col != skip && !filter_pass(f, t->cells[r * (size_t)t->ncols + (size_t)f->col]))
+            return false;
+    }
+    return true;
+}
+
+int tbl_filter_index(const TableView *tv, int col) {
+    for (int i = 0; tv && i < tv->nfilt; i++) if (tv->filt[i].col == col) return i;
+    return -1;
+}
+
+static void filter_free(TblFilter *f) {
+    for (int k = 0; k < f->nvals; k++) free(f->vals[k]);
+    free(f->vals);
+    memset(f, 0, sizeof *f);
+}
+
+static void filter_drop(TableView *tv, int i) {
+    filter_free(&tv->filt[i]);
+    memmove(&tv->filt[i], &tv->filt[i + 1], (size_t)(tv->nfilt - i - 1) * sizeof *tv->filt);
+    tv->nfilt--;
+}
+
+/* Rebuilds the display order of the current sheet from the filters and
+ * the sort, putting the cursor back on record `keep` (a source row) when
+ * it is still shown. The data itself never moves. */
+static void view_rebuild(TableView *tv, size_t keep) {
+    TblSheet *t = &tv->sheets[tv->cur];
+    for (int i = tv->nfilt - 1; i >= 0; i--)    /* filters off the sheet */
+        if (tv->filt[i].col < 0 || tv->filt[i].col >= t->ncols) filter_drop(tv, i);
+    bool filt = tv->nfilt > 0;
+    sort_prune(tv, t);
+    bool sort = tv->nsort > 0;
+
+    free(t->perm); t->perm = NULL;
+    t->nview = t->nrows;
+    if (filt || sort) {
+        t->perm = malloc((t->nrows + 1) * sizeof *t->perm);
+        if (!t->perm) { filter_reset(tv); tv->nsort = 0; }
+    }
+    if (t->perm) {
+        size_t n = 0;
+        for (size_t r = 0; r < t->nrows; r++)
+            if (!filt || row_kept(tv, t, r, -1)) t->perm[n++] = r;
+        t->nview = n;
+        if (sort && n > 1) {
+            g_st = t; g_stv = tv;
+            qsort(t->perm, n, sizeof *t->perm, sort_cmp);
+        }
+    }
+
+    if (!t->perm) {
+        tv->row = keep < t->nrows ? keep : (t->nrows ? t->nrows - 1 : 0);
+        return;
+    }
+    tv->row = 0;
+    for (size_t r = 0; r < t->nview; r++) if (t->perm[r] == keep) { tv->row = r; return; }
+    tv->scroll_row = 0;
+}
+
+/* Sorts the current sheet's display order on `col` too (dir 1 = ascending,
+ * -1 = descending, 0 = no longer on this column; col -1 = back to the
+ * source order), keeping the cursor on the same record. A column already
+ * sorted keeps its rank, a new one becomes the last key. */
 void tbl_sort(TableView *tv, int col, int dir) {
     if (!tv || tv->cur >= tv->nsheets) return;
     TblSheet *t = &tv->sheets[tv->cur];
     size_t keep = tbl_phys_row(t, tv->row);
-    if (dir == 0 || col < 0 || col >= t->ncols || t->nrows < 1) {
-        free(t->perm); t->perm = NULL;
-        tv->sort_col = -1; tv->sort_dir = 0;
-    } else {
-        if (!t->perm) t->perm = malloc((t->nrows + 1) * sizeof *t->perm);
-        if (!t->perm) return;
-        for (size_t r = 0; r < t->nrows; r++) t->perm[r] = r;
-        g_st = t; g_sc = col; g_sd = dir; g_snum = t->numeric[col];
-        qsort(t->perm, t->nrows, sizeof *t->perm, sort_cmp);
-        tv->sort_col = col; tv->sort_dir = dir;
+    int k = tbl_sort_key(tv, col);
+    if (col < 0) {
+        tv->nsort = 0;
+    } else if (k >= 0) {
+        tv->sort[k].dir = dir;                   /* 0: pruned by view_rebuild */
+    } else if (dir) {
+        if (tv->nsort >= TABLE_MAX_SORT) {
+            snprintf(E_notify, sizeof E_notify, "Sort: %d columns at most (S clears)", TABLE_MAX_SORT);
+            return;
+        }
+        tv->sort[tv->nsort].col = col;
+        tv->sort[tv->nsort].dir = dir;
+        tv->nsort++;
     }
-    tv->row = keep;
-    if (t->perm)
-        for (size_t r = 0; r < t->nrows; r++) if (t->perm[r] == keep) { tv->row = r; break; }
+    view_rebuild(tv, keep);
 }
 
-/* 's' in the grid: ascending -> descending -> source order. */
+static void filter_reset(TableView *tv) {
+    while (tv->nfilt > 0) filter_drop(tv, tv->nfilt - 1);
+}
+
+/* Replaces the filter of `col` (keeping its place among the filters, a
+ * new one goes last); the values are copied. */
+void tbl_filter(TableView *tv, int col, const char *const *vals, int nvals, bool missing) {
+    if (!tv) return;
+    if (col < 0) filter_reset(tv);
+    if (tv->cur >= tv->nsheets) return;
+    TblSheet *t = &tv->sheets[tv->cur];
+    size_t keep = tbl_phys_row(t, tv->row);
+    int i = col >= 0 ? tbl_filter_index(tv, col) : -1;
+    if (col >= 0 && col < t->ncols && (nvals > 0 || missing)) {
+        if (i < 0 && tv->nfilt >= TABLE_MAX_FILT) {
+            snprintf(E_notify, sizeof E_notify, "Filter: %d columns at most (F clears)", TABLE_MAX_FILT);
+            return;
+        }
+        TblFilter f = { .col = col, .missing = missing };
+        f.vals = malloc((size_t)(nvals > 0 ? nvals : 1) * sizeof *f.vals);
+        bool ok = f.vals != NULL;
+        for (int k = 0; ok && k < nvals; k++) {
+            if (!vals[k]) continue;                /* missing goes by the flag */
+            f.vals[f.nvals] = strdup(vals[k]);
+            if (f.vals[f.nvals]) f.nvals++; else ok = false;
+        }
+        if (!ok) {
+            filter_free(&f);
+            snprintf(E_notify, sizeof E_notify, "Filter: out of memory");
+            return;
+        }
+        qsort(f.vals, (size_t)f.nvals, sizeof *f.vals, str_cmp_p);
+        if (i >= 0) { filter_free(&tv->filt[i]); tv->filt[i] = f; }
+        else        tv->filt[tv->nfilt++] = f;
+    } else if (i >= 0) {
+        filter_drop(tv, i);
+    }
+    view_rebuild(tv, keep);
+}
+
+/* 's' in the grid: the column joins the sort ascending -> descending ->
+ * leaves it; the other sorted columns stay. */
 void tbl_sort_cycle(TableView *tv) {
     if (!tv || tv->nsheets == 0) return;
-    if (tv->sort_col != tv->col)  tbl_sort(tv, tv->col, 1);
-    else if (tv->sort_dir == 1)   tbl_sort(tv, tv->col, -1);
-    else                          tbl_sort(tv, -1, 0);
+    int k = tbl_sort_key(tv, tv->col);
+    if (k < 0)                     tbl_sort(tv, tv->col, 1);
+    else if (tv->sort[k].dir == 1) tbl_sort(tv, tv->col, -1);
+    else                           tbl_sort(tv, tv->col, 0);
 }
 
 /* ─── Pane glue ────────────────────────────────────────────────── */
@@ -1561,17 +1541,17 @@ bool pane_table_enter(Pane *p) {
     int    cur = tv->cur, col = tv->col;
     size_t row = tv->row;
     size_t phys = (cur < tv->nsheets) ? tbl_phys_row(&tv->sheets[cur], row) : row;
-    int    scol = tv->sort_col, sdir = tv->sort_dir;
+    TblSortKey skeys[TABLE_MAX_SORT];
+    int    nsort = tv->nsort;
+    memcpy(skeys, tv->sort, sizeof skeys);
     bool ok;
 
     if (p->hex_mode && p->hex) {
         if (tbl_is_sqlite(p->hex->data, p->hex->data_len))
             ok = tbl_load_sqlite(tv, p->hex->filename);
-        else {
+        else
             ok = tbl_load_text(tv, p->hex->filename, (const char *)p->hex->data,
                                p->hex->data_len, LANG_NONE);
-            tv->from_hex = true;
-        }
     } else {
         unsigned char magic[16];
         size_t blen = gb_len(p->buf);
@@ -1581,7 +1561,6 @@ bool pane_table_enter(Pane *p) {
         } else {
             char *s = gb_to_str(p->buf);
             ok = tbl_load_text(tv, p->filename, s, blen, p->lang);
-            tv->from_hex = false;
             free(s);
         }
     }
@@ -1589,14 +1568,17 @@ bool pane_table_enter(Pane *p) {
         snprintf(E_notify, sizeof E_notify, "Table view: %s", tv->err);
         return false;
     }
-    tv->sort_col = -1; tv->sort_dir = 0;
     if (cur < tv->nsheets) {
+        /* same sheet again: the sort and the filters stay */
         tv->cur = cur;
         const TblSheet *t = &tv->sheets[cur];
-        tv->row = t->nrows ? (phys < t->nrows ? phys : t->nrows - 1) : 0;
         tv->col = col < t->ncols ? col : t->ncols - 1;
-        if (scol >= 0 && scol < t->ncols) tbl_sort(tv, scol, sdir);
+        memcpy(tv->sort, skeys, sizeof skeys);
+        tv->nsort = nsort;
+        view_rebuild(tv, phys);
     } else {
+        tv->nsort = 0;
+        filter_reset(tv);
         tv->cur = 0; tv->row = 0; tv->col = 0;
     }
     tv->scroll_row = 0; tv->scroll_col = 0;
@@ -1604,200 +1586,12 @@ bool pane_table_enter(Pane *p) {
     return true;
 }
 
-/* ─── Editing ──────────────────────────────────────────────────── */
-
-bool tbl_cell_editable(const TableView *tv, char *why, size_t why_sz) {
-    why[0] = '\0';
-    if (!tv || tv->nsheets == 0) { snprintf(why, why_sz, "No table"); return false; }
-    const TblSheet *t = &tv->sheets[tv->cur];
-    if (t->nrows == 0) { snprintf(why, why_sz, "No row to edit"); return false; }
-    size_t pr = tbl_phys_row(t, tv->row);
-    if (tv->sqlite) {
-        if (!t->rowid) {
-            snprintf(why, why_sz, "%.100s has no rowid (view / WITHOUT ROWID): read-only", t->name);
-            return false;
-        }
-        return true;
-    }
-    if (tv->from_hex) {
-        snprintf(why, why_sz, "Leave the hex view (F2) to edit cells");
-        return false;
-    }
-    if (!t->span || t->span[pr * (size_t)t->ncols + (size_t)tv->col].kind == SPK_NONE) {
-        snprintf(why, why_sz, "This cell is not in the source text (missing or computed): read-only");
-        return false;
-    }
-    return true;
-}
-
-static void str_puts(Str *b, const char *s) { while (*s) str_putc(b, *s++); }
-
-static void enc_csv(Str *o, const char *v, char d) {
-    bool q = false;
-    for (const char *c = v; *c; c++)
-        if (*c == d || *c == '"' || *c == '\n' || *c == '\r') { q = true; break; }
-    if (!q) { str_puts(o, v); return; }
-    str_putc(o, '"');
-    for (const char *c = v; *c; c++) { if (*c == '"') str_putc(o, '"'); str_putc(o, *c); }
-    str_putc(o, '"');
-}
-
-static void enc_json_str(Str *o, const char *v) {
-    str_putc(o, '"');
-    for (const unsigned char *c = (const unsigned char *)v; *c; c++) {
-        switch (*c) {
-            case '"':  str_puts(o, "\\\""); break;
-            case '\\': str_puts(o, "\\\\"); break;
-            case '\n': str_puts(o, "\\n");  break;
-            case '\r': str_puts(o, "\\r");  break;
-            case '\t': str_puts(o, "\\t");  break;
-            case '\b': str_puts(o, "\\b");  break;
-            case '\f': str_puts(o, "\\f");  break;
-            default:
-                if (*c < 0x20) { char u[8]; snprintf(u, sizeof u, "\\u%04x", *c); str_puts(o, u); }
-                else str_putc(o, (char)*c);
-        }
-    }
-    str_putc(o, '"');
-}
-
-/* Is `v` a complete JSON value (number, literal, array, object, string)? */
-static bool json_valid(const char *v) {
-    TableView *tmp = tbl_new();
-    tmp->arena = arena_new(1 << 12);
-    Loader L = { .tv = tmp };
-    JP p = { .L = &L, .s = v, .len = strlen(v) };
-    JVal *r = jp_value(&p);
-    jp_ws(&p);
-    bool ok = r && !p.err && p.i == p.len;
-    ld_free(&L);
-    tbl_free(tmp);
-    return ok;
-}
-
-static bool sql_number(const char *v) {
-    if (!*v) return false;
-    char *end;
-    strtod(v, &end);
-    return *end == '\0' && !isspace((unsigned char)v[0]);
-}
-
-static void enc_sql(Str *o, const char *v) {
-    if (!strcasecmp(v, "NULL") || sql_number(v)) { str_puts(o, v); return; }
-    str_putc(o, '\'');
-    for (const char *c = v; *c; c++) { if (*c == '\'') str_putc(o, '\''); str_putc(o, *c); }
-    str_putc(o, '\'');
-}
-
-static void enc_copy(Str *o, const char *v) {
-    if (!strcmp(v, "NULL")) { str_puts(o, "\\N"); return; }
-    for (const char *c = v; *c; c++) {
-        switch (*c) {
-            case '\\': str_puts(o, "\\\\"); break;
-            case '\t': str_puts(o, "\\t");  break;
-            case '\n': str_puts(o, "\\n");  break;
-            case '\r': str_puts(o, "\\r");  break;
-            default:   str_putc(o, *c);
-        }
-    }
-}
-
-/* Markdown / ASCII tables: pipes escaped, padded back to the old width
- * so a hand-aligned table stays aligned when the value gets shorter. */
-static void enc_md(Str *o, const char *v, size_t old_len) {
-    for (const char *c = v; *c; c++) {
-        if (*c == '|') str_puts(o, "\\|");
-        else if (*c == '\n' || *c == '\r') str_putc(o, ' ');
-        else str_putc(o, *c);
-    }
-    while (o->n < old_len) str_putc(o, ' ');
-}
-
-static bool sqlite_update(TableView *tv, const TblSheet *t, size_t pr, int c,
-                          const char *val, char *err, size_t esz) {
-    char qt[512], qc[512];
-    sql_quote(qt, sizeof qt, t->name, '"');
-    sql_quote(qc, sizeof qc, t->hdr[c], '"');
-    Str lit = {0};
-    if (!strcasecmp(val, "NULL")) str_puts(&lit, "NULL");
-    else {
-        str_putc(&lit, '\'');
-        for (const char *k = val; *k; k++) { if (*k == '\'') str_putc(&lit, '\''); str_putc(&lit, *k); }
-        str_putc(&lit, '\'');
-    }
-    str_putc(&lit, '\0');
-    size_t qsz = lit.n + 1200;
-    char *sql = malloc(qsz);
-    snprintf(sql, qsz, "UPDATE %s SET %s = %s WHERE rowid = %lld;", qt, qc, lit.s, t->rowid[pr]);
-    char *argv[] = { "sqlite3", "-batch", tv->path, sql, NULL };
-    char *out; size_t olen;
-    int rc = run_capture(argv, &out, &olen);
-    free(out); free(sql); free(lit.s);
-    if (rc == 127) { snprintf(err, esz, "sqlite3 not found"); return false; }
-    if (rc != 0)   { snprintf(err, esz, "sqlite3 refused the update (locked or read-only?)"); return false; }
-    return true;
-}
-
-/* Writes `value` into the current cell. Text sources are patched in the
- * buffer at the cell's exact source position (undoable, saved with ^S);
- * SQLite tables get an UPDATE ... WHERE rowid. The grid is then rebuilt. */
-bool pane_table_edit(Pane *p, const char *value) {
-    TableView *tv = p->table;
-    char why[192];
-    if (!tbl_cell_editable(tv, why, sizeof why)) {
-        snprintf(E_notify, sizeof E_notify, "%s", why);
-        return false;
-    }
-    const TblSheet *t = &tv->sheets[tv->cur];
-    size_t pr = tbl_phys_row(t, tv->row);
-    size_t k  = pr * (size_t)t->ncols + (size_t)tv->col;
-    const char *old = t->cells[k];
-    if (old && strcmp(old, value) == 0) return true;
-
-    if (tv->sqlite) {
-        if (!sqlite_update(tv, t, pr, tv->col, value, why, sizeof why)) {
-            snprintf(E_notify, sizeof E_notify, "%s", why);
-            return false;
-        }
-        if (p->hex_mode && p->hex) hex_load(p->hex, p->hex->filename);
-        bool ok = pane_table_enter(p);
-        if (ok) snprintf(E_notify, sizeof E_notify, "Row updated in the database");
-        return ok;
-    }
-
-    TblSpan sp = t->span[k];
-    if (sp.off + sp.len > gb_len(p->buf)) {
-        snprintf(E_notify, sizeof E_notify, "Table is out of date: press F6 twice to reload");
-        return false;
-    }
-    Str o = {0};
-    switch (sp.kind) {
-        case SPK_CSV:  enc_csv(&o, value, tv->delim ? tv->delim : ','); break;
-        case SPK_JSTR: enc_json_str(&o, value); break;
-        case SPK_JRAW: if (json_valid(value)) str_puts(&o, value); else enc_json_str(&o, value); break;
-        case SPK_SQL:  enc_sql(&o, value); break;
-        case SPK_COPY: enc_copy(&o, value); break;
-        case SPK_MD:   enc_md(&o, value, sp.len); break;
-        default: break;
-    }
-    pane_push_undo(p);
-    gb_delete(p->buf, sp.off, sp.len);
-    if (o.n) gb_insert_str(p->buf, sp.off, o.s, o.n);
-    free(o.s);
-    p->cursor = sp.off;
-    pane_text_changed(p);
-    bool ok = pane_table_enter(p);
-    if (ok) snprintf(E_notify, sizeof E_notify, "Cell updated  (^S save, ^Z undo)");
-    return ok;
-}
-
 /* ─── Rendering ────────────────────────────────────────────────── */
 
-/* `row` is a display row: it goes through the sort order. */
 const char *tbl_cell(const TableView *tv, size_t row, int col) {
     if (!tv || tv->cur >= tv->nsheets) return NULL;
     const TblSheet *t = &tv->sheets[tv->cur];
-    if (row >= t->nrows || col < 0 || col >= t->ncols) return NULL;
+    if (row >= t->nview || col < 0 || col >= t->ncols) return NULL;
     return t->cells[tbl_phys_row(t, row) * (size_t)t->ncols + (size_t)col];
 }
 
@@ -1845,8 +1639,7 @@ static int cell_pair(const char *s, bool numeric_col) {
 }
 
 static int data_rows(int win_h) {
-    /* tab bar, top border, header, separator, bottom border, legend bar */
-    int r = win_h - 6;
+    int r = win_h - 5;          /* tab bar, top border, header, separator, bottom */
     return r < 1 ? 1 : r;
 }
 
@@ -1856,9 +1649,11 @@ static int gutter_w(const TblSheet *t) {
     return g + 1;
 }
 
-/* Column width as drawn: the sorted column gets room for its arrow. */
+/* Column width as drawn: a sorted / filtered column gets room for its
+ * marker(s) after the header (" ▲", " ▲2" when several columns sort). */
 static int col_width(const TableView *tv, const TblSheet *t, int c) {
-    return t->colw[c] + (c == tv->sort_col ? 2 : 0);
+    int sw = tbl_sort_key(tv, c) < 0 ? 0 : tv->nsort > 1 ? 3 : 2;
+    return t->colw[c] + sw + (tbl_filter_index(tv, c) >= 0 ? 2 : 0);
 }
 #define CW(c) col_width(tv, t, (c))
 
@@ -1874,47 +1669,143 @@ static void fit_cols(TableView *tv, const TblSheet *t, int win_w) {
     }
 }
 
-/* Fixed bar at the bottom of the grid: always names the current column
- * (whatever the horizontal scroll), its type and sort, then the whole
- * value of the current cell. */
-static void render_legend(const TableView *tv, const TblSheet *t, WINDOW *win, int y, int win_w) {
-    if (y < 2) return;
-    wmove(win, y, 0);
-    wclrtoeol(win);
-    if (t->ncols == 0) return;
+/* ─── Column filter dropdown ('f') ─────────────────────────────── */
 
-    char buf[384];
-    int x = 0;
-    snprintf(buf, sizeof buf, " %s ", t->hdr[tv->col] ? t->hdr[tv->col] : "");
-    int w = disp_width(buf);
-    if (w > win_w / 2) w = win_w / 2;
-    wattron(win, COLOR_PAIR(COLOR_PAIR_SELECTION) | A_BOLD);
-    draw_text(win, y, x, buf, w, false);
-    wattroff(win, COLOR_PAIR(COLOR_PAIR_SELECTION) | A_BOLD);
-    x += w;
+static const char *menu_label(const TblValue *v) {
+    return !v->val ? "(missing)" : !v->val[0] ? "(empty)" : v->val;
+}
 
-    char edit_why[192];
-    bool editable = tbl_cell_editable(tv, edit_why, sizeof edit_why);
-    snprintf(buf, sizeof buf, " %d/%d · %s%s · %s ",
-             tv->col + 1, t->ncols, t->numeric[tv->col] ? "number" : "text",
-             tv->sort_col == tv->col ? (tv->sort_dir > 0 ? " · sorted ▲" : " · sorted ▼") : "",
-             editable ? "Enter: edit" : "read-only");
-    w = disp_width(buf);
-    if (x + w > win_w) w = win_w - x;
-    if (w > 0) {
+static bool same_value(const char *a, const char *b) {
+    return a == b || (a && b && strcmp(a, b) == 0);
+}
+
+/* Where the dropdown goes: hanging from the header of its column (y0 is
+ * its top border), list_h entries tall, inside the pane. */
+static void menu_geom(const TblMenu *m, int win_h, int *y0, int *list_h) {
+    *y0 = 3;
+    if (win_h - *y0 - 3 < 3) *y0 = 1;
+    int h = win_h - *y0 - 3;                   /* top border, search line, bottom border */
+    *list_h = m->nidx < h ? m->nidx : h;
+}
+
+static void render_filter_menu(TableView *tv, const TblSheet *t, WINDOW *win, int win_h, int win_w) {
+    TblMenu *m = &tv->menu;
+    if (m->col < 0 || m->col >= t->ncols || m->nidx < 1) return;
+    int y0, list_h;
+    menu_geom(m, win_h, &y0, &list_h);
+    if (list_h < 1 || win_w < 12) return;
+
+    int cntw = 1;
+    for (size_t n = m->total; n >= 10; n /= 10) cntw++;
+    int lw = m->width;
+    int hw = disp_width(t->hdr[m->col] ? t->hdr[m->col] : "") + 4;
+    if (lw < hw) lw = hw;
+    if (lw < 26) lw = 26;
+    if (lw > 48) lw = 48;
+    int bw = 1 + 3 + lw + 1 + cntw + 1 + 1;    /* border, box, label, count, border */
+    if (bw > win_w) bw = win_w;
+    lw = bw - 7 - cntw;
+
+    int x0 = gutter_w(t);
+    for (int c = tv->scroll_col; c < m->col; c++) x0 += CW(c) + 3;
+    if (x0 + bw > win_w) x0 = win_w - bw;
+    if (x0 < 0) x0 = 0;
+
+    if (m->sel < 0) m->sel = 0;
+    if (m->sel >= m->nidx) m->sel = m->nidx - 1;
+    if (m->sel < m->scroll) m->scroll = m->sel;
+    if (m->sel >= m->scroll + list_h) m->scroll = m->sel - list_h + 1;
+    if (m->scroll > m->nidx - list_h) m->scroll = m->nidx - list_h;
+    if (m->scroll < 0) m->scroll = 0;
+
+    int yb = y0 + list_h + 2;                  /* bottom border */
+    char buf[160];
+
+    /* frame */
+    wattron(win, COLOR_PAIR(COLOR_PAIR_ACTIVE_BORDER));
+    put_ch(win, y0, x0, ACS_ULCORNER);
+    put_ch(win, yb, x0, ACS_LLCORNER);
+    for (int i = 1; i < bw - 1; i++) { put_ch(win, y0, x0 + i, ACS_HLINE); put_ch(win, yb, x0 + i, ACS_HLINE); }
+    put_ch(win, y0, x0 + bw - 1, ACS_URCORNER);
+    put_ch(win, yb, x0 + bw - 1, ACS_LRCORNER);
+    for (int y = y0 + 1; y < yb; y++) { put_ch(win, y, x0, ACS_VLINE); put_ch(win, y, x0 + bw - 1, ACS_VLINE); }
+    wattroff(win, COLOR_PAIR(COLOR_PAIR_ACTIVE_BORDER));
+
+    snprintf(buf, sizeof buf, " %s ", t->hdr[m->col] ? t->hdr[m->col] : "");
+    int tw = disp_width(buf);
+    if (tw > bw - 4) tw = bw - 4;
+    wattron(win, COLOR_PAIR(COLOR_PAIR_TITLE) | A_BOLD);
+    draw_text(win, y0, x0 + 2, buf, tw, false);
+    wattroff(win, COLOR_PAIR(COLOR_PAIR_TITLE) | A_BOLD);
+    snprintf(buf, sizeof buf, " %d value%s ", m->nvals, m->nvals == 1 ? "" : "s");
+    int cw = disp_width(buf);
+    if (2 + tw + cw + 2 <= bw) {
         wattron(win, COLOR_PAIR(COLOR_PAIR_COMMENT));
-        draw_text(win, y, x, buf, w, false);
+        draw_text(win, y0, x0 + bw - 2 - cw, buf, cw, false);
         wattroff(win, COLOR_PAIR(COLOR_PAIR_COMMENT));
-        x += w;
     }
-    if (x + 4 < win_w && t->nrows) {
-        const char *v = tbl_cell(tv, tv->row, tv->col);
-        wattron(win, COLOR_PAIR(COLOR_PAIR_LINENUM));
-        put_ch(win, y, x, ACS_VLINE);
-        wattroff(win, COLOR_PAIR(COLOR_PAIR_LINENUM));
-        wattron(win, COLOR_PAIR(v ? COLOR_PAIR_NORMAL : COLOR_PAIR_COMMENT) | A_BOLD);
-        draw_text(win, y, x + 2, v ? v : "(missing)", win_w - x - 2, false);
-        wattroff(win, COLOR_PAIR(v ? COLOR_PAIR_NORMAL : COLOR_PAIR_COMMENT) | A_BOLD);
+
+    /* search line: what was typed, or how to type */
+    put_ch(win, y0 + 1, x0 + 1, ' ');
+    if (m->q[0]) {
+        snprintf(buf, sizeof buf, "> %s_", m->q);
+        wattron(win, COLOR_PAIR(COLOR_PAIR_STRING) | A_BOLD);
+        draw_text(win, y0 + 1, x0 + 2, buf, bw - 4, false);
+        wattroff(win, COLOR_PAIR(COLOR_PAIR_STRING) | A_BOLD);
+    } else {
+        wattron(win, COLOR_PAIR(COLOR_PAIR_COMMENT));
+        draw_text(win, y0 + 1, x0 + 2, "> type to search", bw - 4, false);
+        wattroff(win, COLOR_PAIR(COLOR_PAIR_COMMENT));
+    }
+    put_ch(win, y0 + 1, x0 + bw - 2, ' ');
+
+    /* "(all)" box: every entry shown ticked, some, or none */
+    int n_on = 0;
+    for (int i = 1; i < m->nidx; i++) n_on += m->on[m->idx[i]];
+    const char *all_box = n_on == 0 ? "[ ]" : n_on == m->nidx - 1 ? "[x]" : "[-]";
+
+    /* entries: counts are the rows the other columns' filters leave, so
+     * they follow what the grid can show */
+    for (int r = 0; r < list_h; r++) {
+        int i = m->scroll + r;
+        int y = y0 + 2 + r;
+        if (i >= m->nidx) break;
+        int e = m->idx[i];
+        bool sel = i == m->sel;
+        const char *label = e < 0 ? "(all)" : menu_label(&m->vals[e]);
+        size_t count = e < 0 ? m->total : m->vals[e].count;
+        const char *box = e < 0 ? all_box : m->on[e] ? "[x]" : "[ ]";
+        bool special = e < 0 || !m->vals[e].val || !m->vals[e].val[0];
+        int base = sel ? A_REVERSE | A_BOLD : 0;
+
+        wattron(win, COLOR_PAIR(COLOR_PAIR_STRING) | base);
+        draw_text(win, y, x0 + 1, box, 3, false);
+        wattroff(win, COLOR_PAIR(COLOR_PAIR_STRING) | base);
+        wattron(win, COLOR_PAIR(special ? COLOR_PAIR_COMMENT : COLOR_PAIR_NORMAL) | base);
+        draw_text(win, y, x0 + 4, label, lw + 1, false);
+        wattroff(win, COLOR_PAIR(special ? COLOR_PAIR_COMMENT : COLOR_PAIR_NORMAL) | base);
+        snprintf(buf, sizeof buf, "%zu ", count);
+        wattron(win, COLOR_PAIR(COLOR_PAIR_LINENUM) | base);
+        draw_text(win, y, x0 + 5 + lw, buf, cntw + 1, true);
+        wattroff(win, COLOR_PAIR(COLOR_PAIR_LINENUM) | base);
+    }
+
+    /* bottom border: keys, and the position in a long list */
+    const char *help = " Space:tick  Enter:apply  Esc ";
+    int hw2 = disp_width(help);
+    if (hw2 + 4 <= bw) {
+        wattron(win, COLOR_PAIR(COLOR_PAIR_COMMENT));
+        draw_text(win, yb, x0 + 2, help, hw2, false);
+        wattroff(win, COLOR_PAIR(COLOR_PAIR_COMMENT));
+    }
+    if (m->nidx > list_h) {
+        snprintf(buf, sizeof buf, " %d/%d ", m->sel + 1, m->nidx);
+        int pw = disp_width(buf);
+        if (hw2 + pw + 5 <= bw) {
+            wattron(win, COLOR_PAIR(COLOR_PAIR_COMMENT));
+            draw_text(win, yb, x0 + bw - 2 - pw, buf, pw, false);
+            wattroff(win, COLOR_PAIR(COLOR_PAIR_COMMENT));
+        }
     }
 }
 
@@ -1934,7 +1825,10 @@ void tbl_render(TableView *tv, WINDOW *win, int win_h, int win_w) {
     x += disp_width(tab);
     for (int i = 0; i < tv->nsheets && x < win_w; i++) {
         const TblSheet *s = &tv->sheets[i];
-        snprintf(tab, sizeof tab, " %s (%zu%s) ", s->name, s->nrows, s->truncated ? "+" : "");
+        if (i == tv->cur && s->nview != s->nrows)
+            snprintf(tab, sizeof tab, " %s (%zu/%zu%s) ", s->name, s->nview, s->nrows, s->truncated ? "+" : "");
+        else
+            snprintf(tab, sizeof tab, " %s (%zu%s) ", s->name, s->nrows, s->truncated ? "+" : "");
         if (i == tv->cur) wattron(win, A_REVERSE | A_BOLD);
         draw_text(win, 0, x, tab, disp_width(tab), false);
         if (i == tv->cur) wattroff(win, A_REVERSE | A_BOLD);
@@ -1952,10 +1846,12 @@ void tbl_render(TableView *tv, WINDOW *win, int win_h, int win_w) {
 
     const TblSheet *t = &tv->sheets[tv->cur];
     int nr = data_rows(win_h);
-    if (t->nrows) {
-        if (tv->row >= t->nrows) tv->row = t->nrows - 1;
+    if (t->nview) {
+        if (tv->row >= t->nview) tv->row = t->nview - 1;
         if (tv->row < tv->scroll_row) tv->scroll_row = tv->row;
         if (tv->row >= tv->scroll_row + (size_t)nr) tv->scroll_row = tv->row - (size_t)nr + 1;
+    } else {
+        tv->row = tv->scroll_row = 0;
     }
     fit_cols(tv, t, win_w);
 
@@ -1966,7 +1862,7 @@ void tbl_render(TableView *tv, WINDOW *win, int win_h, int win_w) {
         for (int c = tv->scroll_col; c < t->ncols && x < win_w; c++) { x += CW(c) + 3; last_c = c; }
     }
 
-    size_t shown = t->nrows - tv->scroll_row < (size_t)nr ? t->nrows - tv->scroll_row : (size_t)nr;
+    size_t shown = t->nview - tv->scroll_row < (size_t)nr ? t->nview - tv->scroll_row : (size_t)nr;
 
     /* horizontal rules: top, below the header, bottom */
     int rule_y[3] = { 1, 3, 4 + (int)shown };
@@ -2013,15 +1909,24 @@ void tbl_render(TableView *tv, WINDOW *win, int win_h, int win_w) {
             int attr;
             bool right_al = t->numeric[c];
             if (r < 0) {
+                bool fc = tbl_filter_index(tv, c) >= 0;
                 s    = t->hdr[c];
-                attr = COLOR_PAIR(c == tv->col ? COLOR_PAIR_SELECTION : COLOR_PAIR_KEYWORD) | A_BOLD;
+                attr = COLOR_PAIR(c == tv->col ? COLOR_PAIR_SELECTION
+                                  : fc ? COLOR_PAIR_STRING : COLOR_PAIR_KEYWORD) | A_BOLD;
                 right_al = false;
-                if (c == tv->sort_col) {
-                    /* sorted column: arrow pinned to the right of the header */
+                int sk = tbl_sort_key(tv, c);
+                if (sk >= 0 || fc) {
+                    /* sorted / filtered column: markers pinned to the
+                     * right of the header, with the key's rank when
+                     * several columns sort */
                     wattron(win, attr);
                     put_ch(win, y, x + 1, ' ');
                     draw_text(win, y, x + 2, s ? s : "", t->colw[c], false);
-                    waddstr(win, tv->sort_dir > 0 ? " ▲" : " ▼");
+                    if (fc) waddstr(win, " ≡");
+                    if (sk >= 0) {
+                        waddstr(win, tv->sort[sk].dir > 0 ? " ▲" : " ▼");
+                        if (tv->nsort > 1) wprintw(win, "%d", sk + 1);
+                    }
                     put_ch(win, y, x + 2 + CW(c), ' ');
                     wattroff(win, attr);
                     x += CW(c) + 3;
@@ -2048,25 +1953,50 @@ void tbl_render(TableView *tv, WINDOW *win, int win_h, int win_w) {
         }
     }
 
-    if (t->nrows == 0 && 4 < win_h) {
+    if (t->nview == 0 && 4 < win_h) {
         wattron(win, COLOR_PAIR(COLOR_PAIR_COMMENT));
-        mvwaddnstr(win, 5 < win_h ? 5 : 4, gw + 2, "(no rows)", win_w - gw - 2);
+        mvwaddnstr(win, 5 < win_h ? 5 : 4, gw + 2,
+                   t->nrows ? "(no row left by the filters: F shows them all)" : "(no rows)",
+                   win_w - gw - 2);
         wattroff(win, COLOR_PAIR(COLOR_PAIR_COMMENT));
     }
-    render_legend(tv, t, win, win_h - 1, win_w);
+    if (tv->menu.open) render_filter_menu(tv, t, win, win_h, win_w);
     wnoutrefresh(win);
 }
 
 void tbl_status(const TableView *tv, char *out, size_t out_sz) {
     if (!tv || tv->nsheets == 0) { snprintf(out, out_sz, " [TABLE] no data "); return; }
     const TblSheet *t = &tv->sheets[tv->cur];
-    char sort[96] = "";
-    if (tv->sort_col >= 0 && tv->sort_col < t->ncols)
-        snprintf(sort, sizeof sort, "  sort: %.40s %s", t->hdr[tv->sort_col],
-                 tv->sort_dir > 0 ? "▲" : "▼");
-    snprintf(out, out_sz, " Row %zu/%zu%s  Col %d/%d  [%s]  %.60s  |  %.40s%s ",
-             t->nrows ? tv->row + 1 : 0, t->nrows, t->truncated ? "+" : "",
-             tv->col + 1, t->ncols, tv->fmt, t->name, t->hdr[tv->col], sort);
+    char sort[160] = "";
+    for (int k = 0, n = 0; k < tv->nsort; k++) {
+        int c = tv->sort[k].col;
+        if (c < 0 || c >= t->ncols) continue;
+        size_t len = strlen(sort);
+        snprintf(sort + len, sizeof sort - len, "%s%.*s %s", n++ ? ", " : "  sort: ",
+                 tv->nsort > 1 ? 16 : 40, t->hdr[c] ? t->hdr[c] : "",
+                 tv->sort[k].dir > 0 ? "▲" : "▼");
+    }
+    char filt[192] = "";
+    for (int i = 0; i < tv->nfilt; i++) {
+        const TblFilter *f = &tv->filt[i];
+        if (f->col < 0 || f->col >= t->ncols) continue;
+        char what[64];
+        if (f->nvals + f->missing == 1)
+            snprintf(what, sizeof what, "%.30s",
+                     f->missing ? "(missing)" : f->vals[0][0] ? f->vals[0] : "(empty)");
+        else
+            snprintf(what, sizeof what, "%d values", f->nvals + f->missing);
+        size_t len = strlen(filt);
+        snprintf(filt + len, sizeof filt - len, "%s%.*s = %s", filt[0] ? ", " : "  filter: ",
+                 tv->nfilt > 1 ? 16 : 30, t->hdr[f->col] ? t->hdr[f->col] : "", what);
+    }
+    if (filt[0]) {
+        size_t len = strlen(filt);
+        snprintf(filt + len, sizeof filt - len, " (%zu of %zu)", t->nview, t->nrows);
+    }
+    snprintf(out, out_sz, " Row %zu/%zu%s  Col %d/%d  [%s]  %.60s  |  %.40s%s%s ",
+             t->nview ? tv->row + 1 : 0, t->nview, t->truncated ? "+" : "",
+             tv->col + 1, t->ncols, tv->fmt, t->name, t->hdr[tv->col], sort, filt);
 }
 
 /* ─── Keys & search ────────────────────────────────────────────── */
@@ -2074,6 +2004,7 @@ void tbl_status(const TableView *tv, char *out, size_t out_sz) {
 static void sheet_switch(TableView *tv, int d) {
     if (tv->nsheets < 2) return;
     tbl_sort(tv, -1, 0);
+    tbl_filter(tv, -1, NULL, 0, false);
     tv->cur = (tv->cur + d + tv->nsheets) % tv->nsheets;
     tv->row = tv->scroll_row = 0;
     tv->col = tv->scroll_col = 0;
@@ -2083,7 +2014,7 @@ bool tbl_handle_key(TableView *tv, int key, int win_h) {
     if (!tv || tv->nsheets == 0) return false;
     const TblSheet *t = &tv->sheets[tv->cur];
     size_t page = (size_t)data_rows(win_h);
-    size_t last = t->nrows ? t->nrows - 1 : 0;
+    size_t last = t->nview ? t->nview - 1 : 0;
 
     switch (key) {
         case KEY_UP:   case 'k': if (tv->row > 0) tv->row--; break;
@@ -2100,18 +2031,200 @@ bool tbl_handle_key(TableView *tv, int key, int win_h) {
         case KEY_BTAB: case '[': sheet_switch(tv, -1); break;
         case 's': tbl_sort_cycle(tv); break;
         case 'S': tbl_sort(tv, -1, 0); break;
+        case 'f': tbl_filter_menu_open(tv); break;
+        case 'F': tbl_filter(tv, -1, NULL, 0, false); break;
         default: return false;
     }
     return true;
 }
 
-bool tbl_search(TableView *tv, const char *query, bool forward) {
-    if (!tv || !query || !query[0] || tv->nsheets == 0) return false;
-    char q[sizeof tv->search];                 /* query may be tv->search itself */
-    snprintf(q, sizeof q, "%s", query);
-    memcpy(tv->search, q, sizeof q);
+/* ─── Column filter dropdown: building and keys ────────────────── */
+
+/* Distinct values sort like the column does; equal-looking values
+ * ("7" and "007", "" and NULL) still end up next to their twins. */
+static int distinct_cmp(const void *pa, const void *pb) {
+    const char *x = *(const char *const *)pa, *y = *(const char *const *)pb;
+    int r = value_cmp(x, y);
+    if (r) return r;
+    if (!x || !y) return (x == NULL) - (y == NULL);   /* missing last */
+    return strcmp(x, y);
+}
+
+/* Entries matching what was typed; "(all)" always stays on top. */
+static void menu_refilter(TblMenu *m) {
+    m->nidx = 0;
+    m->idx[m->nidx++] = -1;
+    for (int i = 0; i < m->nvals; i++)
+        if (!m->q[0] || strcasestr(menu_label(&m->vals[i]), m->q)) m->idx[m->nidx++] = i;
+    m->sel    = (m->q[0] && m->nidx > 1) ? 1 : 0;
+    m->scroll = 0;
+}
+
+static void menu_close(TblMenu *m) {
+    free(m->vals); free(m->idx); free(m->on);
+    memset(m, 0, sizeof *m);
+}
+
+/* 'f' in the grid: the dropdown of the values of the current column in
+ * the rows the other columns' filters leave, each with its row count and
+ * a box ticked when the column's filter keeps it (every box without a
+ * filter). It opens on the first ticked value, or else on the current
+ * cell's. */
+void tbl_filter_menu_open(TableView *tv) {
+    if (!tv || tv->cur >= tv->nsheets) return;
     const TblSheet *t = &tv->sheets[tv->cur];
-    size_t total = t->nrows * (size_t)t->ncols;
+    if (t->ncols == 0) return;
+    TblMenu *m = &tv->menu;
+    menu_close(m);
+
+    int    c  = tv->col;
+    size_t nc = (size_t)t->ncols;
+    const char **v = malloc((t->nrows + 1) * sizeof *v);
+    m->vals = malloc((t->nrows + 1) * sizeof *m->vals);
+    m->idx  = malloc((t->nrows + 2) * sizeof *m->idx);
+    m->on   = malloc((t->nrows + 1) * sizeof *m->on);
+    if (!v || !m->vals || !m->idx || !m->on) {
+        free(v); menu_close(m);
+        snprintf(E_notify, sizeof E_notify, "Filter: out of memory");
+        return;
+    }
+    size_t nv = 0;
+    for (size_t r = 0; r < t->nrows; r++)
+        if (row_kept(tv, t, r, c)) v[nv++] = t->cells[r * nc + (size_t)c];
+    m->total = nv;
+    g_snum = t->numeric[c];
+    qsort(v, nv, sizeof *v, distinct_cmp);
+    int n = 0;
+    for (size_t r = 0; r < nv; r++) {
+        if (n && same_value(v[r], m->vals[n - 1].val)) { m->vals[n - 1].count++; continue; }
+        m->vals[n].val   = v[r];
+        m->vals[n].count = 1;
+        int w = disp_width(menu_label(&m->vals[n]));
+        if (w > m->width) m->width = w;
+        n++;
+    }
+    free(v);
+    m->nvals = n;
+    m->col   = c;
+    m->open  = true;
+    int fi = tbl_filter_index(tv, c);
+    for (int i = 0; i < n; i++) m->on[i] = fi < 0 || filter_pass(&tv->filt[fi], m->vals[i].val);
+    menu_refilter(m);
+
+    if (fi >= 0) {
+        for (int i = 1; i < m->nidx; i++) if (m->on[m->idx[i]]) { m->sel = i; break; }
+    } else if (t->nview) {
+        const char *cur = tbl_cell(tv, tv->row, c);
+        for (int i = 1; i < m->nidx; i++) {
+            const char *val = m->vals[m->idx[i]].val;
+            if (cur == NULL ? val == NULL : (val && same_value(val, cur))) { m->sel = i; break; }
+        }
+    }
+}
+
+/* Enter in the dropdown. Nothing ticked or unticked yet: keeps only the
+ * highlighted value ("(all)": drops the column's filter). Otherwise
+ * keeps the ticked values; all of them ticked drops the filter. Returns
+ * false when nothing is ticked (the dropdown stays open). */
+static bool menu_apply(TableView *tv) {
+    TblMenu *m = &tv->menu;
+    if (!m->touched) {
+        int e = (m->sel >= 0 && m->sel < m->nidx) ? m->idx[m->sel] : -1;
+        if (e < 0) tbl_filter(tv, m->col, NULL, 0, false);
+        else       tbl_filter(tv, m->col, &m->vals[e].val, 1, m->vals[e].val == NULL);
+        return true;
+    }
+    int  n_on = 0;
+    bool missing = false;
+    for (int i = 0; i < m->nvals; i++) if (m->on[i]) n_on++;
+    if (n_on == 0) {
+        snprintf(E_notify, sizeof E_notify, "Filter: tick at least one value (Space)");
+        return false;
+    }
+    if (n_on == m->nvals) { tbl_filter(tv, m->col, NULL, 0, false); return true; }
+    const char **keep = malloc((size_t)n_on * sizeof *keep);
+    if (!keep) { snprintf(E_notify, sizeof E_notify, "Filter: out of memory"); return true; }
+    int k = 0;
+    for (int i = 0; i < m->nvals; i++) {
+        if (!m->on[i]) continue;
+        if (m->vals[i].val) keep[k++] = m->vals[i].val;
+        else                missing = true;
+    }
+    tbl_filter(tv, m->col, keep, k, missing);
+    free(keep);
+    return true;
+}
+
+/* Keys while the dropdown is open: it takes them all. */
+bool tbl_filter_menu_key(TableView *tv, int key, int win_h) {
+    TblMenu *m = &tv->menu;
+    if (!m->open) return false;
+    int y0, page;
+    menu_geom(m, win_h, &y0, &page);
+    if (page < 1) page = 1;
+
+    switch (key) {
+        case KEY_UP:    if (m->sel > 0) m->sel--; break;
+        case KEY_DOWN:  if (m->sel + 1 < m->nidx) m->sel++; break;
+        case KEY_PPAGE: m->sel = m->sel > page ? m->sel - page : 0; break;
+        case KEY_NPAGE: m->sel = m->sel + page < m->nidx ? m->sel + page : m->nidx - 1; break;
+        case KEY_HOME:  m->sel = 0; break;
+        case KEY_END:   m->sel = m->nidx - 1; break;
+        case KEY_MOUSE: {
+            MEVENT ev;
+            if (getmouse(&ev) == OK) {
+                if (ev.bstate & BUTTON4_PRESSED) m->sel = m->sel > 3 ? m->sel - 3 : 0;
+                if (ev.bstate & BUTTON5_PRESSED) m->sel = m->sel + 3 < m->nidx ? m->sel + 3 : m->nidx - 1;
+            }
+            break;
+        }
+        case ' ': {
+            /* tick / untick; on "(all)", every entry shown at once */
+            int e = (m->sel >= 0 && m->sel < m->nidx) ? m->idx[m->sel] : -1;
+            if (e >= 0) {
+                m->on[e] = !m->on[e];
+            } else {
+                bool all = true;
+                for (int i = 1; i < m->nidx; i++) all = all && m->on[m->idx[i]];
+                for (int i = 1; i < m->nidx; i++) m->on[m->idx[i]] = !all;
+            }
+            m->touched = true;
+            break;
+        }
+        case '\n': case '\r': case KEY_ENTER:
+            if (menu_apply(tv)) menu_close(m); /* tbl_filter copied the values */
+            break;
+        case 27:
+            menu_close(m);
+            break;
+        case KEY_BACKSPACE: case 127: case 8: {
+            size_t l = strlen(m->q);
+            while (l > 0 && utf8_is_continuation((unsigned char)m->q[l - 1])) l--;
+            if (l > 0) l--;
+            m->q[l] = '\0';
+            menu_refilter(m);
+            break;
+        }
+        case 'u' & 0x1f:
+            m->q[0] = '\0';
+            menu_refilter(m);
+            break;
+        default:
+            if (key > 32 && key < 256 && key != 127) {   /* space ticks */
+                size_t l = strlen(m->q);
+                if (l + 1 < sizeof m->q) { m->q[l] = (char)key; m->q[l + 1] = '\0'; }
+                menu_refilter(m);
+            }
+            break;
+    }
+    return true;
+}
+
+bool tbl_search(TableView *tv, const char *q, bool forward) {
+    if (!tv || !q || !q[0] || tv->nsheets == 0) return false;
+    snprintf(tv->search, sizeof tv->search, "%s", q);
+    const TblSheet *t = &tv->sheets[tv->cur];
+    size_t total = t->nview * (size_t)t->ncols;   /* the rows shown only */
     if (total == 0) return false;
     size_t at = tv->row * (size_t)t->ncols + (size_t)tv->col;
     for (size_t k = 1; k <= total; k++) {

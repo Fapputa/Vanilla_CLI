@@ -64,30 +64,58 @@ Engineered for zero-latency, Abyss is written in C and uses a **Gap Buffer** and
 ### Compiling and running
 
 `Ctrl + B` saves the buffer and builds it, with the output shown in a pane at
-the bottom:
+the bottom. Commands run from the folder of the file.
 
-| Language | Toolchain |
+| Language | Toolchain (selectable in the `F5` menu) |
 |----------|-----------|
-| C | `gcc` |
-| C++ | `g++` |
+| C | `gcc`, `clang`, `tcc`, `zig cc` |
+| C++ | `g++`, `clang++`, `zig c++` |
 | Rust | `rustc`, or `cargo run` when the file belongs to a crate (a `Cargo.toml` found up the tree) |
-| Assembly | `nasm` + `ld` |
-| C# | `mcs` + `mono` |
-
-Interpreted files (Python, shell, JS, PHP) are simply run.
+| Assembly | `nasm` or `yasm` + `ld` |
+| C# | `mcs` (+ `mono`) or `csc` |
 
 When it finishes, the compile and run times are shown in the status bar and at
 the end of the output pane (`-- compile 412 ms | run 1.27 s --`). A failed
 compilation reports only its compile time; a nonzero exit code is appended.
 
-Pressing `Ctrl + B` twice quickly (within 350 ms) — or `F5` — opens a dropdown at the bottom listing the compiler flags for the current
-language: optimisation level, SIMD/vector ISA (`-march=native`, `-mavx2 -mfma`,
-`-msse4.2`, or `-C target-cpu=native` for Rust), LTO, fast math, sanitizers,
-and so on. `Space` toggles a flag, `Enter` builds and runs with the selection,
-`Esc` closes. Bracketed entries `[x]` are independent; `(*)` entries belong to
-a group where only one can be active at a time (you cannot ask for `-O2` and
-`-O3` at once). The line above the border previews the exact flags that `^B`
-will pass to the compiler.
+Pressing `Ctrl + B` twice quickly (within 350 ms) — or `F5` — opens a dropdown
+at the bottom. `Space` toggles an entry, `Enter` builds and runs with the
+selection, `Esc` closes. Bracketed entries `[x]` are independent; `(*)` entries
+belong to a group where only one can be active at a time (you cannot ask for
+`-O2` and `-O3` at once). The line above the border previews the exact command
+`^B` will run. For compiled languages the menu holds:
+
+- **Compiler** — gcc / clang / tcc / zig (C), g++ / clang++ / zig (C++),
+  nasm / yasm, mcs / csc. Compilers that are not installed are dimmed and
+  marked `(not installed)`.
+- **Output** — `run only` (temporary binary, deleted after the run),
+  `executable` (keeps `<name>` / `<name>.exe` next to the source and runs it),
+  `shared lib` (`lib<name>.so` / `<name>.dll`), `static lib` (`lib<name>.a`),
+  `object files` (`.o`, no link). Rust offers `cdylib` / `staticlib`, C# a `.dll`.
+- **All sources of the folder** — compiles every `.c` (or `.cpp`/`.cc`/`.cxx`,
+  `.cs`) of the folder into **one** output: one executable built from the
+  whole project. Combine with `static link` for a standalone binary that needs
+  no `.so` / `.dll` beside it.
+- **Flags** — optimisation level, SIMD/vector ISA (`-march=native`,
+  `-mavx2 -mfma`, `-msse4.2`, or `-C target-cpu=native` for Rust), LTO, fast
+  math, strip, sanitizers, OpenMP, and so on.
+
+#### Web files and Python
+
+`Ctrl + B` on web files starts a server in the background (its log goes to a
+temporary file), then opens the page in the browser:
+
+| File | Choices in the `F5` menu (default first) |
+|------|---------|
+| `.html`, `.css` | `python -m http.server`, `php -S`, open the file directly (`file://`) |
+| `.php` | `php -S` (built-in server, docroot = the folder), `php` CLI |
+| `.py` | auto (a Flask app gets `flask run`, anything else is run as a script), script, Flask, `http.server` |
+| `.js` | `node` script, `http.server` |
+
+The port is `auto` (Flask 5000, php 8080, others 8000) or 8000 / 8080 / 5000 /
+3000; opening the browser can be turned off. `^B` again restarts the server,
+`k` in the `F5` menu stops it, and it is stopped when Abyss quits. The title
+bar shows `[SERVER <url>]` while it runs.
 
 ### Manual Build
 
@@ -127,6 +155,8 @@ abyss main.c
 | `F3` | File inspector |
 | `F4` | Smart highlight panel |
 | `F6` | Table view (CSV, JSON, SQL, SQLite...) |
+| `F7` | Markdown: rendered view / text |
+| `F8` | Memory editor: pick a process, scan and edit its memory |
 
 ### Table view
 
@@ -145,7 +175,26 @@ starting with the SQLite header).
 | SQLite | Every table and view, through the `sqlite3` CLI (read-only) |
 
 Files with another extension are sniffed. The view reads the buffer as it is,
-unsaved edits included; it is read-only, edits happen in the text.
+unsaved edits included.
+
+**Editing.** `Enter` (or `e`) on a cell opens an edit box. The new value is
+written back at the exact place the cell came from in the source, encoded for
+its format (CSV quoting, JSON string or literal, SQL literal, `COPY` escapes,
+escaped `|` in Markdown), so the rest of the file is untouched. The edit goes
+into the buffer: `^S` saves it, `^Z` / `^Y` undo / redo. SQLite tables are
+updated directly with `UPDATE ... WHERE rowid = ...`; views and
+`WITHOUT ROWID` tables are read-only. Cells that do not exist in the source
+(a key missing from one JSON object, for instance) cannot be edited.
+
+**Sorting.** `s` sorts the grid on the current column (ascending, then
+descending, then back to the file order), `S` clears it. Number columns sort
+numerically, text sorts in natural order (`file2` before `file10`), empty cells
+go last. Sorting only changes the display: the file keeps its order and the
+gutter keeps showing each row's original number.
+
+**Column bar.** The bottom line of the grid always names the current column
+(whatever the horizontal scroll), its type, its sort, whether it is editable,
+and shows the full value of the current cell.
 
 | Key | Action |
 |-----|--------|
@@ -153,9 +202,81 @@ unsaved edits included; it is read-only, edits happen in the text.
 | `PgUp` / `PgDn`, `g` / `G` | Page, first / last row |
 | `Home` / `End` | First / last column |
 | `Tab` / `Shift+Tab` | Next / previous table |
-| `Enter` | Show the full cell in the status bar |
+| `Enter` / `e` | Edit the cell (`^U` clears the field) |
+| `s` / `S` | Sort on the column (asc / desc / off) / unsort |
+| `v` | Show the full cell in the status bar |
+| `^Z` / `^Y`, `^S` | Undo / redo an edit, save |
 | `Ctrl + F`, `Ctrl + N` / `Ctrl + P` | Search cells, next / previous match |
 | `F2` | Hex view |
+
+### Image view
+
+Pictures open in the pane with **nothing to install**: Abyss has its own
+decoders for PNG (every color type and depth, transparency, interlacing),
+JPEG (baseline and progressive, phone photos turned the right way up from
+their EXIF orientation), GIF, BMP, ICO, PNM, TGA and QOI. The picture is
+scaled to the pane (two pixels per character cell with `▀` half blocks, 256
+colors), centered, and redrawn whenever the window or the split changes size.
+
+`d` turns dithering on / off, `r` reloads the file, `F2` shows the bytes in the
+hex view (and `F2` again comes back to the picture). Nothing is ever saved over
+the image. WebP, SVG, HEIC/AVIF and TIFF are shown through
+[chafa](https://hpjansson.org/chafa/) if it happens to be installed; it is
+never required.
+
+### Document view
+
+Markdown files open **rendered**: headings, bold / italic / `code`, links,
+nested and task lists, quotes, code blocks, tables and rules, word-wrapped in a
+centered column of at most 100 characters. `F7` switches to the text to edit
+it and `F7` again shows the result; `^S` saves from either. Documents that are
+not text open in this view too, read-only:
+
+| Format | Read with |
+|--------|-----------|
+| PDF | `pdftotext` (poppler), else `mutool`, else Python `pypdf` |
+| Word `.docx`, OpenDocument `.odt` | the XML read out of the archive (`unzip`, `tar`/bsdtar or Python), headings, lists, bold / italic and tables kept |
+| Word 97 `.doc` | `antiword` or `catdoc` |
+| `.rtf`, `.epub` | `pandoc` |
+
+Arrows / `j` `k` scroll, `PgUp` / `PgDn` / `Space` page, `g` / `G` jump to the
+top / end, `^F` searches (matches highlighted, `^N` / `^P` next / previous).
+
+Optional tools used by these views: `poppler` (`pdftotext`) for PDFs,
+`sqlite3` for databases, `pandoc` for RTF / EPUB.
+
+### Memory editor
+
+`F8` opens a scanner in the style of Cheat Engine, for your own programs and
+offline games.
+
+**1. Pick a process.** The list shows the running processes, newest first,
+with their memory use. Type to filter by name or PID, `Enter` to analyse it.
+`^O` launches a program from here, `^R` refreshes the list.
+
+Linux only lets a program read another one's memory if it is root, or if the
+other program is its child (with the usual `kernel.yama.ptrace_scope = 1`).
+So either start the program from the list with `^O` (it becomes a child of
+Abyss: no root needed), run Abyss with `sudo`, or allow it for the session
+with `sudo sysctl kernel.yama.ptrace_scope=0`. Abyss says which one applies
+when access is refused.
+
+**2. Find a value.** `t` picks the type (int8 / 16 / 32 / 64, float, double,
+text, UTF-16 text, bytes with `??` wildcards), `m` the kind of scan and `s`
+runs it. The first scan reads all the writable memory: exact value, bigger /
+smaller than, between `low..high`, or *unknown initial value* (a copy of the
+memory). Next scans only re-check the addresses found: exact value, changed,
+unchanged, increased, decreased, increased / decreased by N. Change the value
+in the program between two scans (lose a life, spend coins...) until a
+handful of addresses remain. `n` starts over. Values are re-read live; the
+ones that changed since the last scan are highlighted.
+
+**3. Change it.** `Enter` writes a new value into the program's memory. `a`
+saves an address in the list below, `f` saves it frozen: its value is written
+back ten times a second, even when the view is closed. In the saved list
+(`Tab`), `Enter` edits, `f` toggles the freeze, `r` names it, `d` removes it.
+`x` shows the bytes around an address (changing bytes in color), `g` jumps to
+any address.
 
 ---
 

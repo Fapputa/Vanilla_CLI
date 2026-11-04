@@ -2,7 +2,7 @@
 
 A high-performance, versatile toolkit designed to supercharge the Linux terminal experience. From low-level system monitoring to a high-speed C-engineered text editor, this suite brings efficiency and fun to the command line.
 
-![Demo](.rem.gif)
+![Demo](.lain.gif)
 
 ---
 
@@ -127,6 +127,7 @@ abyss main.c
 | `F3` | File inspector |
 | `F4` | Smart highlight panel |
 | `F6` | Table view (CSV, JSON, SQL, SQLite...) |
+| `F8` | Memory editor (scan and change a running program's variables) |
 
 ### Table view
 
@@ -183,6 +184,77 @@ rows shown). Switching to another table clears them.
 | `Enter` | Show the full cell in the status bar |
 | `Ctrl + F`, `Ctrl + N` / `Ctrl + P` | Search cells, next / previous match |
 | `F2` | Hex view |
+
+### Memory editor
+
+`F8` opens a memory scanner in the current pane, in the spirit of Cheat
+Engine: attach to a running process, find where a variable lives in its
+memory by scanning for its value, then read it live, change it or freeze
+it. `F8` again closes the view; frozen values keep being written while it
+is hidden.
+
+**1. Pick a process.** The list shows running processes, newest first,
+with their memory usage. Type to filter it, `Enter` attaches, `Ctrl + R`
+refreshes. `Ctrl + O` launches a program from a command line as a child of
+Abyss and attaches to it right away.
+
+> **Permissions (Linux).** Reading another process's memory needs ptrace
+> rights. With the default `kernel.yama.ptrace_scope = 1`, only a child of
+> Abyss can be inspected without root, so `Ctrl + O` is the easy way.
+> Otherwise run Abyss with `sudo`, or allow it system-wide with
+> `sudo sysctl kernel.yama.ptrace_scope=0`. Memory is accessed through
+> `process_vm_readv` / `process_vm_writev`, with `/proc/<pid>/mem` as a
+> fallback.
+
+**2. Scan.** Choose what you are looking for, then narrow it down:
+
+- `t` cycles the value type: `int8`, `int16`, `int32` (default), `int64`,
+  `float`, `double`, `text`, `text UTF-16`, `bytes`.
+- `m` cycles the scan mode. A first scan can be `exact value`,
+  `bigger than`, `smaller than`, `between` (`low..high`) or
+  `unknown initial value`; the next ones add `increased`, `decreased`,
+  `increased by`, `decreased by`, `changed` and `unchanged`. Text and
+  bytes only support `exact value`, `changed` and `unchanged`.
+- `u` toggles aligned scanning (default: values at addresses aligned to
+  their size, much faster) versus every byte.
+- `s` scans. The first scan walks all the writable memory of the process,
+  each next scan only re-checks the previous results. `n` starts over.
+
+Integers accept decimal or `0x` hex. Floats are matched with a tolerance
+taken from the decimals you type: `100` matches 99.5 to 100.5, `1.25`
+matches 1.245 to 1.255. Byte patterns are written in hex with `??` as a
+wildcard (`DE AD ?? EF`).
+
+A typical session to find a counter whose value you know:
+
+1. Scan for its current value (`s`, e.g. `42`): thousands of results.
+2. Change it in the program (lose a life, gain a point...).
+3. Scan again for the new value, or pick `increased` / `decreased` with `m`.
+4. Repeat until a handful of addresses remain.
+
+When the value is not shown anywhere (a health bar), start with
+`unknown initial value`: the memory is copied, then refine with
+`changed` / `unchanged` / `increased` / `decreased` as it changes.
+
+**3. Change the variable.** Values in the result list are re-read once a
+second.
+
+| Key | Action |
+|-----|--------|
+| `Enter` / `e` | Write a new value at the selected address |
+| `a` / `+` | Save the address to the list below the results |
+| `f` | Save the address and freeze it (its value is written back ten times a second) |
+| `Tab` | Switch between results and saved addresses |
+| `x` | Hex dump around the selected address (changed bytes highlighted) |
+| `g` | Go to an address (hex) in the dump |
+| `p` | Back to the process list |
+| `F8` | Close the memory editor |
+
+On a saved address, `Enter` edits its value, `f` toggles the freeze, `r`
+renames it and `d` / `Del` removes it.
+
+Results are capped at 6,000,000 addresses; refine with a value scan if the
+first one hits the cap.
 
 ---
 

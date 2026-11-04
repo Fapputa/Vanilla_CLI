@@ -1,4 +1,6 @@
 #include "abyss.h"
+
+extern char E_notify[256];
 #include "utf8.h"
 #include <string.h>
 
@@ -98,7 +100,40 @@ void pane_free(Pane *p) {
     }
     hex_free(p->hex);
     tbl_free(p->table);
+    img_free(p->img);
+    doc_free(p->doc);
     free(p);
+}
+
+/* After the buffer was rewritten from outside the usual editing calls
+ * (table edits...): indexes, highlighting and cursor are refreshed. */
+void pane_text_changed(Pane *p) {
+    size_t len = gb_len(p->buf);
+    if (p->cursor > len) p->cursor = len;
+    p->modified = true;
+    li_rebuild(p->li, p->buf);
+    syn_mark_dirty_from(p->syn, 0);
+    p->sel_active = false;
+}
+
+/* Markdown preview of the buffer, or the rendering of a binary document
+ * (PDF, docx...) read from the file itself. */
+bool pane_doc_enter(Pane *p) {
+    if (!p->doc) p->doc = doc_new();
+    bool ok;
+    if (p->binary_view || !doc_is_markdown(p->filename)) {
+        ok = doc_load_file(p->doc, p->filename);
+    } else {
+        char *s = gb_to_str(p->buf);
+        ok = doc_load_markdown(p->doc, p->filename, s, gb_len(p->buf));
+        free(s);
+    }
+    if (!ok && !p->binary_view) {
+        snprintf(E_notify, sizeof E_notify, "Document view: %.200s", p->doc->err);
+        return false;
+    }
+    p->doc_mode = true;          /* binary docs show their error in the pane */
+    return ok;
 }
 
 extern char E_notify[256];
@@ -132,6 +167,28 @@ void pane_open_file(Pane *p, const char *path) {
 
     const char *ext = strrchr(path, '.');
     p->lang = lang_from_ext(ext ? ext : "");
+
+    /* pictures and binary documents (PDF, Word...) are shown, not loaded
+     * as text: the buffer stays empty and saving is disabled */
+    p->img_mode = p->doc_mode = p->binary_view = false;
+    if (p->img) { img_free(p->img); p->img = NULL; }
+    if (p->doc) { doc_free(p->doc); p->doc = NULL; }
+    if (img_is_image(p->filename) || doc_is_binary_doc(p->filename)) {
+        p->hex_mode    = false;
+        p->table_mode  = false;
+        if (p->table) { tbl_free(p->table); p->table = NULL; }
+        p->binary_view = true;
+        p->lang        = LANG_NONE;
+        syn_free(p->syn); p->syn = syn_new(LANG_NONE);
+        li_rebuild(p->li, p->buf);
+        if (img_is_image(p->filename)) {
+            p->img = img_new(p->filename);
+            p->img_mode = true;
+        } else {
+            pane_doc_enter(p);
+        }
+        return;
+    }
 
     
     if (p->lang == LANG_HEX) {
@@ -180,6 +237,15 @@ void pane_open_file(Pane *p, const char *path) {
      * straight into the table view; F6 goes back to text / hex */
     p->table_mode = false;
     if (p->table) { tbl_free(p->table); p->table = NULL; }
+    /* documents open rendered; F7 goes to the text to edit it */
+    p->doc_mode = false;
+    if (doc_is_markdown(p->filename) && gb_len(p->buf) > 0) {
+        char keep[256];
+        snprintf(keep, sizeof keep, "%s", E_notify);
+        if (pane_doc_enter(p) && keep[0]) snprintf(E_notify, sizeof E_notify, "%s", keep);
+        return;
+    }
+
     bool sqlite = p->hex_mode && p->hex && tbl_is_sqlite(p->hex->data, p->hex->data_len);
     if (sqlite || tbl_auto_ext(p->filename)) {
         char keep[256];
@@ -202,6 +268,12 @@ bool pane_save_file(Pane *p, const char *path) {
     
     if (p->hex_mode && p->hex)
         return hex_save(p->hex, path);
+
+    /* never write the (empty) text buffer over a picture or a PDF */
+    if (p->binary_view) {
+        snprintf(E_notify, sizeof E_notify, "Read-only view: use F2 (hex) to modify this file");
+        return false;
+    }
 
     if (path && path[0]) strncpy(p->filename, path, sizeof(p->filename)-1);
     if (!p->filename[0]) return false;
@@ -345,6 +417,21 @@ static int hex_color_at(const GapBuf *g, size_t pos, size_t start, size_t end,
 }
 
 void pane_render(Pane *p, bool force) {
+
+    if (p->mem_mode) {
+        mem_ui_render(p->win, p->win_h, p->win_w);
+        return;
+    }
+
+    if (p->img_mode && p->img) {
+        img_render(p->img, p->win, p->win_h, p->win_w);
+        return;
+    }
+
+    if (p->doc_mode && p->doc) {
+        doc_render(p->doc, p->win, p->win_h, p->win_w);
+        return;
+    }
 
     if (p->table_mode && p->table) {
         tbl_render(p->table, p->win, p->win_h, p->win_w);

@@ -73,6 +73,9 @@ install_system_deps() {
             python3-prompt-toolkit \
             python3-pygments \
             python3-psutil \
+            poppler-utils \
+            sqlite3 \
+            unzip \
             xclip \
             xsel \
             wireless-tools \
@@ -93,6 +96,9 @@ install_system_deps() {
             python-prompt_toolkit \
             python-pygments \
             python-psutil \
+            poppler \
+            sqlite \
+            unzip \
             xclip \
             xsel \
             wireless_tools \

@@ -17,7 +17,12 @@ SRC     = gap_buf.c  \
           beautify.c \
           editor.c \
           highlight.c \
-          table.c
+          table.c    \
+          image.c    \
+          imgdecode.c \
+          doc.c      \
+          memscan.c  \
+          memview.c
 
 OBJ     = $(SRC:.c=.o)
 TARGET  = abyss
@@ -34,7 +39,7 @@ all: $(TARGET) lsc lsc-config
 $(TARGET): $(OBJ)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
-%.o: %.c abyss.h
+%.o: %.c abyss.h imgdecode.h memscan.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 lsc: $(LSC_SRC)

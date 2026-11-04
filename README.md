@@ -2,7 +2,7 @@
 
 A high-performance, versatile toolkit designed to supercharge the terminal experience on Linux and Windows. From low-level system monitoring to a high-speed C-engineered text editor, this suite brings efficiency and fun to the command line.
 
-![Demo](.lain.gif)
+![Demo](.rem.gif)
 
 ---
 

@@ -15,15 +15,61 @@
 #include <errno.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <sys/wait.h>
 #include <pthread.h>
 #include <signal.h>
-#include <termios.h>
 #include <ctype.h>
 #include <time.h>
+
+#ifdef _WIN32
+#  include <io.h>
+#  include <limits.h>
+#  ifndef PATH_MAX
+#    define PATH_MAX 260
+#  endif
+#  define realpath(p, r) _fullpath((r), (p), PATH_MAX)
+#  define PROT_READ    1
+#  define MAP_PRIVATE  2
+#  define MAP_FAILED   ((void *)-1)
+#  define lstat        stat
+#  ifndef S_ISLNK
+#    define S_ISLNK(m) 0
+#  endif
+
+/* mmap en lecture seule émulé : on lit le fichier dans un buffer */
+static inline void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
+    (void)addr; (void)prot; (void)flags;
+    void *p = malloc(len ? len : 1);
+    if (!p) return MAP_FAILED;
+    off_t saved = lseek(fd, 0, SEEK_CUR);
+    _setmode(fd, _O_BINARY);
+    if (lseek(fd, off, SEEK_SET) < 0) { free(p); return MAP_FAILED; }
+    size_t got = 0;
+    while (got < len) {
+        int r = read(fd, (char *)p + got, (unsigned)(len - got));
+        if (r <= 0) break;
+        got += (size_t)r;
+    }
+    lseek(fd, saved, SEEK_SET);
+    if (got != len) { free(p); return MAP_FAILED; }
+    return p;
+}
+static inline int munmap(void *p, size_t len) { (void)len; free(p); return 0; }
+#else
+#  include <sys/mman.h>
+#  include <sys/wait.h>
+#  include <termios.h>
+#endif
+
+#ifdef _WIN32
+static inline const char *home_dir(void) {
+    const char *h = getenv("USERPROFILE");
+    return h ? h : getenv("HOME");
+}
+#else
+static inline const char *home_dir(void) { return getenv("HOME"); }
+#endif
 
 #define GAP_DEFAULT   4096
 #define GAP_GROW      8192
@@ -261,6 +307,25 @@ void        hl_render(HLCtx *h, WINDOW *win, int win_h, int win_w);
 void        hl_colors_init(void);
 const HLMatch *hl_match_at(const HLCtx *h, size_t byte_off);
 
+/* ─── Memory editor (F8, memview.c + memscan.c) ──────────
+ * Process list first, then Cheat Engine style scans of the chosen
+ * process's memory, live values, writes, frozen addresses, hex view. */
+void mem_ui_enter(void);
+void mem_ui_render(WINDOW *win, int h, int w);
+bool mem_ui_key(int key, int win_h);
+void mem_ui_status(char *out, size_t sz);
+int  mem_ui_dialog(char *title, size_t tsz, char *fill, size_t fsz);   /* pending input */
+void mem_ui_dialog_done(int kind, const char *text);
+void mem_ui_tick(void);
+int  mem_ui_timeout(bool visible);
+bool mem_ui_refresh_due(void);       /* a second since the last F8 draw */
+bool mem_ui_picking(void);
+void mem_ui_shutdown(void);
+
+#define HIGHLIGHT_DEFAULT_W  34
+#define HIGHLIGHT_MIN_W      28
+#define HIGHLIGHT_MAX_W      52
+
 /* ─── Table view (F6) ──────────────────────────────────────
  * Read-only grid over structured data: CSV/TSV/PSV, JSON, JSON Lines,
  * SQL dumps (CREATE TABLE / INSERT / COPY), Markdown & psql tables and
@@ -274,6 +339,18 @@ const HLMatch *hl_match_at(const HLCtx *h, size_t byte_off);
 
 typedef struct Arena Arena;
 
+/* Where a cell came from in the source text, so an edit made in the grid
+ * can be written back in place (keeping the rest of the file untouched).
+ * `kind` says how the new value must be encoded (CSV quoting, JSON string,
+ * SQL literal...); 0 means the cell has no editable source. */
+enum { SPK_NONE = 0, SPK_CSV, SPK_JSTR, SPK_JRAW, SPK_SQL, SPK_COPY, SPK_MD };
+
+typedef struct {
+    size_t   off;
+    uint32_t len;
+    uint8_t  kind;
+} TblSpan;
+
 typedef struct {
     char    name[128];
     char  **hdr;        /* ncols headers                            */
@@ -283,8 +360,10 @@ typedef struct {
     int    *colw;       /* display width of each column             */
     bool   *numeric;    /* mostly numbers: right-aligned            */
     bool    truncated;  /* stopped at TABLE_MAX_ROWS                */
-    size_t *perm;       /* display order (sort / filter), NULL = as is */
-    size_t  nview;      /* rows shown: nrows, or fewer when filtered  */
+    TblSpan   *span;    /* nrows * ncols source positions, or NULL  */
+    long long *rowid;   /* SQLite rowid of each row, or NULL        */
+    size_t    *perm;    /* display order (sort / filter), NULL = as is */
+    size_t     nview;   /* rows shown: nrows, or fewer when filtered  */
 } TblSheet;
 
 /* One entry of the column filter dropdown ('f'): a distinct value of the
@@ -340,6 +419,10 @@ typedef struct {
     char        search[256];
     TblSortKey  sort[TABLE_MAX_SORT]; /* sort keys, main one first      */
     int         nsort;             /* 0 = unsorted                      */
+    char        delim;            /* CSV-like sources: the separator   */
+    bool        from_hex;          /* built from the hex buffer         */
+    bool        sqlite;
+    char        path[4096];        /* SQLite database (for UPDATEs)     */
     TblFilter   filt[TABLE_MAX_FILT]; /* column filters, all must pass  */
     int         nfilt;             /* 0 = not filtered                  */
     TblMenu     menu;              /* 'f': dropdown of a column's values */
@@ -373,10 +456,78 @@ void        tbl_filter(TableView *tv, int col, const char *const *vals, int nval
 int         tbl_filter_index(const TableView *tv, int col);
 void        tbl_filter_menu_open(TableView *tv);
 bool        tbl_filter_menu_key(TableView *tv, int key, int win_h);
+bool        tbl_cell_editable(const TableView *tv, char *why, size_t why_sz);
 
-#define HIGHLIGHT_DEFAULT_W  34
-#define HIGHLIGHT_MIN_W      28
-#define HIGHLIGHT_MAX_W      52
+/* Runs argv[0] (no shell) and captures its stdout; stderr is dropped.
+ * Returns the exit code, 127 when the program could not be started. */
+int         proc_capture(char *const argv[], char **out, size_t *out_len);
+/* true when `prog` can be found on PATH */
+bool        proc_have(const char *prog);
+
+/* ─── Image view ───────────────────────────────────────────
+ * Pictures are decoded by the built-in decoders (imgdecode.c: PNG,
+ * JPEG, GIF, BMP, ICO, PNM, TGA, QOI) and drawn with half-block
+ * characters, two pixels per cell, dithered to the 256-color palette.
+ * Re-laid out whenever the pane changes size. chafa, when installed, is
+ * only used for the formats the decoders do not read (WebP, SVG...). */
+typedef struct {
+    char     path[4096];
+    bool     loaded;           /* decoding attempted                      */
+    int      bw, bh;           /* working bitmap (shrunk to <= 1024 px)  */
+    uint8_t *rgba;
+    int      src_w, src_h;     /* size in the file                        */
+    char     fmt[32];
+    bool     dither;
+    int      req_w, req_h;     /* pane size the cells were built for      */
+    int      cols, rows;       /* cell grid                               */
+    short   *top, *bot;        /* color of each half cell, -1 = background */
+    bool     half;             /* two pixels per cell (else one)          */
+    int      img_x, img_y, img_w, img_h;   /* picture area, in cells      */
+    bool     use_chafa;        /* fallback for unsupported formats        */
+    char    *art;
+    size_t   art_len;
+    char     err[256];
+} ImageView;
+
+bool        img_is_image(const char *path);
+ImageView  *img_new(const char *path);
+void        img_free(ImageView *iv);
+void        img_reload(ImageView *iv);
+void        img_toggle_dither(ImageView *iv);
+void        img_render(ImageView *iv, WINDOW *win, int win_h, int win_w);
+
+/* ─── Document view ────────────────────────────────────────
+ * Read-only, word-wrapped rendering of documents: Markdown (from the
+ * buffer), PDF (pdftotext / mutool), Word .docx, OpenDocument .odt,
+ * and anything pandoc can read. */
+typedef struct DocPara DocPara;
+
+typedef struct {
+    char     path[4096];
+    const char *fmt;
+    DocPara *paras;
+    int      npara, cap;
+    /* wrapped layout, rebuilt when the width changes */
+    struct DocLine *lines;
+    size_t   nlines, lcap;
+    int      wrap_w;
+    int      view_rows;   /* rows shown at the last render */
+    size_t   scroll;
+    char     search[256];
+    size_t   match_line;
+    char     err[256];
+} DocView;
+
+bool        doc_is_binary_doc(const char *path);   /* pdf, docx, odt... */
+bool        doc_is_markdown(const char *path);
+DocView    *doc_new(void);
+void        doc_free(DocView *dv);
+bool        doc_load_file(DocView *dv, const char *path);
+bool        doc_load_markdown(DocView *dv, const char *path, const char *text, size_t len);
+void        doc_render(DocView *dv, WINDOW *win, int win_h, int win_w);
+bool        doc_handle_key(DocView *dv, int key, int win_h);
+bool        doc_search(DocView *dv, const char *q, bool forward);
+void        doc_status(const DocView *dv, char *out, size_t out_sz);
 
 typedef struct {
     GapBuf    *buf;
@@ -417,6 +568,18 @@ typedef struct {
 
     bool       table_mode;
     TableView *table;
+
+    bool       img_mode;
+    ImageView *img;
+
+    bool       doc_mode;
+    DocView   *doc;
+
+    /* the file is an image / binary document: the text buffer is empty
+     * and must never be written over it */
+    bool       binary_view;
+
+    bool       mem_mode;          /* F8 memory editor shown in this pane */
 } Pane;
 
 Pane *pane_new(void);
@@ -446,6 +609,9 @@ void  pane_push_undo(Pane *p);
 void  pane_wipe_file(Pane *p);
 void  pane_beautify(Pane *p);
 bool  pane_table_enter(Pane *p);
+bool  pane_table_edit(Pane *p, const char *value);
+bool  pane_doc_enter(Pane *p);
+void  pane_text_changed(Pane *p);
 
 #define TREE_DEFAULT_W  26
 #define TREE_MIN_W      18
@@ -511,6 +677,9 @@ typedef enum {
     MODE_HEX_SEARCH,
     MODE_BUILD_MENU,
     MODE_TABLE_SEARCH,
+    MODE_TABLE_EDIT,
+    MODE_DOC_SEARCH,
+    MODE_MEM_INPUT,
 } EditorMode;
 
 typedef struct {
@@ -530,6 +699,7 @@ typedef struct {
 
     WINDOW    *status_win;
     WINDOW    *title_win;
+    WINDOW    *div_win[MAX_PANES];   /* vertical rules between split panes */
 
     pid_t      run_pid;
     char       run_output[1<<16];
@@ -578,7 +748,19 @@ void run_async(const char *path, Language lang);
  * Flags sharing a non-zero `group` are mutually exclusive: selecting
  * one clears the others, the way -O2/-O3/-Ofast would fight. */
 
-#define BUILD_MAX_FLAGS 20
+#define BUILD_MAX_FLAGS 48
+
+/* What a menu entry stands for. Plain flags land on the compiler command
+ * line; the other kinds are choices the build itself is shaped by. */
+enum {
+    BK_FLAG = 0,   /* compiler flag                                    */
+    BK_CC,         /* compiler to use      (flag = its command)         */
+    BK_OUT,        /* output kind          (flag = run|exe|dll|lib|obj) */
+    BK_ALLSRC,     /* build every source of the folder into one output  */
+    BK_SERVER,     /* web: how to serve    (flag = auto|script|flask|http|php|node|file) */
+    BK_PORT,       /* web: port            (flag = the number)          */
+    BK_BROWSER,    /* web: open the browser once the server is up       */
+};
 
 typedef struct {
     const char *label;   /* menu entry                      */
@@ -586,14 +768,24 @@ typedef struct {
     const char *hint;    /* short explanation, shown inline */
     int         group;   /* 0 = independent, >0 = radio group */
     bool        on;      /* default state                   */
+    int         kind;    /* BK_*                            */
 } BuildFlag;
 
 bool             build_is_compiled(Language lang);
+bool             build_has_menu(Language lang);
 const BuildFlag *build_flag_table(Language lang, int *count);
 bool            *build_flag_state(Language lang);
 void             build_flag_toggle(Language lang, int idx);
+bool             build_flag_available(Language lang, int idx);
 void             build_flags_string(Language lang, char *out, size_t out_sz);
 const char      *build_compiler_name(Language lang);
+void             build_preview(Language lang, const char *path, char *out, size_t out_sz);
+
+/* Background web server started by ^B on web files (php -S, flask,
+ * python -m http.server...). One at a time; stopped on exit. */
+bool             server_running(void);
+void             server_stop(void);
+const char      *server_url(void);
 
 #define COLOR_PAIR_NORMAL           1
 #define COLOR_PAIR_KEYWORD          2
@@ -626,6 +818,9 @@ const char      *build_compiler_name(Language lang);
 
 void colors_init(void);
 int  tok_to_color_pair(TokenType t);
+/* Windows: brings every panel's color pairs onto the editor theme */
+void colors_win_polish(void);
+int  colors_notify_pair(void);
 
 /* Inline color swatches (VSCode-style): map a 24-bit RGB to an ncurses color
  * pair whose foreground is that color. Returns 0 when unsupported/exhausted. */

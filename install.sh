@@ -31,6 +31,15 @@ REAL_HOME="$(getent passwd "$REAL_USER" | cut -d: -f6)"
 [ -n "$REAL_HOME" ] || REAL_HOME="$HOME"
 USER_BIN="$REAL_HOME/bin"
 
+# Lance une commande en tant que vrai utilisateur (ou telle quelle sans sudo).
+as_user() {
+    if [ "$REAL_USER" != "root" ] && [ "$(id -u)" -eq 0 ]; then
+        sudo -u "$REAL_USER" -- "$@"
+    else
+        "$@"
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # Root check
 # ---------------------------------------------------------------------------
@@ -56,53 +65,63 @@ detect_pkg_manager() {
 # ---------------------------------------------------------------------------
 # System dependencies
 # ---------------------------------------------------------------------------
+APT_PKGS=(
+    build-essential libncurses-dev rustc cargo
+    python3 python3-pip python3-rich python3-prompt-toolkit
+    python3-pygments python3-psutil
+    poppler-utils sqlite3 unzip xclip xsel wireless-tools net-tools
+)
+
+PACMAN_PKGS=(
+    base-devel ncurses rust
+    python python-pip python-rich python-prompt_toolkit
+    python-pygments python-psutil
+    poppler sqlite unzip xclip xsel wireless_tools net-tools
+)
+
+# Seuls les paquets absents sont installes ; s'il n'en manque aucun, le
+# gestionnaire de paquets n'est meme pas appele (ni update, ni upgrade).
 install_system_deps() {
-    info "Installing system dependencies..."
+    info "Checking system dependencies..."
+
+    local missing=()
 
     if [ "$PKG_MANAGER" = "apt" ]; then
-        apt update -qq
-        apt install -y \
-            build-essential \
-            libncurses-dev \
-            libncursesw5-dev \
-            rustc \
-            cargo \
-            python3 \
-            python3-pip \
-            python3-rich \
-            python3-prompt-toolkit \
-            python3-pygments \
-            python3-psutil \
-            poppler-utils \
-            sqlite3 \
-            unzip \
-            xclip \
-            xsel \
-            wireless-tools \
-            net-tools
+        local p
+        for p in "${APT_PKGS[@]}"; do
+            dpkg-query -W -f='${Status}' "$p" 2>/dev/null \
+                | grep -q "install ok installed" || missing+=("$p")
+        done
+
+        if [ ${#missing[@]} -eq 0 ]; then
+            ok "All system dependencies already installed."
+            return 0
+        fi
+
+        info "Missing: ${missing[*]}"
+        apt-get update -qq
+        apt-get install -y "${missing[@]}"
+
     elif [ "$PKG_MANAGER" = "pacman" ]; then
-        # -Syu et non -Sy : sur Arch, installer un paquet apres un simple -Sy
-        # produit une mise a jour partielle (ex. python compile contre une glibc
-        # plus recente que celle installee -> ImportError GLIBC_x.yz not found).
-        # La base de donnees et le systeme doivent etre mis a jour ensemble.
-        warn "Arch: a full system upgrade (-Syu) is required to install safely."
-        pacman -Syu --needed --noconfirm \
-            base-devel \
-            ncurses \
-            rust \
-            python \
-            python-pip \
-            python-rich \
-            python-prompt_toolkit \
-            python-pygments \
-            python-psutil \
-            poppler \
-            sqlite \
-            unzip \
-            xclip \
-            xsel \
-            wireless_tools \
-            net-tools
+        # pacman -T affiche les paquets non satisfaits (rien si tout est la).
+        mapfile -t missing < <(pacman -T "${PACMAN_PKGS[@]}" || true)
+
+        if [ ${#missing[@]} -eq 0 ]; then
+            ok "All system dependencies already installed."
+            return 0
+        fi
+
+        info "Missing: ${missing[*]}"
+
+        # Pas de -Sy (mise a jour partielle, non supportee sur Arch) et pas de
+        # -Syu impose : on installe depuis la base locale, coherente avec le
+        # systeme en place. Si les miroirs ont deja retire ces versions, c'est
+        # a l'utilisateur de faire sa mise a jour quand il le decide.
+        if ! pacman -S --needed --noconfirm "${missing[@]}"; then
+            warn "Could not install from the current package database"
+            warn "(it is probably older than the mirrors)."
+            fail "Update your system when convenient (pacman -Syu), then re-run this installer."
+        fi
     fi
 
     ok "System dependencies installed."
@@ -200,7 +219,11 @@ build_all() {
     [ -f "$SCRIPT_DIR/Makefile" ] || fail "Makefile not found in $SCRIPT_DIR."
 
     cd "$SCRIPT_DIR"
-    make clean && make
+    # Compile en tant que vrai utilisateur : sinon les .o et binaires du
+    # dossier du projet appartiennent a root.
+    if ! as_user make clean || ! as_user make; then
+        fail "Build failed (see the compiler errors above). Nothing was installed."
+    fi
 
     ok "Build complete."
 }
@@ -267,8 +290,12 @@ WRAPPER
 # Install to both user-local and system-wide
 # ---------------------------------------------------------------------------
 install_binaries() {
-    mkdir -p "$USER_BIN"
-    if [[ ":$PATH:" != *":$USER_BIN:"* ]]; then
+    as_user mkdir -p "$USER_BIN"
+    # Sous sudo, $PATH est celui de root (secure_path) : on regarde plutot si
+    # les fichiers de config du shell de l'utilisateur ajoutent ~/bin.
+    if ! cat "$REAL_HOME/.bashrc" "$REAL_HOME/.bash_profile" "$REAL_HOME/.profile" \
+             "$REAL_HOME/.zshrc" "$REAL_HOME/.zprofile" 2>/dev/null \
+            | grep -qE '(\$HOME|~|'"$REAL_HOME"')/bin'; then
         warn "$USER_BIN is not in your PATH. Add to ~/.bashrc or ~/.zshrc:"
         echo -e "  ${CYAN}export PATH=\"\$HOME/bin:\$PATH\"${NC}"
     fi
@@ -289,7 +316,7 @@ install_binaries() {
 cleanup_build() {
     info "Removing object files (.o)..."
     cd "$SCRIPT_DIR"
-    make clean_obj
+    as_user make clean_obj
     ok "Object files removed."
 
     info "Removing compiled binaries from project root..."

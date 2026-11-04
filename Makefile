@@ -32,7 +32,7 @@ LSC_BIN     = lsc
 LSC_CFG_SRC = lsc-config.c
 LSC_CFG_BIN = lsc-config
 
-.PHONY: all clean debug lsc lsc-config
+.PHONY: all clean clean_obj debug lsc lsc-config
 
 all: $(TARGET) lsc lsc-config
 

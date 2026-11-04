@@ -1,8 +1,8 @@
 # Vanilla_CLI Suite
 
-A high-performance, versatile toolkit designed to supercharge the Linux terminal experience. From low-level system monitoring to a high-speed C-engineered text editor, this suite brings efficiency and fun to the command line.
+A high-performance, versatile toolkit designed to supercharge the terminal experience on Linux and Windows. From low-level system monitoring to a high-speed C-engineered text editor, this suite brings efficiency and fun to the command line.
 
-![Demo](.rem.gif)
+![Demo](.lain.gif)
 
 ---
 
@@ -50,6 +50,49 @@ The installer will automatically:
 - Build `abyss`, `lsc`, and `lsc-config` with `make clean && make`
 - Deploy all commands to both `~/bin` and `/usr/local/bin`
 - Remove compiled binaries and object files from the project root once installed
+
+---
+
+## Windows
+
+Abyss fully supports Windows 10 and 11, through a **precompiled `abyss.exe`**
+available on the [Releases page](https://github.com/Fapputa/Vanilla_CLI/releases).
+
+**1. Download** `abyss.exe` from the latest release. It is statically linked:
+a single self-contained file, with no DLL or MSYS2 install needed beside it.
+
+**2. Put it on your `PATH`**, for example in `%USERPROFILE%\bin` (from PowerShell):
+
+```powershell
+mkdir $env:USERPROFILE\bin -Force
+move .\abyss.exe $env:USERPROFILE\bin\
+[Environment]::SetEnvironmentVariable("Path", "$env:Path;$env:USERPROFILE\bin", "User")
+```
+
+**3. Run it** from Windows Terminal, PowerShell or `cmd.exe`:
+
+```powershell
+abyss main.c
+```
+
+Every feature works on Windows: compile and run with `Ctrl + B` (gcc, clang,
+tcc, zig, nasm, csc... whichever are on `PATH`), web servers, table view, image
+and document views, hex view and the memory editor. Notes specific to Windows:
+
+- The console cannot redefine colors, so the editor uses its own xterm-256
+  theme (Monokai-style syntax, deep red title bar, slate status bar).
+- Images need nothing to install. PDFs and SQLite databases use `pdftotext`
+  (poppler) and `sqlite3` when they are on `PATH` (scoop, winget or MSYS2).
+  `.docx` / `.odt` files are read with the `tar.exe` shipped with Windows 10+.
+- The memory editor (`F8`) needs Abyss to be run as administrator to attach to
+  processes started by another user or elevated.
+
+To build the `.exe` yourself instead, from an **MSYS2 UCRT64** shell:
+
+```bash
+pacman -S --needed make mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-ncurses
+make            # -> abyss.exe
+```
 
 ---
 

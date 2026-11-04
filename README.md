@@ -68,7 +68,7 @@ mkdir $env:USERPROFILE\bin -Force
 move .\abyss.exe $env:USERPROFILE\bin\
 [Environment]::SetEnvironmentVariable("Path", "$env:Path;$env:USERPROFILE\bin", "User")
 ```
-**3 Run it** from the .exe file,
+**3  Run it** from the .exe file
 
 **3.1 Or run it** from Windows Terminal, PowerShell or `cmd.exe`:
 

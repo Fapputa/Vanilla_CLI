@@ -139,6 +139,7 @@ bool pane_doc_enter(Pane *p) {
 extern char E_notify[256];
 
 void pane_open_file(Pane *p, const char *path) {
+    p->url[0] = p->url_name[0] = '\0';
     char resolved[4096];
     if (realpath(path, resolved))
         strncpy(p->filename, resolved, sizeof(p->filename)-1);
@@ -256,15 +257,42 @@ void pane_open_file(Pane *p, const char *path) {
 }
 
 typedef struct { char path[4096]; char *data; size_t len; } SaveArgs;
+
+/* saves still being written by a background thread */
+static int saves_in_flight = 0;
+
+static bool write_file(const char *path, const char *data, size_t len) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return false;
+    bool ok = fwrite(data, 1, len, f) == len;
+    if (fclose(f) != 0) ok = false;
+    return ok;
+}
+
 static void *save_thread_fn(void *arg) {
     SaveArgs *sa = arg;
-    FILE *f = fopen(sa->path, "w");
-    if (f) { fwrite(sa->data, 1, sa->len, f); fclose(f); }
+    write_file(sa->path, sa->data, sa->len);
     free(sa->data); free(sa);
+    __atomic_sub_fetch(&saves_in_flight, 1, __ATOMIC_SEQ_CST);
     return NULL;
 }
 
-bool pane_save_file(Pane *p, const char *path) {
+static bool pane_save_impl(Pane *p, const char *path, bool sync);
+
+bool pane_save_file(Pane *p, const char *path) { return pane_save_impl(p, path, false); }
+
+/* ^B: the compiler reads the file from disk, so the save must be on
+ * disk before it starts — written here, after any background save of
+ * the same file has landed (it would otherwise overwrite it late). */
+bool pane_save_file_sync(Pane *p) {
+    for (int i = 0; i < 2000 && __atomic_load_n(&saves_in_flight, __ATOMIC_SEQ_CST) > 0; i++) {
+        struct timespec ts = { 0, 1000000L };
+        nanosleep(&ts, NULL);
+    }
+    return pane_save_impl(p, NULL, true);
+}
+
+static bool pane_save_impl(Pane *p, const char *path, bool sync) {
     
     if (p->hex_mode && p->hex)
         return hex_save(p->hex, path);
@@ -296,12 +324,25 @@ bool pane_save_file(Pane *p, const char *path) {
         free(s);
     }
 
-    SaveArgs *sa = malloc(sizeof *sa);
-    snprintf(sa->path, sizeof(sa->path), "%s", p->filename);
-    sa->data = out; sa->len = outlen;
-    pthread_t tid;
-    pthread_create(&tid, NULL, save_thread_fn, sa);
-    pthread_detach(tid);
+    if (sync) {
+        bool ok = write_file(p->filename, out, outlen);
+        free(out);
+        if (!ok) {
+            snprintf(E_notify, sizeof E_notify, "Save failed: %.200s", strerror(errno));
+            return false;
+        }
+    } else {
+        SaveArgs *sa = malloc(sizeof *sa);
+        snprintf(sa->path, sizeof(sa->path), "%s", p->filename);
+        sa->data = out; sa->len = outlen;
+        __atomic_add_fetch(&saves_in_flight, 1, __ATOMIC_SEQ_CST);
+        pthread_t tid;
+        if (pthread_create(&tid, NULL, save_thread_fn, sa) == 0) {
+            pthread_detach(tid);
+        } else {                       /* no thread: write it right here */
+            save_thread_fn(sa);
+        }
+    }
     p->modified = false;
     const char *ext = strrchr(p->filename, '.');
     p->lang = lang_from_ext(ext ? ext : "");

@@ -491,6 +491,30 @@ static void url_path(char *out, size_t sz, const char *name) {
     out[o] = '\0';
 }
 
+static void temp_path(char *out, size_t sz, const char *name);
+
+#ifdef _WIN32
+/* On Windows the program writes into a pipe, where the C runtime fully
+ * buffers stdout: a prompt printed before scanf() would only show once
+ * the program ends. The temporary "run only" build therefore gets this
+ * header forced in (-include), turning that buffering off. */
+static const char UNBUF_H[] =
+    "#include <stdio.h>\n"
+    "__attribute__((constructor)) static void abyss_unbuffered_stdout(void) {\n"
+    "    setvbuf(stdout, NULL, _IONBF, 0);\n"
+    "    setvbuf(stderr, NULL, _IONBF, 0);\n"
+    "}\n";
+
+static void unbuf_header_path(char *out, size_t sz) { temp_path(out, sz, "abyss_unbuffered.h"); }
+
+static void unbuf_header_write(void) {
+    char p[4096];
+    unbuf_header_path(p, sizeof p);
+    FILE *f = fopen(p, "wb");
+    if (f) { fputs(UNBUF_H, f); fclose(f); }
+}
+#endif
+
 /* C, C++: one or every source of the folder, into the chosen output. */
 static void plan_native(Plan *pl, Language lang, const char *dir, const char *base, const char *stem) {
     const char *cc  = build_compiler_name(lang);
@@ -544,6 +568,14 @@ static void plan_native(Plan *pl, Language lang, const char *dir, const char *ba
             else          obj_name(names[0], pl->produced, sizeof pl->produced);
         }
     } else {                                              /* run only */
+#ifdef _WIN32
+        if (strncmp(cc, "tcc", 3) != 0) {                 /* gcc, clang, zig: -include */
+            char hp[4096];
+            unbuf_header_path(hp, sizeof hp);
+            size_t pl_len = strlen(pre);
+            snprintf(pre + pl_len, sizeof pre - pl_len, "%s-include \"%s\"", pl_len ? " " : "", hp);
+        }
+#endif
         snprintf(pl->build, sizeof pl->build, "%s %s %s -o \"" TMP_BIN "\" %s", cc, pre, srcs, post);
         snprintf(pl->run, sizeof pl->run, "\"" RUN_PREFIX TMP_BIN "\"");
         snprintf(pl->cleanup[pl->ncleanup++], sizeof pl->cleanup[0], "%s/" TMP_BIN, dir);
@@ -770,32 +802,7 @@ static void fmt_duration(double s, char *out, size_t out_sz) {
     else         snprintf(out, out_sz, "%.2f s", s);
 }
 
-/* Runs `cmd` from `cwd` with stderr folded into stdout, appending its
- * output to out_buf at *pos. Returns the pclose status, or -1. */
-static int capture(const char *cmd, const char *cwd, char *out_buf, size_t out_max, size_t *pos) {
-    static char full_cmd[CMD_MAX + 4200];
-    if (cwd && cwd[0]) snprintf(full_cmd, sizeof full_cmd, "(" CD_CMD " \"%s\" && %s) 2>&1", cwd, cmd);
-    else               snprintf(full_cmd, sizeof full_cmd, "(%s) 2>&1", cmd);
-
-    FILE *fp = popen(full_cmd, "r");
-    if (!fp) {
-        int w = snprintf(out_buf + *pos, out_max - *pos, "(popen failed: %s)\n", strerror(errno));
-        if (w > 0) *pos = min_sz(*pos + (size_t)w, out_max - 1);
-        return -1;
-    }
-    char tmp[4096];
-    while (fgets(tmp, sizeof tmp, fp)) {
-        if (*pos >= out_max - 1) continue;   /* keep draining so the child can exit */
-        size_t n = strlen(tmp);
-        if (*pos + n >= out_max) n = out_max - *pos - 1;
-        memcpy(out_buf + *pos, tmp, n);
-        *pos += n;
-    }
-    out_buf[*pos] = '\0';
-    return pclose(fp);
-}
-
-static int exit_code(int status) {
+static int __attribute__((unused)) exit_code(int status) {
 #ifdef _WIN32
     return status;
 #else
@@ -953,70 +960,483 @@ static void run_server(const Plan *pl, char *out_buf, size_t out_max, char *timi
     snprintf(timing, timing_sz, "serving %s", pl->url);
 }
 
-void run_file(const char *path, Language lang, char *out_buf, size_t out_max,
-              char *timing, size_t timing_sz) {
-    static Plan pl;
-    make_plan(&pl, lang, path);
-    timing[0] = '\0';
-    out_buf[0] = '\0';
 
-    if (pl.server) { run_server(&pl, out_buf, out_max, timing, timing_sz); return; }
-    if (!pl.build[0] && !pl.run[0]) {
-        if (pl.url[0]) {
-            open_url(pl.url);
-            snprintf(out_buf, out_max, "Opened %s\n", pl.url);
-            snprintf(timing, timing_sz, "opened in the browser");
-            return;
+/* ─── Live console (^B) ───────────────────────────────────────────
+ * The build and then the program run as a child process that the main
+ * loop polls (run_poll): their output reaches the panel as it comes,
+ * and keys typed while the panel has the focus go to the program's
+ * stdin. Nothing blocks the editor any more.
+ *   Linux   — the child gets a pseudo-terminal: its stdout is line
+ *             buffered like in a real terminal, and the tty itself does
+ *             the echo, line editing and ^C.
+ *   Windows — pipes + a job object (winproc.c), so the child never
+ *             touches the console curses draws on; the input line is
+ *             echoed and edited here, then sent on Enter. */
+
+#ifdef _WIN32
+int  win_child_start(const char *cmdline, const char *cwd);
+int  win_child_read(char *buf, int max);
+int  win_child_write(const char *buf, int n);
+void win_child_close_stdin(void);
+int  win_child_exited(int *code);
+void win_child_kill(void);
+void win_child_release(void);
+#else
+#  include <pty.h>
+#  include <sys/ioctl.h>
+#  include <sys/wait.h>
+#endif
+
+enum { PH_IDLE = 0, PH_BUILD, PH_RUN };
+
+static struct {
+    int     phase;
+    Plan    pl;
+    char   *buf;                 /* the panel's text (E.out_text)          */
+    size_t  cap, len;
+    double  t0;
+    char    build_t[32], run_t[32];
+    int     code;
+    bool    build_failed;
+    bool    stopped;             /* killed from the panel                  */
+    bool    intr_sent;           /* ^C already forwarded once              */
+    bool    changed, finished;
+    char    timing[256];
+    int     esc;                 /* escape-sequence decoder state          */
+    bool    cr;                  /* lone \r: the next text rewrites the line */
+    int     cols, rows;
+#ifdef _WIN32
+    char    line[4096];          /* input line being typed                 */
+    size_t  line_len;
+#endif
+} R;
+
+#ifndef _WIN32
+static pid_t ch_pid    = 0;
+static int   ch_fd     = -1;
+static bool  ch_exited = false;
+static int   ch_status = 0;
+#endif
+
+/* ── output buffer ── */
+
+static void out_trim(void) {                 /* full: keep the newest half */
+    size_t from = R.len - R.cap / 2;
+    const char *nl = memchr(R.buf + from, '\n', R.len - from);
+    if (nl) from = (size_t)(nl + 1 - R.buf);
+    memmove(R.buf, R.buf + from, R.len - from);
+    R.len -= from;
+    R.buf[R.len] = '\0';
+}
+
+static void out_byte(char c) {
+    if (!R.buf || R.cap < 4) return;
+    if (R.len + 2 >= R.cap) out_trim();
+    R.buf[R.len++] = c;
+    R.buf[R.len]   = '\0';
+    R.changed      = true;
+}
+
+static void out_str(const char *s) { while (*s) out_byte(*s++); }
+
+static void out_fmt(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void out_fmt(const char *fmt, ...) {
+    static char tmp[8192];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(tmp, sizeof tmp, fmt, ap);
+    va_end(ap);
+    out_str(tmp);
+}
+
+static void out_newline_if_needed(void) {
+    if (R.len > 0 && R.buf[R.len - 1] != '\n') out_byte('\n');
+}
+
+/* One character back (UTF-8 aware), never past the start of the line. */
+static void out_backspace(void) {
+    if (R.len == 0 || R.buf[R.len - 1] == '\n') return;
+    do R.len--; while (R.len > 0 && ((unsigned char)R.buf[R.len] & 0xC0) == 0x80);
+    R.buf[R.len] = '\0';
+    R.changed    = true;
+}
+
+/* Raw child output -> panel text: escape sequences (colours, cursor
+ * moves, titles) are dropped, \r\n becomes \n, a lone \r rewrites the
+ * line (progress bars), \b steps back (tty echo of a backspace). */
+static void out_feed(const char *d, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)d[i];
+        switch (R.esc) {
+            case 1:                                       /* after ESC */
+                R.esc = c == '[' ? 2 : c == ']' ? 3 : strchr("()*+#%", c) ? 5 : 0;
+                continue;
+            case 2: if (c >= 0x40 && c <= 0x7E) R.esc = 0; continue;      /* CSI */
+            case 3: if (c == 7) R.esc = 0; else if (c == 27) R.esc = 4; continue; /* OSC */
+            case 4: R.esc = (c == '\\') ? 0 : 3; continue;
+            case 5: R.esc = 0; continue;                  /* ESC ( B ... */
+            default: break;
         }
-        snprintf(out_buf, out_max, "(No run command for this file type)");
-        return;
+        if (c == 27)   { R.esc = 1; continue; }
+        if (c == '\r') { R.cr = true; continue; }
+        if (c == '\n') { R.cr = false; out_byte('\n'); continue; }
+        if (R.cr) {
+            R.cr = false;
+            while (R.len > 0 && R.buf[R.len - 1] != '\n') R.len--;
+            R.buf[R.len] = '\0';
+        }
+        if (c == '\b') { out_backspace(); continue; }
+        if (c == '\t') { out_byte('\t'); continue; }
+        if (c < 32 || c == 127) continue;
+        out_byte((char)c);
+    }
+}
+
+/* ── child process ── */
+
+static bool child_start(const char *cmd, const char *cwd) {
+#ifdef _WIN32
+    return win_child_start(cmd, cwd) != 0;
+#else
+    struct winsize ws;
+    memset(&ws, 0, sizeof ws);
+    ws.ws_col = (unsigned short)(R.cols > 10 ? R.cols : 80);
+    ws.ws_row = (unsigned short)(R.rows > 2  ? R.rows : 24);
+    int fd = -1;
+    pid_t pid = forkpty(&fd, NULL, NULL, &ws);
+    if (pid < 0) return false;
+    if (pid == 0) {                         /* child: session leader on the pty */
+        if (cwd && cwd[0] && chdir(cwd) != 0) {
+            fprintf(stderr, "cd %s: %s\n", cwd, strerror(errno));
+            _exit(127);
+        }
+        setenv("TERM", "dumb", 1);          /* no colour codes from compilers */
+        execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+        _exit(127);
+    }
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+    fcntl(fd, F_SETFD, FD_CLOEXEC);
+    ch_pid    = pid;
+    ch_fd     = fd;
+    ch_exited = false;
+    ch_status = 0;
+    return true;
+#endif
+}
+
+/* >0 bytes read, 0 nothing for now, -1 closed */
+static int child_read(char *b, size_t n) {
+#ifdef _WIN32
+    return win_child_read(b, (int)n);
+#else
+    if (ch_fd < 0) return -1;
+    ssize_t r = read(ch_fd, b, n);
+    if (r > 0) return (int)r;
+    if (r < 0 && (errno == EAGAIN || errno == EINTR)) return 0;
+    return -1;                              /* EIO: every slave end closed */
+#endif
+}
+
+static void child_write(const char *b, size_t n) {
+#ifdef _WIN32
+    win_child_write(b, (int)n);
+#else
+    if (ch_fd < 0) return;
+    while (n > 0) {
+        ssize_t w = write(ch_fd, b, n);
+        if (w <= 0) break;                  /* full: the program is not reading */
+        b += w; n -= (size_t)w;
+    }
+#endif
+}
+
+static bool child_done(int *code) {
+#ifdef _WIN32
+    return win_child_exited(code) != 0;
+#else
+    if (!ch_exited && ch_pid > 0) {
+        int st = 0;
+        pid_t w = waitpid(ch_pid, &st, WNOHANG);
+        if (w == ch_pid)  { ch_exited = true; ch_status = st; }
+        else if (w < 0)   { ch_exited = true; ch_status = -1; }
+    }
+    if (ch_exited) *code = exit_code(ch_status);
+    return ch_exited;
+#endif
+}
+
+static void child_release(void) {
+#ifdef _WIN32
+    win_child_release();
+#else
+    if (ch_fd >= 0) close(ch_fd);
+    ch_fd  = -1;
+    ch_pid = 0;
+#endif
+}
+
+static void child_kill(void) {
+#ifdef _WIN32
+    win_child_kill();
+#else
+    if (ch_pid > 0 && !ch_exited) {
+        kill(-ch_pid, SIGKILL);             /* the whole session it started */
+        kill(ch_pid, SIGKILL);
+        waitpid(ch_pid, &ch_status, 0);
+        ch_exited = true;
+    }
+    child_release();
+#endif
+}
+
+/* ── phases: build, then run ── */
+
+static void run_finish(void) {
+    bool bf   = R.build_failed;
+    int  code = R.code;
+    R.cr = false;
+    R.esc = 0;
+
+    if (R.len == 0) {
+        if (R.stopped)          out_str("(Stopped)");
+        else if (bf)            out_fmt("(Compilation failed with code %d)", code);
+        else if (!R.pl.run[0])  out_str("(Build finished)");
+        else if (code == 0)     out_str("(Execution finished)");
+        else                    out_fmt("(Process exited with code %d)", code);
     }
 
-    size_t pos = 0;
-    char build_t[32] = "", run_t[32] = "";
-    int code = 0;
-    bool build_failed = false;
-
-    if (pl.build[0]) {
-        double t0 = now_sec();
-        code = exit_code(capture(pl.build, pl.cwd, out_buf, out_max, &pos));
-        fmt_duration(now_sec() - t0, build_t, sizeof build_t);
-        build_failed = (code != 0);
-    }
-
-    if (!build_failed && pl.run[0]) {
-        double t0 = now_sec();
-        code = exit_code(capture(pl.run, pl.cwd, out_buf, out_max, &pos));
-        fmt_duration(now_sec() - t0, run_t, sizeof run_t);
-    }
-
-    if (pos == 0) {
-        if (build_failed)          snprintf(out_buf, out_max, "(Compilation failed with code %d)", code);
-        else if (!pl.run[0])       snprintf(out_buf, out_max, "(Build finished)");
-        else if (code == 0)        snprintf(out_buf, out_max, "(Execution finished)");
-        else                       snprintf(out_buf, out_max, "(Process exited with code %d)", code);
-        pos = strlen(out_buf);
-    }
-
-    if (build_failed)
-        snprintf(timing, timing_sz, "compile %s (failed)", build_t);
-    else if (pl.build[0] && pl.run[0])
-        snprintf(timing, timing_sz, "compile %s | run %s", build_t, run_t);
-    else if (pl.build[0])
-        snprintf(timing, timing_sz, "compile %s -> %s", build_t, pl.produced[0] ? pl.produced : "done");
+    const char *stop = R.stopped ? " (stopped)" : "";
+    if (bf)
+        snprintf(R.timing, sizeof R.timing, "compile %s (%s)", R.build_t,
+                 R.stopped ? "stopped" : "failed");
+    else if (R.pl.build[0] && R.pl.run[0])
+        snprintf(R.timing, sizeof R.timing, "compile %s | run %s%s", R.build_t, R.run_t, stop);
+    else if (R.pl.build[0])
+        snprintf(R.timing, sizeof R.timing, "compile %s -> %.150s", R.build_t,
+                 R.pl.produced[0] ? R.pl.produced : "done");
     else
-        snprintf(timing, timing_sz, "run %s", run_t);
+        snprintf(R.timing, sizeof R.timing, "run %s%s", R.run_t, stop);
 
     /* footer in the output panel, which stays visible after the notification clears */
-    if (pos > 0 && out_buf[pos - 1] != '\n' && pos < out_max - 1) out_buf[pos++] = '\n';
-    if (!build_failed && pl.produced[0] && pos < out_max)
-        pos += (size_t)snprintf(out_buf + pos, out_max - pos, "-> built %s in %s\n", pl.produced, pl.cwd);
-    if (pos < out_max) {
-        if (!build_failed && code != 0)
-            snprintf(out_buf + pos, out_max - pos, "-- %s | exit %d --\n", timing, code);
-        else
-            snprintf(out_buf + pos, out_max - pos, "-- %s --\n", timing);
+    out_newline_if_needed();
+    if (!bf && R.pl.produced[0])
+        out_fmt("-> built %s in %s\n", R.pl.produced, R.pl.cwd);
+#ifdef _WIN32
+    if (!bf && (unsigned)code >= 0xC0000000u && !R.stopped)   /* NTSTATUS: it crashed */
+        out_fmt("-- %s | crashed 0x%08X%s --\n", R.timing, (unsigned)code,
+                (unsigned)code == 0xC0000005u ? " (access violation)" :
+                (unsigned)code == 0xC00000FDu ? " (stack overflow)" : "");
+    else
+#endif
+    if (!bf && code != 0 && !R.stopped) out_fmt("-- %s | exit %d --\n", R.timing, code);
+    else                                out_fmt("-- %s --\n", R.timing);
+
+    for (int i = 0; i < R.pl.ncleanup; i++) unlink(R.pl.cleanup[i]);
+    R.phase    = PH_IDLE;
+    R.finished = true;
+}
+
+static void phase_start(int ph);
+
+static void phase_end(int code) {
+    int ph = R.phase;
+    fmt_duration(now_sec() - R.t0, ph == PH_BUILD ? R.build_t : R.run_t, sizeof R.build_t);
+    R.code = code;
+    child_release();
+    if (ph == PH_BUILD) {
+        R.build_failed = (code != 0) || R.stopped;
+        if (!R.build_failed && R.pl.run[0]) {
+            if (R.len > 0) {
+                out_newline_if_needed();
+                out_fmt("-- compiled in %s --\n", R.build_t);
+            }
+            phase_start(PH_RUN);
+            return;
+        }
+    }
+    run_finish();
+}
+
+static void phase_start(int ph) {
+    const char *cmd = ph == PH_BUILD ? R.pl.build : R.pl.run;
+    R.phase     = ph;
+    R.t0        = now_sec();
+    R.intr_sent = false;
+    R.esc       = 0;
+    R.cr        = false;
+#ifdef _WIN32
+    R.line_len  = 0;
+#endif
+    R.changed   = true;
+    if (!child_start(cmd, R.pl.cwd)) {
+        out_newline_if_needed();
+        out_fmt("(could not start: %s)\n", cmd);
+        phase_end(-1);
+    }
+}
+
+/* ── public side ── */
+
+bool run_start(const char *path, Language lang, char *buf, size_t cap,
+               int cols, int rows, char *msg, size_t msg_sz) {
+    run_stop();
+    memset(&R, 0, sizeof R);
+    R.buf  = buf;
+    R.cap  = cap;
+    R.cols = cols;
+    R.rows = rows;
+    if (buf && cap) buf[0] = '\0';
+    msg[0] = '\0';
+    make_plan(&R.pl, lang, path);
+
+    if (R.pl.server) {                       /* long-lived: runs detached */
+        run_server(&R.pl, buf, cap, msg, msg_sz);
+        R.len = strlen(buf);
+        return false;
+    }
+    if (!R.pl.build[0] && !R.pl.run[0]) {
+        if (R.pl.url[0]) {
+            open_url(R.pl.url);
+            snprintf(buf, cap, "Opened %s\n", R.pl.url);
+            snprintf(msg, msg_sz, "opened in the browser");
+        } else {
+            snprintf(buf, cap, "(No run command for this file type)");
+        }
+        R.len = strlen(buf);
+        return false;
     }
 
-    for (int i = 0; i < pl.ncleanup; i++) unlink(pl.cleanup[i]);
+#ifdef _WIN32
+    if (strstr(R.pl.build, "abyss_unbuffered.h")) unbuf_header_write();
+#endif
+    phase_start(R.pl.build[0] ? PH_BUILD : PH_RUN);
+    if (R.phase == PH_IDLE) {                /* could not even start */
+        snprintf(msg, msg_sz, "%s", R.timing);
+        R.finished = false;
+        return false;
+    }
+    return true;
+}
+
+int run_poll(void) {
+    if (R.phase != PH_IDLE) {
+        static char tmp[8192];
+        /* bounded per tick: a program printing nonstop cannot freeze the keys */
+        for (int i = 0; i < 32; i++) {
+            int n = child_read(tmp, sizeof tmp);
+            if (n <= 0) break;
+            out_feed(tmp, (size_t)n);
+        }
+        int code = 0;
+        if (R.phase != PH_IDLE && child_done(&code)) {
+            for (int i = 0; i < 256; i++) {  /* what it wrote just before exiting */
+                int n = child_read(tmp, sizeof tmp);
+                if (n <= 0) break;
+                out_feed(tmp, (size_t)n);
+            }
+            phase_end(code);
+        }
+    }
+    int ev = 0;
+    if (R.changed)  { ev |= RUN_EV_OUTPUT; R.changed  = false; }
+    if (R.finished) { ev |= RUN_EV_DONE;   R.finished = false; }
+    return ev;
+}
+
+bool run_active(void) { return R.phase != PH_IDLE; }
+bool run_compiling(void) { return R.phase == PH_BUILD; }
+const char *run_timing(void) { return R.timing; }
+
+void run_resize(int cols, int rows) {
+    R.cols = cols;
+    R.rows = rows;
+#ifndef _WIN32
+    if (ch_fd >= 0) {
+        struct winsize ws;
+        memset(&ws, 0, sizeof ws);
+        ws.ws_col = (unsigned short)(cols > 10 ? cols : 80);
+        ws.ws_row = (unsigned short)(rows > 2 ? rows : 24);
+        ioctl(ch_fd, TIOCSWINSZ, &ws);
+    }
+#endif
+}
+
+/* Kills what runs (editor quitting, panel restarted). */
+void run_stop(void) {
+    if (R.phase == PH_IDLE) return;
+    int ph = R.phase;
+    child_kill();
+    R.stopped = true;
+    fmt_duration(now_sec() - R.t0, ph == PH_BUILD ? R.build_t : R.run_t, sizeof R.build_t);
+    R.code = -1;
+    if (ph == PH_BUILD) R.build_failed = true;
+    run_finish();
+}
+
+/* ^C: the first one is a polite SIGINT (Linux), the next one kills. */
+void run_interrupt(void) {
+    if (R.phase == PH_IDLE) return;
+#ifndef _WIN32
+    if (!R.intr_sent) {
+        R.intr_sent = true;
+        child_write("\x03", 1);
+        return;
+    }
+#endif
+    run_stop();
+}
+
+void run_input_char(int c) {
+    if (R.phase == PH_IDLE) return;
+    char b = (char)c;
+#ifdef _WIN32
+    if (R.line_len + 1 < sizeof R.line) {
+        R.line[R.line_len++] = b;
+        out_byte(b);                         /* local echo */
+    }
+#else
+    child_write(&b, 1);                      /* the tty echoes it */
+#endif
+}
+
+void run_input_enter(void) {
+    if (R.phase == PH_IDLE) return;
+#ifdef _WIN32
+    out_byte('\n');
+    child_write(R.line, R.line_len);
+    child_write("\r\n", 2);
+    R.line_len = 0;
+#else
+    child_write("\r", 1);
+#endif
+}
+
+void run_input_backspace(void) {
+    if (R.phase == PH_IDLE) return;
+#ifdef _WIN32
+    if (R.line_len == 0) return;
+    do R.line_len--; while (R.line_len > 0 && ((unsigned char)R.line[R.line_len] & 0xC0) == 0x80);
+    out_backspace();
+#else
+    child_write("\x7f", 1);
+#endif
+}
+
+/* ^D: end of input for the program. */
+void run_input_eof(void) {
+    if (R.phase == PH_IDLE) return;
+#ifdef _WIN32
+    if (R.line_len) { child_write(R.line, R.line_len); R.line_len = 0; }
+    win_child_close_stdin();
+#else
+    child_write("\x04", 1);
+#endif
+}
+
+void run_input_str(const char *s, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        if (s[i] == '\r') continue;
+        if (s[i] == '\n') run_input_enter();
+        else              run_input_char((unsigned char)s[i]);
+    }
 }

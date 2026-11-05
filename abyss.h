@@ -457,6 +457,14 @@ int         tbl_filter_index(const TableView *tv, int col);
 void        tbl_filter_menu_open(TableView *tv);
 bool        tbl_filter_menu_key(TableView *tv, int key, int win_h);
 bool        tbl_cell_editable(const TableView *tv, char *why, size_t why_sz);
+/* 'w': writes the rows the grid shows (sort and filters applied, in that
+ * order) of the current table to `path`, in the format of the source
+ * (CSV stays CSV, SQL dump stays SQL, SQLite gives a new database...). */
+struct Pane;
+bool        pane_table_export(struct Pane *p, const char *path, char *msg, size_t msg_sz);
+/* Default name for that copy: next to the source, "<name>_view.<ext>". */
+void        tbl_export_suggest(const struct Pane *p, const char *fallback_dir,
+                               char *out, size_t out_sz);
 
 /* Runs argv[0] (no shell) and captures its stdout; stderr is dropped.
  * Returns the exit code, 127 when the program could not be started. */
@@ -529,7 +537,7 @@ bool        doc_handle_key(DocView *dv, int key, int win_h);
 bool        doc_search(DocView *dv, const char *q, bool forward);
 void        doc_status(const DocView *dv, char *out, size_t out_sz);
 
-typedef struct {
+typedef struct Pane {
     GapBuf    *buf;
     LineIdx   *li;
     SynCtx    *syn;
@@ -580,12 +588,18 @@ typedef struct {
     bool       binary_view;
 
     bool       mem_mode;          /* F8 memory editor shown in this pane */
+
+    /* page fetched from the F1 field (curl): shown without a file on
+     * disk until it is saved; url_name is the local name it would get */
+    char       url[2048];
+    char       url_name[256];
 } Pane;
 
 Pane *pane_new(void);
 void  pane_free(Pane *p);
 void  pane_open_file(Pane *p, const char *path);
 bool  pane_save_file(Pane *p, const char *path);
+bool  pane_save_file_sync(Pane *p);
 void  pane_set_window(Pane *p, WINDOW *w, int y, int x, int h, int ww);
 void  pane_render(Pane *p, bool force);
 void  pane_insert_char(Pane *p, char c);
@@ -627,6 +641,9 @@ typedef struct {
 
 typedef struct {
     char     cwd[4096];
+    /* field at the top of the tree: a path, a URL, or (plain text) a
+     * filter on the names of the folder */
+    char     query[2048];
     FTEntry *entries;
     size_t   count;
     size_t   cap;
@@ -645,6 +662,11 @@ void        ft_go_up(FileTree *ft);
 const char *ft_selected_path(FileTree *ft, char *buf, size_t bufsz);
 void        ft_render(FileTree *ft, WINDOW *win, int win_h, int win_w, bool is_active);
 bool        ft_handle_key(FileTree *ft, int key, char *open_path, size_t path_sz);
+/* the field holds a filter (not a path nor a URL) */
+bool        ft_query_is_filter(const char *q);
+void        ft_query_set(FileTree *ft, const char *q);
+/* Tab: completes the path typed in the field */
+bool        ft_query_complete(FileTree *ft);
 
 #define FILEINFO_DEFAULT_W  36
 #define FILEINFO_MIN_W      28
@@ -680,6 +702,7 @@ typedef enum {
     MODE_TABLE_EDIT,
     MODE_DOC_SEARCH,
     MODE_MEM_INPUT,
+    MODE_TABLE_EXPORT,
 } EditorMode;
 
 typedef struct {
@@ -696,6 +719,8 @@ typedef struct {
     char      *out_text;
     size_t     out_scroll;
     bool       out_visible;
+    bool       out_focus;     /* keys go to the running program   */
+    bool       out_follow;    /* panel sticks to the newest output */
 
     WINDOW    *status_win;
     WINDOW    *title_win;
@@ -738,9 +763,28 @@ void editor_close_split(void);
 void editor_focus_next(void);
 void editor_resize_panes(void);
 
-void run_file(const char *path, Language lang, char *out_buf, size_t out_max,
-              char *timing, size_t timing_sz);
-void run_async(const char *path, Language lang);
+/* ^B: build + run in a live console (run.c). run_start launches the
+ * child and returns at once (false when nothing keeps running: server,
+ * browser, error — `msg` then holds the outcome); the main loop calls
+ * run_poll, which streams the output into `buf` and reports
+ * RUN_EV_OUTPUT / RUN_EV_DONE. The run_input_* calls feed its stdin. */
+#define RUN_OUT_CAP   (1 << 18)
+#define RUN_EV_OUTPUT 1
+#define RUN_EV_DONE   2
+bool        run_start(const char *path, Language lang, char *buf, size_t cap,
+                      int cols, int rows, char *msg, size_t msg_sz);
+int         run_poll(void);
+bool        run_active(void);
+bool        run_compiling(void);
+const char *run_timing(void);
+void        run_resize(int cols, int rows);
+void        run_stop(void);
+void        run_interrupt(void);
+void        run_input_char(int c);
+void        run_input_enter(void);
+void        run_input_backspace(void);
+void        run_input_eof(void);
+void        run_input_str(const char *s, size_t n);
 
 /* ─── Build options (^B ^B menu) ───────────────────────────
  * Compiled languages get a per-language table of toggleable compiler

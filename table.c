@@ -1799,7 +1799,9 @@ bool pane_table_enter(Pane *p) {
             ok = tbl_load_sqlite(tv, p->filename);
         } else {
             char *s = gb_to_str(p->buf);
-            ok = tbl_load_text(tv, p->filename, s, blen, p->lang);
+            /* a fetched page has no file: its would-be name gives the format */
+            const char *nm = p->filename[0] ? p->filename : p->url_name;
+            ok = tbl_load_text(tv, nm, s, blen, p->lang);
             tv->from_hex = false;
             free(s);
         }
@@ -2011,6 +2013,398 @@ bool pane_table_edit(Pane *p, const char *value) {
     bool ok = pane_table_enter(p);
     if (ok) snprintf(E_notify, sizeof E_notify, "Cell updated  (^S save, ^Z undo)");
     return ok;
+}
+
+/* ─── Saving the rows shown ('w') ─────────────────────────────────
+ * The grid as it is shown — sort order and filters applied — written to
+ * a new file in the format of the source. Values come from the source
+ * text where the parser kept their position (SQL literals, raw JSON), so
+ * numbers, NULLs and nested JSON round-trip unchanged. */
+
+static const char *fmt_ext(const TableView *tv) {
+    const char *f = tv->fmt ? tv->fmt : "";
+    if (!strcmp(f, "CSV"))      return ".csv";
+    if (!strcmp(f, "TSV"))      return ".tsv";
+    if (!strcmp(f, "PSV"))      return ".psv";
+    if (!strcmp(f, "JSON"))     return ".json";
+    if (!strcmp(f, "JSONL"))    return ".jsonl";
+    if (!strcmp(f, "SQL"))      return ".sql";
+    if (!strcmp(f, "SQLite"))   return ".db";
+    return ".md";
+}
+
+/* the file the table was read from (or the name a fetched page would get) */
+static const char *export_source(const Pane *p) {
+    const TableView *tv = p->table;
+    if (tv && tv->sqlite && tv->path[0]) return tv->path;
+    if (p->hex_mode && p->hex && p->hex->filename[0]) return p->hex->filename;
+    if (p->filename[0]) return p->filename;
+    if (p->url_name[0]) return p->url_name;
+    return "";
+}
+
+void tbl_export_suggest(const Pane *p, const char *fallback_dir, char *out, size_t out_sz) {
+    const TableView *tv = p->table;
+    const char *src = export_source(p);
+    const char *ext = path_ext(src);
+    if (!*ext && tv) ext = fmt_ext(tv);
+    char dir[4096] = "", stem[512] = "table";
+    const char *sl = path_sep(src);
+    if (sl)                                    /* next to the source */
+        snprintf(dir, sizeof dir, "%.*s", (int)(sl - src), src);
+    else if (fallback_dir && *fallback_dir)    /* fetched page: no folder of its own */
+        snprintf(dir, sizeof dir, "%s", fallback_dir);
+    const char *base = sl ? sl + 1 : src;
+    if (*base) {
+        size_t n = strlen(base) - strlen(path_ext(base));
+        if (n) snprintf(stem, sizeof stem, "%.*s", (int)n, base);
+    }
+    /* several tables in the source: the copy is named after the one shown */
+    if (tv && tv->nsheets > 1 && tv->cur < tv->nsheets) {
+        size_t l = strlen(stem);
+        snprintf(stem + l, sizeof stem - l, "_%.100s", tv->sheets[tv->cur].name);
+        for (char *c = stem + l + 1; *c; c++)
+            if (*c == '/' || *c == '\\' || *c == ' ' || *c == ':') *c = '_';
+    }
+    if (dir[0]) snprintf(out, out_sz, "%s/%s_view%s", dir, stem, ext);
+    else        snprintf(out, out_sz, "%s_view%s", stem, ext);
+}
+
+/* SQL identifier, quoted unless it is a plain word */
+static void enc_ident(Str *o, const char *v) {
+    bool plain = *v && (isalpha((unsigned char)*v) || *v == '_');
+    for (const char *c = v; plain && *c; c++)
+        if (!isalnum((unsigned char)*c) && *c != '_') plain = false;
+    if (plain) { str_puts(o, v); return; }
+    str_putc(o, '"');
+    for (const char *c = v; *c; c++) { if (*c == '"') str_putc(o, '"'); str_putc(o, *c); }
+    str_putc(o, '"');
+}
+
+/* source text of a cell, when the parser kept where it came from */
+static bool cell_raw(const TblSheet *t, size_t pr, int c, const char *src, size_t slen,
+                     int kind, const char **raw, size_t *rlen) {
+    if (!t->span || !src) return false;
+    const TblSpan *sp = &t->span[pr * (size_t)t->ncols + (size_t)c];
+    if (sp->kind != kind || sp->off + sp->len > slen) return false;
+    *raw = src + sp->off; *rlen = sp->len;
+    return true;
+}
+
+/* CREATE TABLE statement of `name` in a SQL dump, kept as written */
+static bool sql_find_create(const char *s, size_t len, const char *name,
+                            size_t *off, size_t *n) {
+    TableView *tmp = tbl_new();
+    tmp->arena = arena_new(1 << 12);
+    Loader L = { .tv = tmp };
+    SqlLex x = { .L = &L, .s = s, .len = len };
+    bool found = false;
+    sql_next(&x);
+    while (x.tok.t != T_EOF && !found) {
+        if (!tok_kw(&x.tok, "CREATE")) { sql_skip_stmt(&x); continue; }
+        const char *st = x.tok.p;
+        sql_next(&x);
+        while (tok_kw(&x.tok, "TEMP") || tok_kw(&x.tok, "TEMPORARY") ||
+               tok_kw(&x.tok, "UNLOGGED") || tok_kw(&x.tok, "GLOBAL") || tok_kw(&x.tok, "LOCAL"))
+            sql_next(&x);
+        char nm[128] = "";
+        if (tok_kw(&x.tok, "TABLE")) {
+            sql_next(&x);
+            if (tok_kw(&x.tok, "IF")) { sql_next(&x); sql_next(&x); sql_next(&x); }
+            sql_name(&x, nm, sizeof nm);
+        }
+        bool hit = nm[0] && strcmp(nm, name) == 0;
+        int depth = 0;
+        while (x.tok.t != T_EOF) {
+            if (tok_is(&x.tok, '(')) depth++;
+            else if (tok_is(&x.tok, ')')) depth--;
+            else if (tok_is(&x.tok, ';') && depth <= 0) break;
+            sql_next(&x);
+        }
+        if (hit) {
+            const char *end = x.tok.t == T_EOF ? s + len : x.tok.p + 1;
+            *off = (size_t)(st - s); *n = (size_t)(end - st);
+            found = true;
+        }
+        if (x.tok.t != T_EOF) sql_next(&x);
+    }
+    ld_free(&L);
+    tbl_free(tmp);
+    return found;
+}
+
+static void put_json_value(Str *o, const TblSheet *t, size_t pr, int c,
+                           const char *src, size_t slen) {
+    const char *v = t->cells[pr * (size_t)t->ncols + (size_t)c];
+    const char *raw; size_t rl;
+    if (cell_raw(t, pr, c, src, slen, SPK_JRAW, &raw, &rl)) {
+        /* numbers, true/false/null, nested arrays and objects as written,
+         * on one line (raw newlines can only be whitespace in JSON) */
+        for (size_t i = 0; i < rl; i++)
+            str_putc(o, (raw[i] == '\n' || raw[i] == '\r') ? ' ' : raw[i]);
+        return;
+    }
+    enc_json_str(o, v ? v : "");
+}
+
+static void put_md_row(Str *o, char **vals, const int *w, int nc, const char *nl) {
+    for (int c = 0; c < nc; c++) {
+        str_puts(o, c ? " | " : "| ");
+        Str e = {0};
+        enc_md(&e, vals[c] ? vals[c] : "", 0);
+        str_putc(&e, '\0');
+        str_puts(o, e.s);
+        for (int k = disp_width(e.s); k < w[c]; k++) str_putc(o, ' ');
+        free(e.s);
+    }
+    str_puts(o, " |");
+    str_puts(o, nl);
+}
+
+static bool write_all(const char *path, const char *data, size_t len) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return false;
+    bool ok = fwrite(data, 1, len, f) == len;
+    if (fclose(f) != 0) ok = false;
+    return ok;
+}
+
+/* SQLite: a new database holding the table's schema and the rows shown,
+ * copied by rowid from the source (types and BLOBs kept), through the
+ * sqlite3 CLI. Views and WITHOUT ROWID tables get their values instead. */
+static bool export_sqlite(const TableView *tv, const TblSheet *t, const char *path,
+                          char *msg, size_t msz) {
+    if (!proc_have("sqlite3")) { snprintf(msg, msz, "sqlite3 not found"); return false; }
+    if (strchr(tv->path, '\'') || strchr(path, '\'')) {
+        snprintf(msg, msz, "Paths with a quote (') are not supported for SQLite copies");
+        return false;
+    }
+    char qn[512];
+    sql_quote(qn, sizeof qn, t->name, '"');
+
+    char lit[512], q[700];
+    sql_quote(lit, sizeof lit, t->name, '\'');
+    snprintf(q, sizeof q, "SELECT sql FROM sqlite_master WHERE type='table' AND name=%s;", lit);
+    char *qa[] = { "sqlite3", "-readonly", "-batch", "-noheader", "-list",
+                   (char *)tv->path, q, NULL };
+    char *schema = NULL; size_t sl = 0;
+    if (run_capture(qa, &schema, &sl) != 0) sl = 0;
+    while (sl && (schema[sl - 1] == '\n' || schema[sl - 1] == '\r' || schema[sl - 1] == ' '))
+        schema[--sl] = '\0';
+
+    Str o = {0};
+    bool by_rowid = t->rowid && sl > 0;
+    if (by_rowid) {
+        str_puts(&o, "ATTACH '"); str_puts(&o, tv->path); str_puts(&o, "' AS src;\n");
+    }
+    str_puts(&o, "BEGIN;\n");
+    if (sl) { str_puts(&o, schema); str_puts(&o, ";\n"); }
+    else {
+        str_puts(&o, "CREATE TABLE "); str_puts(&o, qn); str_puts(&o, " (");
+        for (int c = 0; c < t->ncols; c++) {
+            if (c) str_puts(&o, ", ");
+            enc_ident(&o, t->hdr[c] ? t->hdr[c] : "");
+            str_puts(&o, t->numeric[c] ? " NUMERIC" : " TEXT");
+        }
+        str_puts(&o, ");\n");
+    }
+    for (size_t r = 0; r < t->nview; r++) {
+        size_t pr = tbl_phys_row(t, r);
+        str_puts(&o, "INSERT INTO main."); str_puts(&o, qn);
+        if (by_rowid) {
+            char tail[64];
+            snprintf(tail, sizeof tail, " WHERE rowid = %lld;\n", t->rowid[pr]);
+            str_puts(&o, " SELECT * FROM src."); str_puts(&o, qn); str_puts(&o, tail);
+        } else {
+            str_puts(&o, " VALUES (");
+            for (int c = 0; c < t->ncols; c++) {
+                const char *v = t->cells[pr * (size_t)t->ncols + (size_t)c];
+                if (c) str_puts(&o, ", ");
+                if (!v) str_puts(&o, "NULL"); else enc_sql(&o, v);
+            }
+            str_puts(&o, ");\n");
+        }
+    }
+    str_puts(&o, "COMMIT;\n");
+    free(schema);
+
+    char script[4200];
+    snprintf(script, sizeof script, "%s.abyss-tmp.sql", path);
+    bool ok = write_all(script, o.s, o.n);
+    free(o.s);
+    if (!ok) { snprintf(msg, msz, "Cannot write %.150s: %s", script, strerror(errno)); return false; }
+    remove(path);                                   /* a fresh database */
+    char rd[4300];
+    snprintf(rd, sizeof rd, ".read '%s'", script);
+    char *ra[] = { "sqlite3", "-batch", "-bail", (char *)path, rd, NULL };
+    char *out; size_t olen;
+    int rc = run_capture(ra, &out, &olen);
+    free(out);
+    remove(script);
+    if (rc != 0) {
+        snprintf(msg, msz, "sqlite3 could not build %.150s (code %d)", path, rc);
+        return false;
+    }
+    return true;
+}
+
+bool pane_table_export(Pane *p, const char *path_in, char *msg, size_t msz) {
+    TableView *tv = p->table;
+    msg[0] = '\0';
+    if (!tv || tv->cur >= tv->nsheets) { snprintf(msg, msz, "No table"); return false; }
+    const TblSheet *t = &tv->sheets[tv->cur];
+    if (!path_in || !*path_in) { snprintf(msg, msz, "No file name"); return false; }
+
+    /* keep the source's extension when none was typed */
+    char path[4096];
+    const char *src_name = export_source(p);
+    const char *ext = path_ext(src_name);
+    if (!*ext) ext = fmt_ext(tv);
+    if (*path_ext(path_in)) snprintf(path, sizeof path, "%s", path_in);
+    else                    snprintf(path, sizeof path, "%s%s", path_in, ext);
+
+    /* a copy, never the source itself */
+    char ra[4096], rb[4096];
+    if (src_name[0] && realpath(path, ra) && realpath(src_name, rb) && !strcmp(ra, rb)) {
+        snprintf(msg, msz, "That is the source file: choose another name for the copy");
+        return false;
+    }
+
+    if (tv->sqlite) {
+        if (!export_sqlite(tv, t, path, msg, msz)) return false;
+        snprintf(msg, msz, "Saved %zu row%s of %.60s to %.150s", t->nview,
+                 t->nview == 1 ? "" : "s", t->name, path);
+        return true;
+    }
+
+    /* the text the table was read from, for cells kept as written */
+    char *src = NULL; size_t slen = 0;
+    bool crlf = p->crlf;
+    if (tv->from_hex && p->hex) {
+        src = malloc(p->hex->data_len + 1);
+        memcpy(src, p->hex->data, p->hex->data_len);
+        slen = p->hex->data_len;
+        src[slen] = '\0';
+        crlf = false;
+        for (size_t i = 0; i + 1 < slen && i < 65536 && !crlf; i++)
+            crlf = src[i] == '\r' && src[i + 1] == '\n';
+    } else {
+        src  = gb_to_str(p->buf);
+        slen = gb_len(p->buf);
+    }
+    const char *nl = crlf ? "\r\n" : "\n";
+    const char *f = tv->fmt ? tv->fmt : "";
+    int nc = t->ncols;
+    Str o = {0};
+
+    if (!strcmp(f, "CSV") || !strcmp(f, "TSV") || !strcmp(f, "PSV")) {
+        char d = tv->delim ? tv->delim : (!strcmp(f, "TSV") ? '\t' : !strcmp(f, "PSV") ? '|' : ',');
+        for (int c = 0; c < nc; c++) {
+            if (c) str_putc(&o, d);
+            enc_csv(&o, t->hdr[c] ? t->hdr[c] : "", d);
+        }
+        str_puts(&o, nl);
+        for (size_t r = 0; r < t->nview; r++) {
+            size_t pr = tbl_phys_row(t, r);
+            for (int c = 0; c < nc; c++) {
+                const char *v = t->cells[pr * (size_t)nc + (size_t)c];
+                if (c) str_putc(&o, d);
+                enc_csv(&o, v ? v : "", d);
+            }
+            str_puts(&o, nl);
+        }
+    } else if (!strcmp(f, "JSON") || !strcmp(f, "JSONL")) {
+        bool lines = !strcmp(f, "JSONL");
+        if (!lines) { str_putc(&o, '['); str_puts(&o, nl); }
+        for (size_t r = 0; r < t->nview; r++) {
+            size_t pr = tbl_phys_row(t, r);
+            if (!lines) str_puts(&o, "  ");
+            str_putc(&o, '{');
+            for (int c = 0, k = 0; c < nc; c++) {
+                if (!t->cells[pr * (size_t)nc + (size_t)c]) continue;   /* key absent */
+                if (k++) str_puts(&o, ", ");
+                enc_json_str(&o, t->hdr[c] ? t->hdr[c] : "");
+                str_puts(&o, ": ");
+                put_json_value(&o, t, pr, c, src, slen);
+            }
+            str_putc(&o, '}');
+            if (!lines && r + 1 < t->nview) str_putc(&o, ',');
+            str_puts(&o, nl);
+        }
+        if (!lines) { str_putc(&o, ']'); str_puts(&o, nl); }
+    } else if (!strcmp(f, "SQL")) {
+        size_t co, cn;
+        if (sql_find_create(src, slen, t->name, &co, &cn)) {
+            for (size_t i = 0; i < cn; i++) str_putc(&o, src[co + i]);
+            str_puts(&o, nl); str_puts(&o, nl);
+        }
+        Str head = {0};
+        str_puts(&head, "INSERT INTO ");
+        enc_ident(&head, t->name);
+        str_puts(&head, " (");
+        for (int c = 0; c < nc; c++) {
+            if (c) str_puts(&head, ", ");
+            enc_ident(&head, t->hdr[c] ? t->hdr[c] : "");
+        }
+        str_puts(&head, ") VALUES (");
+        str_putc(&head, '\0');
+        for (size_t r = 0; r < t->nview; r++) {
+            size_t pr = tbl_phys_row(t, r);
+            str_puts(&o, head.s);
+            for (int c = 0; c < nc; c++) {
+                const char *v = t->cells[pr * (size_t)nc + (size_t)c];
+                const char *raw; size_t rl;
+                if (c) str_puts(&o, ", ");
+                if (cell_raw(t, pr, c, src, slen, SPK_SQL, &raw, &rl))
+                    for (size_t i = 0; i < rl; i++) str_putc(&o, raw[i]);
+                else if (!v) str_puts(&o, "NULL");
+                else enc_sql(&o, v);
+            }
+            str_puts(&o, ");");
+            str_puts(&o, nl);
+        }
+        free(head.s);
+    } else {                                     /* Markdown / psql / text tables */
+        int *w = calloc((size_t)nc + 1, sizeof *w);
+        for (int c = 0; c < nc; c++) {
+            w[c] = disp_width(t->hdr[c] ? t->hdr[c] : "");
+            if (w[c] < 3) w[c] = 3;
+        }
+        for (size_t r = 0; r < t->nview; r++) {
+            size_t pr = tbl_phys_row(t, r);
+            for (int c = 0; c < nc; c++) {
+                const char *v = t->cells[pr * (size_t)nc + (size_t)c];
+                if (!v) continue;
+                Str e = {0};
+                enc_md(&e, v, 0);
+                str_putc(&e, '\0');
+                int dw = disp_width(e.s);
+                if (dw > w[c]) w[c] = dw;
+                free(e.s);
+            }
+        }
+        put_md_row(&o, t->hdr, w, nc, nl);
+        for (int c = 0; c < nc; c++) {
+            str_puts(&o, c ? "-|-" : "|-");
+            for (int k = 0; k < w[c]; k++) str_putc(&o, '-');
+        }
+        str_puts(&o, "-|");
+        str_puts(&o, nl);
+        for (size_t r = 0; r < t->nview; r++)
+            put_md_row(&o, t->cells + tbl_phys_row(t, r) * (size_t)nc, w, nc, nl);
+        free(w);
+    }
+    free(src);
+
+    bool ok = write_all(path, o.s ? o.s : "", o.n);
+    free(o.s);
+    if (!ok) {
+        snprintf(msg, msz, "Cannot write %.150s: %s", path, strerror(errno));
+        return false;
+    }
+    snprintf(msg, msz, "Saved %zu row%s%s to %.150s", t->nview, t->nview == 1 ? "" : "s",
+             (tv->nsort || tv->nfilt) ? " (as sorted / filtered)" : "", path);
+    return true;
 }
 
 /* ─── Rendering ────────────────────────────────────────────────── */

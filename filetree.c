@@ -5,6 +5,15 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <ctype.h>
+#include <strings.h>
+
+/* case-insensitive "contains" (strcasestr is missing on Windows) */
+static bool name_has(const char *name, const char *needle) {
+    size_t n = strlen(needle);
+    for (; *name; name++)
+        if (strncasecmp(name, needle, n) == 0) return true;
+    return n == 0;
+}
 
 #define TREE_CP_BASE   40
 #define TREE_CP_SLOTS  64
@@ -12,6 +21,7 @@
 #define TREE_CP_SEL    (TREE_CP_BASE + TREE_CP_SLOTS)
 #define TREE_CP_HEADER (TREE_CP_BASE + TREE_CP_SLOTS + 1)
 #define TREE_CP_BORDER (TREE_CP_BASE + TREE_CP_SLOTS + 2)
+#define TREE_CP_FIELD  (TREE_CP_BASE + TREE_CP_SLOTS + 3)
 
 typedef struct {
     char  key[32];      
@@ -158,6 +168,7 @@ void ft_init_color_pairs(void)
     init_pair(TREE_CP_SEL,    COLOR_BLACK, COLOR_CYAN);
     init_pair(TREE_CP_HEADER, COLOR_WHITE, COLOR_RED);
     init_pair(TREE_CP_BORDER, COLOR_CYAN,  -1);
+    init_pair(TREE_CP_FIELD,  COLOR_WHITE, COLOR_BLACK);
 }
 
 static const ColorRule *find_rule(const FTEntry *e)
@@ -253,10 +264,13 @@ void ft_reload(FileTree *ft)
 
     DIR *d = opendir(ft->cwd);
     if (!d) return;
+    bool filtering = ft_query_is_filter(ft->query);
 
     struct dirent *de;
     while ((de = readdir(d))) {
         if (strcmp(de->d_name, ".") == 0) continue;
+        if (filtering && (strcmp(de->d_name, "..") == 0 ||
+                          !name_has(de->d_name, ft->query))) continue;
 
         char full[4096];
         snprintf(full, sizeof full, "%s/%s", ft->cwd, de->d_name);
@@ -307,6 +321,7 @@ void ft_enter(FileTree *ft)
 
     ft->selected = 0;
     ft->scroll   = 0;
+    ft->query[0] = '\0';
     ft_reload(ft);
 }
 
@@ -327,6 +342,7 @@ void ft_go_up(FileTree *ft)
 
     ft->selected = 0;
     ft->scroll   = 0;
+    ft->query[0] = '\0';
     ft_reload(ft);
 
     if (old_name[0]) {
@@ -399,7 +415,39 @@ void ft_render(FileTree *ft, WINDOW *win, int win_h, int win_w, bool is_active)
     }
 
     
-    int rows = win_h - 1;
+    /* the field: path / URL / filter, typed straight into the tree */
+    {
+        wmove(win, 1, 1);
+        wattron(win, COLOR_PAIR(TREE_CP_FIELD));
+        int room = inner_w - 3;                       /* " > " + text + cursor */
+        if (room < 1) room = 1;
+        const char *q = ft->query;
+        if (q[0] || is_active) {
+            const char *show = q;
+            /* keep the end of a long path visible, cut on a character */
+            while ((int)strlen(show) > room - 1) {
+                show++;
+                while ((*show & 0xC0) == 0x80) show++;
+            }
+            wprintw(win, " %s ", ft_query_is_filter(q) ? "?" : ">");
+            waddstr(win, show);
+            if (is_active) waddch(win, ' ' | A_REVERSE);
+        } else {
+            wprintw(win, " > ");
+        }
+        int y, x; getyx(win, y, x); (void)y;
+        if (!q[0]) {
+            wattron(win, A_DIM);
+            int left = win_w - x - 1;
+            if (left > 0) wprintw(win, "%.*s", left, "path, URL or filter");
+            wattroff(win, A_DIM);
+            getyx(win, y, x);
+        }
+        while (x < win_w) { waddch(win, ' '); x++; }
+        wattroff(win, COLOR_PAIR(TREE_CP_FIELD));
+    }
+
+    int rows = win_h - 2;
     if (rows < 1) rows = 1;
 
     
@@ -410,7 +458,7 @@ void ft_render(FileTree *ft, WINDOW *win, int win_h, int win_w, bool is_active)
 
     for (int row = 0; row < rows; row++) {
         size_t idx = ft->scroll + (size_t)row;
-        wmove(win, row + 1, 1);
+        wmove(win, row + 2, 1);
 
         
         if (idx >= ft->count) {
@@ -489,4 +537,89 @@ bool ft_handle_key(FileTree *ft, int key, char *open_path, size_t path_sz)
         default:
             return false;
     }
+}
+/* ─── The field at the top of the tree ─────────────────────────────
+ * A URL (http://, https://, ftp://, www.) is fetched, anything that looks
+ * like a path (/, ~, ./, C:\...) is opened, plain text filters the names
+ * of the folder shown. */
+
+static bool query_is_url(const char *q) {
+    return !strncasecmp(q, "http://", 7) || !strncasecmp(q, "https://", 8) ||
+           !strncasecmp(q, "ftp://", 6)  || !strncasecmp(q, "ftps://", 7)  ||
+           !strncasecmp(q, "www.", 4);
+}
+
+bool ft_query_is_filter(const char *q) {
+    if (!q || !q[0]) return false;
+    while (*q == ' ') q++;
+    if (!*q || query_is_url(q) || *q == '~' || *q == '"' || *q == '\'') return false;
+    if (strchr(q, '/') || strchr(q, '\\')) return false;
+    if (isalpha((unsigned char)q[0]) && q[1] == ':') return false;    /* C: */
+    if (!strncasecmp(q, "file:", 5)) return false;
+    return true;
+}
+
+void ft_query_set(FileTree *ft, const char *q) {
+    bool was = ft_query_is_filter(ft->query);
+    snprintf(ft->query, sizeof ft->query, "%s", q ? q : "");
+    bool now = ft_query_is_filter(ft->query);
+    if (was || now) {                  /* the list only changes for filters */
+        ft->selected = 0;
+        ft->scroll   = 0;
+        ft_reload(ft);
+    }
+}
+
+/* Tab: completes the last part of the path typed, up to what every
+ * matching name shares (a folder gets its trailing '/'). */
+bool ft_query_complete(FileTree *ft) {
+    const char *q = ft->query;
+    if (!q[0] || ft_query_is_filter(q) || query_is_url(q)) return false;
+
+    char full[4096];
+    const char *home = getenv("HOME");
+    if (q[0] == '~' && home) snprintf(full, sizeof full, "%s%s", home, q + 1);
+    else if (q[0] == '/' || (isalpha((unsigned char)q[0]) && q[1] == ':'))
+        snprintf(full, sizeof full, "%s", q);
+    else snprintf(full, sizeof full, "%s/%s", ft->cwd, q);
+
+    char *sl = strrchr(full, '/');
+    if (!sl) return false;
+    char dir[4096], part[1024];
+    snprintf(part, sizeof part, "%s", sl + 1);
+    if (sl == full) snprintf(dir, sizeof dir, "/");
+    else            snprintf(dir, sizeof dir, "%.*s", (int)(sl - full), full);
+
+    DIR *d = opendir(dir);
+    if (!d) return false;
+    size_t pl = strlen(part);
+    char common[1024] = "";
+    int nmatch = 0;
+    bool only_dir = false;
+    struct dirent *de;
+    while ((de = readdir(d))) {
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+        if (strncmp(de->d_name, part, pl) != 0) continue;
+        if (pl == 0 && de->d_name[0] == '.') continue;          /* hidden: type the dot */
+        if (nmatch++ == 0) {
+            snprintf(common, sizeof common, "%s", de->d_name);
+            char p2[4096]; struct stat st;
+            snprintf(p2, sizeof p2, "%s/%s", dir, de->d_name);
+            only_dir = stat(p2, &st) == 0 && S_ISDIR(st.st_mode);
+        } else {
+            size_t i = 0;
+            while (common[i] && common[i] == de->d_name[i]) i++;
+            common[i] = '\0';
+        }
+    }
+    closedir(d);
+    if (nmatch == 0 || strlen(common) < pl) return false;
+
+    char out[2048];
+    size_t keep = strlen(q) - pl;                 /* what precedes the last part */
+    snprintf(out, sizeof out, "%.*s%s%s", (int)keep, q, common,
+             (nmatch == 1 && only_dir) ? "/" : "");
+    if (!strcmp(out, ft->query)) return false;
+    snprintf(ft->query, sizeof ft->query, "%s", out);
+    return true;
 }

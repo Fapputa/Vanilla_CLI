@@ -1,4 +1,5 @@
 #include "abyss.h"
+#include <strings.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -380,6 +381,7 @@ static void draw_wrapped(WINDOW *win, int *vrowp, int scroll, int win_h,
         int screen_row = 1 + *vrowp - scroll;
         if (screen_row >= win_h) break;
         size_t take = (size_t)w < len - pos ? (size_t)w : len - pos;
+        if (take > sizeof line - 1) take = sizeof line - 1;   /* very wide panel */
         if (pos + take < len) {
             size_t last_sp = take;
             for (size_t i = take; i > 0; i--)
@@ -791,7 +793,22 @@ void fi_render(FileInfo *fi, WINDOW *win, int win_h, int win_w) {
         const char *labels[] = {"R", "W", "X"};
         int modes[] = {R_OK, W_OK, X_OK};
         for (int ai = 0; ai < 3 && ax + 3 < win_w; ai++) {
+#ifdef _WIN32
+            /* the Windows CRT has no X_OK: access(path, 1) is an "invalid
+             * parameter" that terminates the program on the spot. There,
+             * "executable" is decided by the extension. */
+            bool ok;
+            if (modes[ai] == X_OK) {
+                const char *xd = strrchr(path, '.');
+                ok = xd && (!strcasecmp(xd, ".exe") || !strcasecmp(xd, ".com") ||
+                            !strcasecmp(xd, ".bat") || !strcasecmp(xd, ".cmd") ||
+                            !strcasecmp(xd, ".ps1"));
+            } else {
+                ok = (access(path, modes[ai]) == 0);
+            }
+#else
             bool ok = (access(path, modes[ai]) == 0);
+#endif
             wattron(win, COLOR_PAIR(ok ? FI_CP_PERM_ON : FI_CP_PERM_OFF) | (ok ? A_BOLD : A_DIM));
             mvwprintw(win, row, ax, "%s", ok ? labels[ai] : "-");
             wattroff(win, COLOR_PAIR(ok ? FI_CP_PERM_ON : FI_CP_PERM_OFF) | (ok ? A_BOLD : A_DIM));
@@ -816,7 +833,9 @@ void fi_render(FileInfo *fi, WINDOW *win, int win_h, int win_w) {
             if (ROW_VIS) {
                 char tbuf[64];
                 struct tm *tm_info = localtime(&times[ti].t);
-                strftime(tbuf, sizeof tbuf, "%Y-%m-%d %H:%M:%S", tm_info);
+                /* NULL for a date the C library cannot represent */
+                if (!tm_info || !strftime(tbuf, sizeof tbuf, "%Y-%m-%d %H:%M:%S", tm_info))
+                    snprintf(tbuf, sizeof tbuf, "(unknown)");
                 wattron(win, COLOR_PAIR(FI_CP_KEY));
                 mvwprintw(win, row, x, "%-6s: ", times[ti].label);
                 wattroff(win, COLOR_PAIR(FI_CP_KEY));

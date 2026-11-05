@@ -6,6 +6,8 @@ void ft_init_color_pairs(void);
 #include <string.h>
 #include <locale.h>
 #include <time.h>
+#include <dirent.h>
+#include <strings.h>
 #ifdef _WIN32
 int win_console_size(int *rows, int *cols);
 #ifdef _WIN32
@@ -141,6 +143,8 @@ static void layout_windows(void) {
 
     place_win(&E.title_win, title_h, cols, 0, 0);
     if (E.out_visible) place_win(&E.out_win, out_h, cols, title_h + edit_h, 0);
+    if (E.out_visible && E.out_win && run_active())
+        run_resize(getmaxx(E.out_win), getmaxy(E.out_win) - 1);
     place_win(&E.status_win, status_h, cols, rows - 1, 0);
 
     int npanes = E.npanes < 1 ? 1 : E.npanes;
@@ -194,7 +198,7 @@ static void render_title(void) {
                 "  %s  ^Q:Quit", ap->binary_view ? "F2:Hex" : "F7:Edit the text");
         else if (ap->table_mode)
             wprintw(E.title_win,
-                " [TABLE] Arrows/hjkl:Move  Enter/e:Edit cell  s:Sort col (adds)  S:Unsort all  f:Filter col  F:Unfilter all  v:Show cell"
+                " [TABLE] Arrows/hjkl:Move  Enter/e:Edit cell  s:Sort col (adds)  S:Unsort all  f:Filter col  F:Unfilter all  w:Save rows shown  v:Show cell"
                 "  Tab:Next table  ^F:Find  ^N/^P  ^Z/^Y:Undo/Redo  ^S:Save  F6:Exit  ^Q:Quit");
         else if (ap->hex_mode)
             wprintw(E.title_win,
@@ -217,7 +221,10 @@ static void render_title(void) {
          * shortened from the left to whatever room is left */
         int tw = getmaxx(E.title_win);
         char base[512] = "[No File]", dir[4096] = "";
-        if (ap->filename[0]) {
+        if (ap->url[0]) {                 /* fetched page: its name, then the URL */
+            snprintf(base, sizeof base, "%s  [URL]", ap->url_name);
+            snprintf(dir, sizeof dir, "%s", ap->url);
+        } else if (ap->filename[0]) {
             const char *sl = strrchr(ap->filename, '/');
 #ifdef _WIN32
             const char *bs = strrchr(ap->filename, '\\');
@@ -367,17 +374,21 @@ static void render_pane_borders(void) {
 }
 
 /* Output of ^B, wrapped to the panel width (by display columns, so
- * accented compiler messages wrap where they should). */
-static void render_output(void) {
-    if (!E.out_visible || !E.out_win || !E.out_text) return;
-    int h, w; getmaxyx(E.out_win, h, w);
-    if (w < 1 || h < 1) return;
-    werase(E.out_win);
-    wattron(E.out_win, COLOR_PAIR(COLOR_PAIR_COMMENT));
+ * accented compiler messages wrap where they should). Row 0 is a header
+ * saying what runs and which keys do what; while the console follows
+ * the output, the newest rows stay in view. */
+static size_t out_total_rows = 0;   /* wrapped rows of the text, last render */
+static int    out_text_rows  = 1;   /* rows the panel shows text on          */
+
+/* Walks the text wrapped to `w` columns: returns how many rows it takes,
+ * draws rows [first, first + h) from y0 when `win` is given, and tells
+ * where the text ends (where the console cursor goes). */
+static size_t out_layout(WINDOW *win, int y0, int w, size_t first, int h,
+                         size_t *end_row, int *end_col) {
     const char *ptr = E.out_text;
-    int row = 0;
-    size_t scroll = E.out_scroll;
-    while (*ptr && row < h) {
+    size_t row = 0;
+    int last_cols = 0;
+    while (*ptr) {
         const char *nl  = strchr(ptr, '\n');
         size_t      len = nl ? (size_t)(nl - ptr) : strlen(ptr);
         if (len && ptr[len - 1] == '\r') len--;
@@ -395,20 +406,80 @@ static void render_output(void) {
                 end += (size_t)k;
             }
             if (end == off && off < len) end = off + 1;
-            if (scroll > 0) scroll--;
-            else {
-                wmove(E.out_win, row, 0);
-                for (size_t i = off; i < end; i++)
-                    waddch(E.out_win, ptr[i] == '\t' ? ' ' : (chtype)(unsigned char)ptr[i]);
-                row++;
+            if (win && row >= first && row < first + (size_t)h) {
+                wmove(win, y0 + (int)(row - first), 0);
+                for (size_t i = off; i < end; i++) {
+                    if (ptr[i] == '\t') waddstr(win, "    ");
+                    else if ((unsigned char)ptr[i] >= 32) waddch(win, (chtype)(unsigned char)ptr[i]);
+                }
             }
+            last_cols = cols;
+            row++;
             off = end;
-        } while (off < len && row < h);
-        if (!nl) break;
+        } while (off < len);
+        if (!nl) {                                 /* text ends mid-line */
+            if (end_row) { *end_row = row - 1; *end_col = last_cols; }
+            return row;
+        }
         ptr = nl + 1;
     }
+    if (end_row) { *end_row = row; *end_col = 0; } /* after a newline */
+    return row;
+}
+
+static void render_output(void) {
+    if (!E.out_visible || !E.out_win || !E.out_text) return;
+    int h, w; getmaxyx(E.out_win, h, w);
+    if (w < 1 || h < 1) return;
+    werase(E.out_win);
+
+    bool live    = run_active();
+    bool console = live && E.out_focus;
+    int  y0      = h >= 2 ? 1 : 0;
+    int  th      = h - y0;
+    if (y0) {
+        char hdr[256];
+        if (console)
+            snprintf(hdr, sizeof hdr, " %s  |  type: input   Enter: send   ^D: end of input   ^C: stop   Esc: editor   PgUp/PgDn: scroll",
+                     run_compiling() ? "Compiling..." : "Running");
+        else if (live)
+            snprintf(hdr, sizeof hdr, " %s in the background  |  ^B: back to the console",
+                     run_compiling() ? "Compiling" : "Running");
+        else
+            snprintf(hdr, sizeof hdr, " Output  |  Enter: close   ^B: build & run again");
+        wattron(E.out_win, COLOR_PAIR(COLOR_PAIR_TITLE) | A_BOLD | A_REVERSE);
+        mvwhline(E.out_win, 0, 0, ' ', w);
+        mvwaddnstr(E.out_win, 0, 0, hdr, w);
+        wattroff(E.out_win, COLOR_PAIR(COLOR_PAIR_TITLE) | A_BOLD | A_REVERSE);
+    }
+
+    size_t end_row = 0; int end_col = 0;
+    size_t total = out_layout(NULL, 0, w, 0, 0, &end_row, &end_col);
+    size_t need  = (console && end_row >= total) ? end_row + 1 : total;
+    size_t max_first = need > (size_t)th ? need - (size_t)th : 0;
+    if (E.out_follow || E.out_scroll > max_first) E.out_scroll = max_first;
+    if (E.out_scroll >= max_first) E.out_follow = true;
+    out_total_rows = need;
+    out_text_rows  = th;
+
+    wattron(E.out_win, COLOR_PAIR(COLOR_PAIR_COMMENT));
+    out_layout(E.out_win, y0, w, E.out_scroll, th, NULL, NULL);
     wattroff(E.out_win, COLOR_PAIR(COLOR_PAIR_COMMENT));
+
+    if (console && end_row >= E.out_scroll && end_row < E.out_scroll + (size_t)th)
+        mvwaddch(E.out_win, y0 + (int)(end_row - E.out_scroll),
+                 end_col < w ? end_col : w - 1, ' ' | A_REVERSE);
     wnoutrefresh(E.out_win);
+}
+
+/* Scrolls the panel; reaching the bottom follows the output again. */
+static void out_scroll_by(long d) {
+    size_t max = out_total_rows > (size_t)out_text_rows ? out_total_rows - (size_t)out_text_rows : 0;
+    long cur = E.out_follow ? (long)max : (long)E.out_scroll;
+    cur += d;
+    if (cur < 0) cur = 0;
+    if ((size_t)cur >= max) { E.out_follow = true;  E.out_scroll = max; }
+    else                    { E.out_follow = false; E.out_scroll = (size_t)cur; }
 }
 
 /* One-line input box. Wider for cell edits; the text scrolls sideways so
@@ -416,7 +487,8 @@ static void render_output(void) {
  * columns, not bytes. */
 static void render_dialog(const char *title) {
     int rows, cols; getmaxyx(stdscr, rows, cols);
-    int dw = (E.mode == MODE_TABLE_EDIT || E.mode == MODE_MEM_INPUT) ? cols - 8 : 62;
+    int dw = (E.mode == MODE_TABLE_EDIT || E.mode == MODE_MEM_INPUT) ? cols - 8
+           : (E.mode == MODE_TABLE_EXPORT || E.mode == MODE_SAVE_DIALOG) ? 90 : 62;
     if (dw > 110) dw = 110;
     if (dw > cols) dw = cols;
     if (dw < 20) dw = cols;
@@ -468,21 +540,34 @@ static void render_dialog(const char *title) {
 }
 
 /* ─── Build & run (^B) ────────────────────────────────────────────
- * Saves first — the compiler reads the file from disk, not the buffer. */
+ * Saves first — the compiler reads the file from disk, not the buffer —
+ * and waits for that save to be on disk. The build and the program then
+ * run in the live console below (run.c): the editor keeps drawing, the
+ * output arrives as it is printed, and typed keys reach the program. */
 static void build_and_run(void) {
     Pane *ap = E.panes[E.active];
+    if (run_active()) {                     /* still running: back to its console */
+        E.out_visible = true;
+        E.out_focus   = true;
+        E.out_follow  = true;
+        layout_windows();
+        force_full_dirty();
+        return;
+    }
     if (!ap->filename[0]) return;
     if (ap->binary_view) {
         snprintf(E_notify, sizeof E_notify, "Nothing to run: this is a picture / document");
         return;
     }
 
-    pane_save_file(ap, NULL);
+    if (!pane_save_file_sync(ap) && !ap->hex_mode) return;   /* E_notify says why */
     E.out_visible = true;
     E.out_scroll  = 0;
+    E.out_follow  = true;
     layout_windows();
     free(E.out_text);
-    E.out_text    = malloc(1 << 16);
+    E.out_text = malloc(RUN_OUT_CAP);
+    if (!E.out_text) { E.out_visible = false; layout_windows(); return; }
     E.out_text[0] = '\0';
 
     if (build_has_menu(ap->lang)) {
@@ -491,12 +576,56 @@ static void build_and_run(void) {
         /* bounded: the notification area is one status-bar line */
         snprintf(E_notify, sizeof E_notify, "%.16s %.200s",
                  build_compiler_name(ap->lang), flags[0] ? flags : "...");
-        render_status();
-        doupdate();
     }
-    char timing[128];
-    run_file(ap->filename, ap->lang, E.out_text, 1 << 16, timing, sizeof timing);
-    snprintf(E_notify, sizeof E_notify, "%s", timing);
+    int ow = E.out_win ? getmaxx(E.out_win) : 80;
+    int oh = E.out_win ? getmaxy(E.out_win) - 1 : 10;
+    char msg[256];
+    bool live = run_start(ap->filename, ap->lang, E.out_text, RUN_OUT_CAP, ow, oh, msg, sizeof msg);
+    E.out_focus = live;
+    if (!live && msg[0]) snprintf(E_notify, sizeof E_notify, "%s", msg);
+}
+
+/* Keys while the console has the focus: they go to the running program.
+ * Esc gives the keys back to the editor (the program keeps running and
+ * its output keeps coming), ^B returns to the console, ^Q still quits.
+ * Returns false for keys the editor should handle itself. */
+static bool console_key(int key) {
+    if (!(E.out_focus && E.out_visible && run_active() && E.mode == MODE_NORMAL)) return false;
+    switch (key) {
+        case 27:
+            E.out_focus = false;
+            snprintf(E_notify, sizeof E_notify, "Program still running - ^B: back to its console");
+            return true;
+        case 'c' & 0x1f: run_interrupt();       return true;
+        case 'd' & 0x1f: run_input_eof();       return true;
+        case '\n': case '\r': case KEY_ENTER:
+            E.out_follow = true;
+            run_input_enter();
+            return true;
+        case KEY_BACKSPACE: case 127: case 8:
+            run_input_backspace();
+            return true;
+        case KEY_UP:    out_scroll_by(-1);                  return true;
+        case KEY_DOWN:  out_scroll_by(1);                   return true;
+        case KEY_PPAGE: out_scroll_by(-(out_text_rows - 1)); return true;
+        case KEY_NPAGE: out_scroll_by(out_text_rows - 1);   return true;
+        case KEY_MOUSE: {
+            MEVENT ev;
+            if (getmouse(&ev) == OK) {
+                if (ev.bstate & BUTTON4_PRESSED) out_scroll_by(-3);
+                else if (ev.bstate & BUTTON5_PRESSED) out_scroll_by(3);
+            }
+            return true;
+        }
+        case 'b' & 0x1f: case 'q' & 0x1f:
+            return false;
+        default:
+            if (key == '\t' || (key >= 32 && key < 256)) {
+                E.out_follow = true;
+                run_input_char(key);
+            }
+            return true;                    /* other function keys: swallowed */
+    }
 }
 
 static void build_menu_open(void) {
@@ -695,7 +824,7 @@ static void full_redraw(bool force) {
 
     
     if (E.finfo && E.finfo->visible && E.finfo->win)
-        fi_render(E.finfo, E.finfo->win, edit_h, E.finfo->width);
+        fi_render(E.finfo, E.finfo->win, edit_h, getmaxx(E.finfo->win));
 
     
     if (E.hl && E.hl->visible && E.hl->win) {
@@ -759,6 +888,14 @@ static void full_redraw(bool force) {
         };
         if (E.mode == MODE_MEM_INPUT) {
             render_dialog(mem_dialog_title);
+        } else if (E.mode == MODE_TABLE_EXPORT) {
+            Pane *ap = E.panes[E.active];
+            const TableView *tv = ap->table;
+            char t[200];
+            size_t shown = (tv && tv->cur < tv->nsheets) ? tv->sheets[tv->cur].nview : 0;
+            snprintf(t, sizeof t, "Save the %zu row%s shown%s as", shown, shown == 1 ? "" : "s",
+                     tv && (tv->nsort || tv->nfilt) ? " (sorted / filtered)" : "");
+            render_dialog(t);
         } else if (E.mode == MODE_TABLE_EDIT) {
             Pane *ap = E.panes[E.active];
             char t[256];
@@ -878,9 +1015,29 @@ static void dialog_confirm(void) {
                 snprintf(E_notify, sizeof E_notify, "Not found: %.200s", E.dialog_buf);
             break;
 
-        case MODE_SAVE_DIALOG:
-            pane_save_file(ap, E.dialog_buf);
+        case MODE_SAVE_DIALOG: {
+            bool was_url = ap->url[0] != '\0';
+            bool ok = pane_save_file(ap, E.dialog_buf);
+            if (ok && was_url) {          /* the fetched page now lives in that file */
+                if (ap->hex_mode && ap->hex)
+                    snprintf(ap->hex->filename, sizeof ap->hex->filename, "%s", E.dialog_buf);
+                ap->url[0] = ap->url_name[0] = '\0';
+                if (E.tree) ft_reload(E.tree);
+                snprintf(E_notify, sizeof E_notify, "Saved to %.200s", E.dialog_buf);
+            } else if (!ok && !E_notify[0]) {
+                snprintf(E_notify, sizeof E_notify, "Could not save to %.200s", E.dialog_buf);
+            }
             force_full_dirty();
+            break;
+        }
+
+        case MODE_TABLE_EXPORT:
+            if (ap->table) {
+                char msg[256];
+                pane_table_export(ap, E.dialog_buf, msg, sizeof msg);
+                snprintf(E_notify, sizeof E_notify, "%s", msg);
+                if (E.tree) ft_reload(E.tree);
+            }
             break;
 
         case MODE_OPEN_DIALOG:
@@ -925,6 +1082,333 @@ static void dialog_confirm(void) {
         default: break;
     }
     E.mode = MODE_NORMAL;
+}
+
+/* ─── F1 field: open a path, fetch a URL ──────────────────────────
+ * A URL is downloaded with curl into a private temporary folder, only so
+ * that the usual detection (extension, table, image, document...) applies.
+ * Text lands in the buffer and the temporary file is removed at once: the
+ * page has no file until ^S saves it. Pictures, PDFs, databases and hex
+ * views need their bytes on disk: those stay in the folder until exit. */
+
+static char url_tmp_dir[4096];
+static int  url_tmp_seq = 0;
+
+static const char *url_tmpdir(void) {
+    if (url_tmp_dir[0]) return url_tmp_dir;
+#ifdef _WIN32
+    const char *t = getenv("TEMP");
+    if (!t || !*t) t = ".";
+    snprintf(url_tmp_dir, sizeof url_tmp_dir, "%s\\abyss-url-%d", t, (int)getpid());
+    if (mkdir(url_tmp_dir) != 0 && errno != EEXIST) { url_tmp_dir[0] = '\0'; return NULL; }
+#else
+    const char *t = getenv("TMPDIR");
+    if (!t || !*t) t = "/tmp";
+    snprintf(url_tmp_dir, sizeof url_tmp_dir, "%s/abyss-url-XXXXXX", t);
+    if (!mkdtemp(url_tmp_dir)) { url_tmp_dir[0] = '\0'; return NULL; }
+#endif
+    return url_tmp_dir;
+}
+
+static void url_tmp_cleanup(void) {
+    if (!url_tmp_dir[0]) return;
+    DIR *d = opendir(url_tmp_dir);
+    if (d) {
+        struct dirent *de;
+        while ((de = readdir(d))) {
+            if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+            char f[4600];
+            snprintf(f, sizeof f, "%s/%s", url_tmp_dir, de->d_name);
+            unlink(f);
+        }
+        closedir(d);
+    }
+    rmdir(url_tmp_dir);
+    url_tmp_dir[0] = '\0';
+}
+
+/* extension for a Content-Type, when the URL itself gives none */
+static const char *ctype_ext(const char *ct) {
+    static const struct { const char *t, *e; } map[] = {
+        { "text/html", ".html" }, { "application/xhtml", ".html" },
+        { "application/json", ".json" }, { "+json", ".json" },
+        { "application/x-ndjson", ".jsonl" },
+        { "text/csv", ".csv" }, { "text/tab-separated", ".tsv" },
+        { "javascript", ".js" }, { "text/css", ".css" },
+        { "text/markdown", ".md" }, { "application/sql", ".sql" },
+        { "image/svg", ".svg" }, { "xml", ".xml" },
+        { "image/png", ".png" }, { "image/jpeg", ".jpg" }, { "image/gif", ".gif" },
+        { "image/webp", ".webp" }, { "image/bmp", ".bmp" }, { "image/x-icon", ".ico" },
+        { "application/pdf", ".pdf" }, { "sqlite", ".db" },
+        { "x-python", ".py" }, { "x-sh", ".sh" }, { "x-c", ".c" },
+        { "text/plain", ".txt" },
+        { NULL, NULL }
+    };
+    if (!ct) return "";
+    for (int i = 0; map[i].t; i++) {
+        size_t n = strlen(map[i].t);
+        for (const char *c = ct; *c; c++)
+            if (!strncasecmp(c, map[i].t, n)) return map[i].e;
+    }
+    return "";
+}
+
+/* local name for a URL: the last part of its path, without ?query */
+static void url_basename(const char *url, char *out, size_t sz) {
+    const char *p = strstr(url, "://");
+    p = p ? p + 3 : url;
+    const char *path = strchr(p, '/');
+    char name[256] = "";
+    if (path) {
+        size_t n = strcspn(path, "?#");
+        const char *end = path + n;
+        const char *b = end;
+        while (b > path && b[-1] != '/') b--;
+        snprintf(name, sizeof name, "%.*s", (int)(end - b), b);
+    }
+    for (char *c = name; *c; c++)
+        if (*c == '\\' || *c == ':' || *c == '*' || *c == '"' || *c == '<' ||
+            *c == '>' || *c == '|' || (unsigned char)*c < 32) *c = '_';
+    if (!name[0] || !strcmp(name, ".") || !strcmp(name, "..")) snprintf(name, sizeof name, "index");
+    snprintf(out, sz, "%s", name);
+}
+
+static void status_flash(const char *msg) {
+    if (!E.status_win) return;
+    wbkgdset(E.status_win, ' ' | COLOR_PAIR(COLOR_PAIR_STATUS));
+    werase(E.status_win);
+    wattron(E.status_win, COLOR_PAIR(COLOR_PAIR_STATUS) | A_BOLD);
+    mvwaddnstr(E.status_win, 0, 1, msg, getmaxx(E.status_win) - 2);
+    wattroff(E.status_win, COLOR_PAIR(COLOR_PAIR_STATUS) | A_BOLD);
+    wrefresh(E.status_win);
+}
+
+static void pane_reset_for_open(Pane *p) {
+    gb_free(p->buf);  p->buf = gb_new(GAP_DEFAULT);
+    li_free(p->li);   p->li  = li_new();
+    syn_free(p->syn); p->syn = syn_new(LANG_C);
+    p->cursor = 0;
+}
+
+static void after_open(const char *path) {
+    if (E.finfo && E.finfo->visible) fi_analyze(E.finfo, path);
+    if (E.hl && E.hl->visible) E.hl->dirty = true;
+    layout_windows();
+    force_full_dirty();
+}
+
+static bool fetch_url(Pane *ap, const char *url_in) {
+    char url[2048];
+    if (!strncasecmp(url_in, "www.", 4)) snprintf(url, sizeof url, "https://%s", url_in);
+    else                                 snprintf(url, sizeof url, "%s", url_in);
+
+    if (!proc_have("curl")) {
+        snprintf(E_notify, sizeof E_notify, "curl not found: install it to open URLs");
+        return false;
+    }
+    const char *dir = url_tmpdir();
+    if (!dir) {
+        snprintf(E_notify, sizeof E_notify, "Cannot create a temporary folder: %.150s", strerror(errno));
+        return false;
+    }
+    char tmp[4600];
+    snprintf(tmp, sizeof tmp, "%s/%d.download", dir, ++url_tmp_seq);
+
+    char flash[300];
+    snprintf(flash, sizeof flash, "Fetching %.250s ...", url);
+    status_flash(flash);
+
+    char *argv[] = { "curl", "-sSL", "--max-time", "60", "-o", tmp,
+                     "-w", "%{http_code} %{content_type}", url, NULL };
+    char *out = NULL; size_t olen = 0;
+    int rc = proc_capture(argv, &out, &olen);
+    int http = 0;
+    char ctype[200] = "";
+    if (out) sscanf(out, "%d %199[^\n]", &http, ctype);
+    free(out);
+    if (rc != 0) {
+        unlink(tmp);
+        const char *why = rc == 6 ? "could not resolve the host" : rc == 7 ? "could not connect"
+                        : rc == 28 ? "timed out" : rc == 35 || rc == 60 ? "SSL / certificate error"
+                        : rc == 3 ? "malformed URL" : rc == 127 ? "curl could not start" : NULL;
+        if (why) snprintf(E_notify, sizeof E_notify, "curl: %s (%.180s)", why, url);
+        else     snprintf(E_notify, sizeof E_notify, "curl failed (code %d): %.180s", rc, url);
+        return false;
+    }
+
+    /* the name decides the view: the URL's own, or one from the Content-Type */
+    char name[256];
+    url_basename(url, name, sizeof name);
+    const char *dot = strrchr(name, '.');
+    const char *ce  = ctype_ext(ctype);
+    bool html = !strcmp(ce, ".html");
+    if (*ce && (!dot || (html && strcasecmp(dot, ".html") && strcasecmp(dot, ".htm")))) {
+        size_t l = strlen(name);
+        snprintf(name + l, sizeof name - l, "%s", ce);
+    }
+    char local[4900];
+    snprintf(local, sizeof local, "%s/%d_%s", dir, url_tmp_seq, name);
+    if (rename(tmp, local) != 0) snprintf(local, sizeof local, "%s", tmp);
+
+    pane_reset_for_open(ap);
+    pane_open_file(ap, local);
+    E_notify[0] = '\0';
+    snprintf(ap->url, sizeof ap->url, "%s", url);
+    snprintf(ap->url_name, sizeof ap->url_name, "%s", name);
+
+    bool on_disk = ap->binary_view || ap->hex_mode || (ap->table && ap->table->sqlite);
+    if (!on_disk) {                   /* text: in memory only, no file behind it */
+        unlink(local);
+        ap->filename[0] = '\0';
+        ap->modified    = true;
+    }
+    if (http >= 400)
+        snprintf(E_notify, sizeof E_notify, "HTTP %d — page shown anyway  (^S to save it)", http);
+    else
+        snprintf(E_notify, sizeof E_notify, "%s%.150s  (%s%s)", on_disk ? "" : "Fetched ", url,
+                 ctype[0] ? ctype : "unknown type",
+                 on_disk ? ", read-only temporary copy" : ", not saved: ^S to keep it");
+    after_open(ap->filename[0] ? ap->filename : "");
+    return true;
+}
+
+/* Opens `path` from the tree in the active pane; the tree follows its folder. */
+static void tree_open_path(const char *open_path) {
+    Pane *ap2 = E.panes[E.active];
+    pane_reset_for_open(ap2);
+    pane_open_file(ap2, open_path);
+
+    char tmp[4096];
+    snprintf(tmp, sizeof tmp, "%s", open_path);
+    char *slash = strrchr(tmp, '/');
+    if (slash && slash != tmp) {
+        *slash = '\0';
+        char resolved[4096];
+        if (realpath(tmp, resolved))
+            snprintf(E.tree->cwd, sizeof E.tree->cwd, "%s", resolved);
+        E.tree->query[0] = '\0';
+        ft_reload(E.tree);
+    }
+    E.tree_focus = false;
+    after_open(open_path);
+}
+
+/* Enter in the tree field */
+static void tree_query_submit(void) {
+    FileTree *ft = E.tree;
+    char q[2048];
+    const char *b = ft->query;
+    while (*b == ' ') b++;
+    snprintf(q, sizeof q, "%s", b);
+    size_t n = strlen(q);
+    while (n && (q[n - 1] == ' ' || q[n - 1] == '\n' || q[n - 1] == '\r')) q[--n] = '\0';
+    /* pasted / dragged paths often come quoted */
+    if (n >= 2 && (q[0] == '\'' || q[0] == '"') && q[n - 1] == q[0]) {
+        memmove(q, q + 1, n - 2); q[n - 2] = '\0'; n -= 2;
+    }
+    if (!n) { ft_query_set(ft, ""); return; }
+
+    if (!strncasecmp(q, "http://", 7) || !strncasecmp(q, "https://", 8) ||
+        !strncasecmp(q, "ftp://", 6) || !strncasecmp(q, "ftps://", 7) ||
+        !strncasecmp(q, "www.", 4)) {
+        if (fetch_url(E.panes[E.active], q)) {
+            ft_query_set(ft, "");
+            E.tree_focus = false;
+        }
+        return;
+    }
+
+    if (ft_query_is_filter(q)) {          /* filter: open what is selected */
+        if (!ft->count) { snprintf(E_notify, sizeof E_notify, "No name matches \"%.200s\"", q); return; }
+        FTEntry *e = &ft->entries[ft->selected];
+        char full[4400];
+        snprintf(full, sizeof full, "%s/%s", ft->cwd, e->name);
+        bool dir = e->is_dir;
+        ft_query_set(ft, "");
+        if (dir) {
+            char r[4096];
+            if (realpath(full, r)) snprintf(ft->cwd, sizeof ft->cwd, "%s", r);
+            ft->selected = 0; ft->scroll = 0;
+            ft_reload(ft);
+        } else {
+            tree_open_path(full);
+        }
+        return;
+    }
+
+    /* a path: absolute, ~, relative to the folder shown, or file:// */
+    char path[4400];
+    const char *home = home_dir();
+    if (!strncasecmp(q, "file://", 7)) snprintf(path, sizeof path, "%s", q + 7);
+    else if (q[0] == '~' && home)      snprintf(path, sizeof path, "%s%s", home, q + 1);
+    else if (q[0] == '/' || q[0] == '\\' || (isalpha((unsigned char)q[0]) && q[1] == ':'))
+        snprintf(path, sizeof path, "%s", q);
+    else snprintf(path, sizeof path, "%s/%s", ft->cwd, q);
+
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        snprintf(E_notify, sizeof E_notify, "Not found: %.220s", path);
+        return;
+    }
+    ft_query_set(ft, "");
+    if (S_ISDIR(st.st_mode)) {
+        char r[4096];
+        if (realpath(path, r)) snprintf(ft->cwd, sizeof ft->cwd, "%s", r);
+        else                   snprintf(ft->cwd, sizeof ft->cwd, "%s", path);
+        ft->selected = 0; ft->scroll = 0;
+        ft_reload(ft);
+    } else {
+        tree_open_path(path);
+    }
+}
+
+/* Keys for the tree field; true when the key was used. */
+static bool tree_query_key(int key) {
+    FileTree *ft = E.tree;
+    size_t len = strlen(ft->query);
+    if ((key >= 32 && key < 127) || (key >= 128 && key < 256)) {
+        if (len + 1 < sizeof ft->query) {
+            char q[sizeof ft->query];
+            snprintf(q, sizeof q, "%s%c", ft->query, (char)key);
+            ft_query_set(ft, q);
+        }
+        return true;
+    }
+    if (key == '\t') {                        /* path completion */
+        if (len) ft_query_complete(ft);
+        return len > 0;
+    }
+    if (!len) return false;
+    switch (key) {
+        case KEY_BACKSPACE: case 127: case '\b': {
+            char q[sizeof ft->query];
+            snprintf(q, sizeof q, "%s", ft->query);
+            size_t k = len;
+            do k--; while (k > 0 && ((unsigned char)q[k] & 0xC0) == 0x80);
+            q[k] = '\0';
+            ft_query_set(ft, q);
+            return true;
+        }
+        case 27: case 'u' & 0x1f:
+            ft_query_set(ft, "");
+            return true;
+        case '\n': case '\r': case KEY_ENTER:
+            tree_query_submit();
+            return true;
+        default:
+            return false;
+    }
+}
+
+/* ^S / ^O on a buffer with no file yet (a fetched page): a name to start from */
+static const char *save_suggestion(const Pane *p, char *out, size_t sz) {
+    if (p->filename[0]) return p->filename;
+    if (!p->url_name[0]) return NULL;
+    char cwd[4096] = ".";
+    if (E.tree) snprintf(cwd, sizeof cwd, "%s", E.tree->cwd);
+    else if (!getcwd(cwd, sizeof cwd)) snprintf(cwd, sizeof cwd, ".");
+    snprintf(out, sz, "%s/%s", cwd, p->url_name);
+    return out;
 }
 
 static void handle_key_normal(int key) {
@@ -1007,36 +1491,10 @@ static void handle_key_normal(int key) {
 
 
     if (E.tree_focus && E.tree && E.tree->visible) {
+        if (tree_query_key(key)) return;
         char open_path[4096] = "";
         bool consumed = ft_handle_key(E.tree, key, open_path, sizeof open_path);
-        if (open_path[0]) {
-            Pane *ap2 = E.panes[E.active];
-            gb_free(ap2->buf);  ap2->buf = gb_new(GAP_DEFAULT);
-            li_free(ap2->li);   ap2->li  = li_new();
-            syn_free(ap2->syn); ap2->syn = syn_new(LANG_C);
-            ap2->cursor = 0;
-            pane_open_file(ap2, open_path);
-
-            char tmp[4096];
-            strncpy(tmp, open_path, sizeof tmp - 1);
-            char *slash = strrchr(tmp, '/');
-            if (slash && slash != tmp) {
-                *slash = '\0';
-                char resolved[4096];
-                if (realpath(tmp, resolved))
-                    strncpy(E.tree->cwd, resolved, sizeof E.tree->cwd - 1);
-                ft_reload(E.tree);
-            }
-
-            if (E.finfo && E.finfo->visible)
-                fi_analyze(E.finfo, open_path);
-            if (E.hl && E.hl->visible)
-                E.hl->dirty = true;
-
-            E.tree_focus = false;
-            layout_windows();
-            force_full_dirty();
-        }
+        if (open_path[0]) tree_open_path(open_path);
         if (consumed) return;
     }
 
@@ -1137,7 +1595,16 @@ static void handle_key_normal(int key) {
             if (ap->hex_mode) { force_full_dirty(); return; }
         } else {
             if (key == ('s' & 0x1f)) {
+                char sug[4400];
                 if (ap->filename[0]) pane_save_file(ap, NULL);
+                else if (!tv->sqlite) open_dialog(MODE_SAVE_DIALOG, save_suggestion(ap, sug, sizeof sug));
+                return;
+            }
+            if (key == 'w') {                    /* the rows shown, as a new file */
+                if (tv->nsheets == 0) return;
+                char sug[4400];
+                tbl_export_suggest(ap, E.tree ? E.tree->cwd : NULL, sug, sizeof sug);
+                open_dialog(MODE_TABLE_EXPORT, sug);
                 return;
             }
             if (key == ('f' & 0x1f)) {
@@ -1216,9 +1683,11 @@ static void handle_key_normal(int key) {
             return;
         }
         if (key == KEY_F(6))     { pane_table_enter(ap); return; }
-        if (key == ('s' & 0x1f)) { hex_save(ap->hex, NULL); return; }
-        if (key == ('o' & 0x1f)) {
-            open_dialog(MODE_SAVE_DIALOG, ap->hex->filename[0] ? ap->hex->filename : NULL);
+        if (key == ('s' & 0x1f) && !ap->url[0]) { hex_save(ap->hex, NULL); return; }
+        if (key == ('o' & 0x1f) || key == ('s' & 0x1f)) {
+            char sug[4400];
+            open_dialog(MODE_SAVE_DIALOG, ap->url[0] ? save_suggestion(ap, sug, sizeof sug)
+                        : ap->hex->filename[0] ? ap->hex->filename : NULL);
             return;
         }
         if (key == ('j' & 0x1f)) { open_dialog(MODE_HEX_JUMP, NULL); return; }
@@ -1264,12 +1733,17 @@ static void handle_key_normal(int key) {
         case '\n': case '\r':                    pane_insert_char(ap, '\n'); break;
         case '\t':                               pane_insert_str(ap, "    ", 4); break;
 
-        case 'o' & 0x1f:
-            open_dialog(MODE_SAVE_DIALOG, ap->filename[0] ? ap->filename : NULL);
+        case 'o' & 0x1f: {
+            char sug[4400];
+            open_dialog(MODE_SAVE_DIALOG, save_suggestion(ap, sug, sizeof sug));
             break;
+        }
         case 's' & 0x1f:
             if (ap->filename[0]) pane_save_file(ap, NULL);
-            else open_dialog(MODE_SAVE_DIALOG, NULL);
+            else {
+                char sug[4400];
+                open_dialog(MODE_SAVE_DIALOG, save_suggestion(ap, sug, sizeof sug));
+            }
             break;
         case 'z' & 0x1f: pane_undo(ap);  break;
         case 'y' & 0x1f: pane_redo(ap);  break;
@@ -1527,17 +2001,16 @@ void editor_cleanup(void) {
         if (E.tree->win) delwin(E.tree->win);
         ft_free(E.tree);
     }
-    if (E.finfo) {
-        if (E.finfo->win) delwin(E.finfo->win);
-        fi_free(E.finfo);
-    }
-    if (E.hl) {
-        if (E.hl->win) delwin(E.hl->win);
-        hl_free(E.hl);
-    }
+    if (E.finfo) fi_free(E.finfo);         /* fi_free deletes its window */
+    if (E.hl)    hl_free(E.hl);            /* hl_free too                */
+    E.finfo = NULL;
+    E.hl    = NULL;
+    run_stop();
     free(E.out_text);
+    E.out_text = NULL;
     pthread_mutex_destroy(&E.save_mutex);
     server_stop();
+    url_tmp_cleanup();
     unlink("./temp_bin");
 }
 
@@ -1613,12 +2086,21 @@ void editor_run(const char *initial_file) {
             int mt = mem_ui_timeout(mem_visible());
             if (mt > 0 && (tmo < 0 || mt < tmo)) tmo = mt;
         }
+        if (run_active() && (tmo < 0 || tmo > 25)) tmo = 25;   /* live console */
 	#ifdef _WIN32
     		if (tmo < 0) tmo = 100;   /* pas de SIGWINCH sous Windows : on sonde la taille toutes les 100 ms */
 	#endif
         if (tmo >= 0) wtimeout(kw, tmo);
         int key = wgetch(kw);
         if (tmo >= 0) wtimeout(kw, -1);
+        {                                           /* live console: new output, end */
+            int ev = run_poll();
+            if (ev & RUN_EV_DONE) {
+                E.out_focus = false;
+                snprintf(E_notify, sizeof E_notify, "%s", run_timing());
+            }
+            if (ev) full_redraw(false);
+        }
 	        if (build_tap_pending && key == ERR) {      /* single ^B */
             build_tap_pending = false;
             build_and_run();
@@ -1658,7 +2140,7 @@ void editor_run(const char *initial_file) {
 
         /* Enter closes the output panel (only outside dialogs and menus,
          * where Enter has its own meaning) */
-        if (E.out_visible && E.mode == MODE_NORMAL &&
+        if (E.out_visible && E.mode == MODE_NORMAL && !(E.out_focus && run_active()) &&
             (key == '\n' || key == '\r' || key == KEY_ENTER)) {
             E.out_visible = false;
             layout_windows();
@@ -1723,7 +2205,25 @@ void editor_run(const char *initial_file) {
                 
                 if (!consumed && sn >= 5
                         && sq[1]=='2' && sq[2]=='0' && sq[3]=='1' && sq[4]=='~') {
-                    if (in_paste && paste_len > 0 && E.mode == MODE_NORMAL) {
+                    if (in_paste && paste_len > 0 && E.mode == MODE_NORMAL &&
+                        E.out_focus && run_active()) {
+                        run_input_str(paste_batch, (size_t)paste_len);
+                    } else if (in_paste && paste_len > 0 && E.mode == MODE_NORMAL &&
+                               E.tree_focus && E.tree && E.tree->visible) {
+                        /* a path / URL pasted into the tree field: one line */
+                        paste_batch[paste_len] = '\0';
+                        char q[sizeof E.tree->query];
+                        size_t o = strlen(E.tree->query);
+                        memcpy(q, E.tree->query, o);
+                        for (int pi = 0; pi < paste_len && o + 1 < sizeof q; pi++) {
+                            char c = paste_batch[pi];
+                            if (c == '\n' || c == '\r') { if (o) break; continue; }
+                            if (c == '\t') c = ' ';
+                            q[o++] = c;
+                        }
+                        q[o] = '\0';
+                        ft_query_set(E.tree, q);
+                    } else if (in_paste && paste_len > 0 && E.mode == MODE_NORMAL) {
                         paste_batch[paste_len] = '\0';
                         Pane *ap2 = E.panes[E.active];
                         if (!ap2->hex_mode && !ap2->table_mode && !ap2->mem_mode &&
@@ -1836,6 +2336,8 @@ void editor_run(const char *initial_file) {
                 paste_batch[paste_len++] = (char)key;
             continue;
         }
+
+        if (console_key(key)) { full_redraw(false); continue; }
 
         EditorMode prev_mode = E.mode;
         if (E.mode == MODE_NORMAL)           handle_key_normal(key);

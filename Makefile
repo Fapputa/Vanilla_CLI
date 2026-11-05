@@ -1,7 +1,7 @@
 CC      = gcc
 CFLAGS  = -O2 -march=native -Wall -Wextra -Wno-unused-parameter \
           -D_GNU_SOURCE -D_POSIX_C_SOURCE=200809L
-LDFLAGS = -lncurses -lpthread -lm
+LDFLAGS = -lncurses -lpthread -lm -lutil
 
 SRC     = gap_buf.c  \
           line_idx.c \

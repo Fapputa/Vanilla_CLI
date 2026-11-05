@@ -2,7 +2,7 @@
 
 A high-performance, versatile toolkit designed to supercharge the terminal experience on Linux and Windows. From low-level system monitoring to a high-speed C-engineered text editor, this suite brings efficiency and fun to the command line.
 
-![Demo](.rem.gif)
+![Demo](.lain.gif)
 
 ---
 
@@ -68,9 +68,8 @@ mkdir $env:USERPROFILE\bin -Force
 move .\abyss.exe $env:USERPROFILE\bin\
 [Environment]::SetEnvironmentVariable("Path", "$env:Path;$env:USERPROFILE\bin", "User")
 ```
-**3  Run it** from the .exe file
 
-**3.1 Or run it** from Windows Terminal, PowerShell or `cmd.exe`:
+**3. Run it** from Windows Terminal, PowerShell or `cmd.exe`:
 
 ```powershell
 abyss main.c
@@ -173,6 +172,25 @@ abyss main.c
 | `F6` | Table view (CSV, JSON, SQL, SQLite...) |
 | `F8` | Memory editor (scan and change a running program's variables) |
 
+### File tree (F1)
+
+`F1` shows the tree of the current folder. The line under its header is a
+field: just type (or paste) into it while the tree has the focus.
+
+- **A path**, absolute (`/etc/hosts`, `~/notes.md`, `C:\dev\x.c`) or
+  relative to the folder shown (`src/main.c`): `Enter` opens the file, or
+  moves the tree to the folder. `Tab` completes the path.
+- **A URL** (`http://`, `https://`, `ftp://`, or just `www.example.com`):
+  `Enter` fetches it with `curl` and shows it in the editor, whatever its
+  type (HTML, JSON, CSV in the table view, pictures, PDF...). Text pages
+  live in memory only, with no file on disk: `Ctrl + S` offers a name
+  (the page's own, in the tree's folder) to keep it. Pictures, PDFs and
+  databases go through a temporary copy, removed when Abyss exits.
+- **Anything else** filters the names of the folder as you type; `Enter`
+  opens the highlighted one.
+
+`Backspace` erases, `Esc` / `Ctrl + U` clears the field.
+
 ### Table view
 
 `F6` shows the current buffer as a grid, and `F6` again goes back to the
@@ -217,6 +235,16 @@ drops them all. The tab shows `shown/total`, the status bar lists the
 filters, and they work together with the sort and the search (only the
 rows shown). Switching to another table clears them.
 
+**Saving the rows shown.** `w` writes the table as it is displayed (only
+the rows the filters keep, in the sort order) to a new file, in the format
+of the source: CSV stays CSV (same separator), TSV / PSV, JSON (array of
+objects) and JSON Lines, SQL dump (the original `CREATE TABLE` followed by
+one `INSERT` per row, literals kept as written), Markdown / text tables,
+and SQLite (a new database with the table's schema, rows copied from the
+source with their types). The name offered is `<name>_view.<ext>` next to
+the source; an extension left out is added back, and the source itself is
+never overwritten. With several tables in the file, the one shown is saved.
+
 | Key | Action |
 |-----|--------|
 | Arrows / `hjkl` | Move between cells |
@@ -225,6 +253,7 @@ rows shown). Switching to another table clears them.
 | `Tab` / `Shift+Tab` | Next / previous table |
 | `s` / `S` | Add the column to the sort (asc / desc / off) / clear every sort |
 | `f` / `F` | Filter the rows on the values ticked in the column (dropdown, `Space` ticks) / drop every filter |
+| `w` | Save the rows shown (sorted / filtered) as a new file, same format as the source |
 | `Enter` | Show the full cell in the status bar |
 | `Ctrl + F`, `Ctrl + N` / `Ctrl + P` | Search cells, next / previous match |
 | `F2` | Hex view |

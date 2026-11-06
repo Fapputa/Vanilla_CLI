@@ -339,6 +339,9 @@ void mem_ui_shutdown(void);
 
 typedef struct Arena Arena;
 
+/* F9 static analysis view (disview.c / disview.h) */
+typedef struct DisView DisView;
+
 /* Where a cell came from in the source text, so an edit made in the grid
  * can be written back in place (keeping the rest of the file untouched).
  * `kind` says how the new value must be encoded (CSV quoting, JSON string,
@@ -588,6 +591,9 @@ typedef struct Pane {
     bool       binary_view;
 
     bool       mem_mode;          /* F8 memory editor shown in this pane */
+
+    bool       dis_mode;          /* F9 static analysis shown in this pane */
+    DisView   *dis;               /* kept when hidden: F9 reopens it at once */
 
     /* page fetched from the F1 field (curl): shown without a file on
      * disk until it is saved; url_name is the local name it would get */

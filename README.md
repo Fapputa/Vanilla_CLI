@@ -2,7 +2,7 @@
 
 A high-performance, versatile toolkit designed to supercharge the terminal experience on Linux and Windows. From low-level system monitoring to a high-speed C-engineered text editor, this suite brings efficiency and fun to the command line.
 
-![Demo](.rem.gif)
+![Demo](.lain.gif)
 
 ---
 
@@ -171,6 +171,7 @@ abyss main.c
 | `F4` | Smart highlight panel |
 | `F6` | Table view (CSV, JSON, SQL, SQLite...) |
 | `F8` | Memory editor (scan and change a running program's variables) |
+| `F9` | Static analysis of an ELF x86-64 binary (read-only) |
 
 ### File tree (F1)
 
@@ -326,8 +327,71 @@ second.
 On a saved address, `Enter` edits its value, `f` toggles the freeze, `r`
 renames it and `d` / `Del` removes it.
 
+**4. History.** Each saved address logs the value changes seen when it is
+re-read (once a second while `F8` shows, and at every redraw): old value,
+new value and the time, e.g. `0 → 245`. The last 32 changes are kept per
+address, older ones are dropped; the list shows how many were seen.
+
+| Key (saved list) | Action |
+|-----|--------|
+| `h` | Show / hide the history of the selected address (takes the place of the hex dump) |
+| `c` | Clear its history |
+| `v` | Pin the *value* rather than the address: when it leaves its address, the page around it and the two next to it are searched and the entry follows it (`A → B` is logged); `left … (not found nearby)` and `back at …` when it disappears and returns. `v` again pins the address |
+
+Nothing is read while the view is closed, so changes made meanwhile show as
+a single transition. When the process exits, its saved addresses and their
+history stay on screen (a `process ended` line is added); `p` picks another
+process, which starts a new list.
+
 Results are capped at 6,000,000 addresses; refine with a value scan if the
 first one hits the cap.
+
+### Static analysis (F9)
+
+`F9` opens a read-only analysis of the file behind the current buffer, in the
+current pane, when it is an ELF64 x86-64 binary (executable, PIE, shared
+object or `.o`). The binary is only read: never run, emulated or modified.
+Anything else gets a message in the status bar (not an ELF file, 32-bit or
+another architecture, truncated or malformed file). The file on disk is
+analysed, not unsaved changes in the buffer.
+
+The first screen sums the file up: type, architecture, entry point (and
+`main`), linking and libraries, protections (PIE, NX, RELRO, stack canary,
+FORTIFY, writable + executable segments), the functions found and where they
+come from, segments, sections and the loader's warnings (a damaged section
+table is reported and ignored). Arrows / `j` `k`, `PgUp` / `PgDn` / `Space`
+and `g` / `G` scroll it. `F9` or `Esc` closes the view; the analysis is kept,
+so `F9` shows it again at once unless the file changed on disk.
+
+`Tab` switches to the function list (and back, see below): address, size, number of
+callers, origin and name of every function found. The origin says where the
+function comes from: `symtab` / `dynsym` (symbol), `plt`, `entry`, `main`,
+`ctor`, `call` (target of a direct call), `codeptr` (address taken by
+`lea [rip+X]`), `dataptr` (code pointer stored in data) or `prologue` (found by
+its prologue in unreached code); the last two are guessed starts, marked `?`.
+Arrows / `j` `k`, `PgUp` / `PgDn` / `Space` and `g` / `G` move the selection.
+`s` cycles the sort: address, name, size (largest first), callers (most called
+first). `/` filters on the name (case-insensitive, applied as you type; `Enter`
+keeps it, `Esc` gives the previous one back, `Esc` on the list clears it).
+`:` jumps to a hex address (`401000`, `0x401000`): the function holding it is
+selected (the filter is dropped if it hid it), or the closest one when the
+address is in no function. The status bar shows the selected function, its
+position in the list and the active filter.
+
+`Enter` on a function opens its disassembly: a linear sweep of its bytes, from
+its start over its size (up to the next function, at most 64 KiB, when the size
+is unknown; never past the end of its section). Each line shows the address, the
+bytes (in a window at least 90 columns wide), the instruction and a comment: the
+name of a call / jump target, of the data or the string a `[rip + X]` operand
+points to, the start of another function. A line marked `!` is one the
+recursive analysis did not decode (bytes hidden in code, or code it did not
+reach, e.g. the cases of a switch whose table it does not follow). Arrows /
+`j` `k`, `PgUp` / `PgDn` / `Space` and `g` / `G` move; `Esc` goes back to the
+list. `Tab` then cycles the three screens: information, list, disassembly.
+
+The view needs [capstone](https://www.capstone-engine.org/) (`pacman -S
+capstone`, `apt install libcapstone-dev`), found through `pkg-config` at build
+time. Without it the module is left out of the build and `F9` says so.
 
 ---
 

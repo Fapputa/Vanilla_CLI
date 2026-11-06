@@ -1,6 +1,7 @@
 #include "abyss.h"
 #include "utf8.h"
 #include "memscan.h"
+#include "disview.h"
 
 void ft_init_color_pairs(void);
 #include <string.h>
@@ -185,7 +186,11 @@ static void render_title(void) {
     Pane *ap = E.panes[E.active];
 
     if (E.show_shortcuts) {
-        if (ap->mem_mode)
+        if (ap->dis_mode)
+            wprintw(E.title_win,
+                " [DISASM] Tab:Info/Functions/Disasm  Enter:Disassemble  Arrows/jk  PgUp/PgDn/Space  g/G:Top/End  s:Sort"
+                "  /:Filter  ':':Go to addr  Esc:Back/Close  F9:Close  ^E:Next pane  ^Q:Quit");
+        else if (ap->mem_mode)
             wprintw(E.title_win,
                 " [MEMORY] F8:Close  p:Process  t:Type  m:Mode  s:Scan  n:New  Enter:Edit  a:Save"
                 "  f:Freeze  x:Hex  g:Goto  Tab:Saved  ^Q:Quit");
@@ -210,7 +215,7 @@ static void render_title(void) {
                 "  ^R:LN  ^W:Wipe  ^D:Fmt  F1:Tree  F2:Hex  F3:Info  F4:HL  F6:Table  F7:Doc  ^A:Help  ^Q:Quit");
     } else {
         bool mod         = ap->hex_mode ? (ap->hex && ap->hex->modified) : ap->modified;
-        const char *hex_tag  = ap->mem_mode ? "  [MEMORY]" : ap->img_mode ? "  [IMAGE]" : ap->doc_mode ? "  [DOC]"
+        const char *hex_tag  = ap->dis_mode ? "  [DISASM]" : ap->mem_mode ? "  [MEMORY]" : ap->img_mode ? "  [IMAGE]" : ap->doc_mode ? "  [DOC]"
                              : ap->table_mode ? "  [TABLE]" : ap->hex_mode ? "  [HEX]" : "";
         const char *tree_tag = (E.tree && E.tree->visible && E.tree_focus) ? "  [TREE]" : "";
         const char *hl_tag   = (E.hl   && E.hl->visible)                  ? "  [HL]"   : "";
@@ -281,7 +286,11 @@ static void render_status(void) {
     wattron(E.status_win, COLOR_PAIR(COLOR_PAIR_STATUS));
     Pane *ap = E.panes[E.active];
 
-    if (ap->mem_mode) {
+    if (ap->dis_mode && ap->dis) {
+        char info[512];
+        dis_status(ap->dis, info, sizeof info);
+        waddstr(E.status_win, info);
+    } else if (ap->mem_mode) {
         char info[512];
         mem_ui_status(info, sizeof info);
         waddstr(E.status_win, info);
@@ -776,7 +785,6 @@ static void handle_key_build_menu(int key) {
         case 'k': case 'K':
             if (server_running()) {
                 server_stop();
-    mem_ui_shutdown();
                 snprintf(E_notify, sizeof E_notify, "Server stopped");
             } else {
                 snprintf(E_notify, sizeof E_notify, "No server running");
@@ -808,7 +816,7 @@ static void full_redraw(bool force) {
     
     for (int i = 0; i < E.npanes; i++) {
         Pane *p = E.panes[i];
-        if (p->mem_mode || p->img_mode || p->doc_mode)
+        if (p->dis_mode || p->mem_mode || p->img_mode || p->doc_mode)
             pane_render(p, force);                 /* these views take precedence */
         else if (p->table_mode && p->table)
             tbl_render(p->table, p->win, p->win_h, p->win_w);
@@ -1281,6 +1289,11 @@ static void tree_open_path(const char *open_path) {
     char tmp[4096];
     snprintf(tmp, sizeof tmp, "%s", open_path);
     char *slash = strrchr(tmp, '/');
+#ifdef _WIN32
+    char *bslash = strrchr(tmp, '\\');          /* path typed as C:\dir\file */
+    if (bslash && (!slash || bslash > slash)) slash = bslash;
+    if (slash == tmp + 2 && tmp[1] == ':') slash++;   /* keep "C:\" whole */
+#endif
     if (slash && slash != tmp) {
         *slash = '\0';
         char resolved[4096];
@@ -1339,7 +1352,13 @@ static void tree_query_submit(void) {
     /* a path: absolute, ~, relative to the folder shown, or file:// */
     char path[4400];
     const char *home = home_dir();
-    if (!strncasecmp(q, "file://", 7)) snprintf(path, sizeof path, "%s", q + 7);
+    if (!strncasecmp(q, "file://", 7)) {
+        const char *fp = q + 7;
+#ifdef _WIN32
+        if (fp[0] == '/' && isalpha((unsigned char)fp[1]) && fp[2] == ':') fp++;  /* file:///C:/x */
+#endif
+        snprintf(path, sizeof path, "%s", fp);
+    }
     else if (q[0] == '~' && home)      snprintf(path, sizeof path, "%s%s", home, q + 1);
     else if (q[0] == '/' || q[0] == '\\' || (isalpha((unsigned char)q[0]) && q[1] == ':'))
         snprintf(path, sizeof path, "%s", q);
@@ -1411,6 +1430,62 @@ static const char *save_suggestion(const Pane *p, char *out, size_t sz) {
     return out;
 }
 
+/* F9: opens the static analysis view on the file behind the pane (the
+ * bytes on disk, never the unsaved buffer), or closes it. The analysis
+ * is kept while hidden, so F9 again shows it at once unless the file
+ * changed on disk. */
+static void dis_toggle(Pane *ap) {
+    if (ap->dis_mode) { ap->dis_mode = false; force_full_dirty(); return; }
+    const char *path = ap->hex_mode && ap->hex && ap->hex->filename[0] ? ap->hex->filename : ap->filename;
+    if (ap->url[0]) path = "";                     /* fetched page: nothing on disk */
+    char err[300] = "";
+#ifdef HAVE_CAPSTONE
+    if (path[0] && !ap->dis) {                     /* first analysis: may take a moment */
+        snprintf(E_notify, sizeof E_notify, "Analysing %.200s...", path);
+        render_status();
+        doupdate();
+    }
+#endif
+    if (!dis_open(&ap->dis, path, err, sizeof err)) {
+        snprintf(E_notify, sizeof E_notify, "F9: %.240s", err);
+        return;
+    }
+    E_notify[0] = '\0';
+    ap->dis_mode = true;
+    ap->mem_mode = false;
+    if (ap->modified) snprintf(E_notify, sizeof E_notify, "F9: the file on disk is analysed, not the unsaved changes");
+    force_full_dirty();
+}
+
+/* F9 toggle and the keys of the F9 view in pane p; false when the key is
+ * not for it (p not in the view, or F8, which switches to the memory
+ * editor) */
+static bool dis_pane_key(Pane *p, int key) {
+    if (key == KEY_F(9)) { dis_toggle(p); return true; }
+    if (!p->dis_mode || key == KEY_F(8)) return false;
+    if (key == KEY_MOUSE) {                 /* click on a row / address, wheel */
+        MEVENT ev;
+        if (getmouse(&ev) == OK && p->win) {
+            int by, bx, mh, mw;
+            getbegyx(p->win, by, bx);
+            getmaxyx(p->win, mh, mw);
+            int y = ev.y - by, x = ev.x - bx;
+            if (y >= 0 && y < mh && x >= 0 && x < mw &&
+                dis_mouse(p->dis, y, x, (unsigned long)ev.bstate, p->win_h))
+                force_full_dirty();
+        }
+        return true;
+    }
+    if (key == ('q' & 0x1f)) { E.running = false; return true; }
+    if (key == ('a' & 0x1f)) { E.show_shortcuts = !E.show_shortcuts; return true; }
+    if (key == ('e' & 0x1f)) { editor_focus_next(); return true; }
+    if (!dis_key(p->dis, key, p->win_h) && key == 27) {
+        p->dis_mode = false;
+        force_full_dirty();
+    }
+    return true;
+}
+
 static void handle_key_normal(int key) {
 
     
@@ -1466,7 +1541,14 @@ static void handle_key_normal(int key) {
         return;
     }
 
-    
+    /* F9: static analysis of the file behind this pane (read-only). Taken
+     * before the F3 / F4 panels, which would otherwise swallow its keys
+     * (Tab cycles the F9 screens, j/k move in them). The file tree keeps
+     * the keys while it has the focus (F1). F8 falls through to the
+     * memory editor below. */
+    if (!(E.tree_focus && E.tree && E.tree->visible) && dis_pane_key(E.panes[E.active], key))
+        return;
+
     if (finfo_focus && E.finfo && E.finfo->visible) {
         if (key == KEY_DOWN || key == 'j') { E.finfo->scroll_row++;                        return; }
         if (key == KEY_UP   || key == 'k') { if (E.finfo->scroll_row > 0) E.finfo->scroll_row--; return; }
@@ -1500,12 +1582,13 @@ static void handle_key_normal(int key) {
 
     Pane *ap = E.panes[E.active];
 
-    /* Table view: read-only, so plain letters navigate. F2 drops to the
-     * hex dump, F6 back to whatever was underneath. */
+    /* F9 while the file tree has the focus: once the tree passed the key on */
+    if (dis_pane_key(ap, key)) return;
+
     /* F8: memory editor in this pane (process list, then scans) */
     if (key == KEY_F(8)) {
         ap->mem_mode = !ap->mem_mode;
-        if (ap->mem_mode) mem_ui_enter();
+        if (ap->mem_mode) { mem_ui_enter(); ap->dis_mode = false; }
         force_full_dirty();
         return;
     }
@@ -2010,6 +2093,7 @@ void editor_cleanup(void) {
     E.out_text = NULL;
     pthread_mutex_destroy(&E.save_mutex);
     server_stop();
+    mem_ui_shutdown();                     /* F8: detach, free the scans */
     url_tmp_cleanup();
     unlink("./temp_bin");
 }
@@ -2024,6 +2108,7 @@ void editor_run(const char *initial_file) {
     initscr(); raw(); noecho();
     keypad(stdscr, TRUE);
     set_escdelay(25);
+    mouseinterval(0);                       /* F9: a press is a click, no wait */
     curs_set(0);
 
     colors_init();
@@ -2085,11 +2170,20 @@ void editor_run(const char *initial_file) {
         {                                           /* memory editor: live values, freezes */
             int mt = mem_ui_timeout(mem_visible());
             if (mt > 0 && (tmo < 0 || mt < tmo)) tmo = mt;
+            int dt = dbg_ui_timeout();              /* F9 debugger: dbg_poll while it runs */
+            if (dt > 0 && (tmo < 0 || dt < tmo)) tmo = dt;
         }
         if (run_active() && (tmo < 0 || tmo > 25)) tmo = 25;   /* live console */
 	#ifdef _WIN32
     		if (tmo < 0) tmo = 100;   /* pas de SIGWINCH sous Windows : on sonde la taille toutes les 100 ms */
 	#endif
+        {   /* mouse reporting only while F9 shows: elsewhere the terminal
+             * keeps its own selection (copy with the mouse) */
+            static mmask_t mouse_on;
+            mmask_t want = E.panes[E.active]->dis_mode
+                ? (mmask_t)(BUTTON1_PRESSED | BUTTON4_PRESSED | BUTTON5_PRESSED) : 0;
+            if (want != mouse_on) { mousemask(want, NULL); mouse_on = want; }
+        }
         if (tmo >= 0) wtimeout(kw, tmo);
         int key = wgetch(kw);
         if (tmo >= 0) wtimeout(kw, -1);
@@ -2116,6 +2210,7 @@ void editor_run(const char *initial_file) {
         }
 
         mem_ui_tick();                              /* frozen addresses */
+        if (key == ERR && dis_ui_poll()) { full_redraw(false); continue; }   /* F9 debuggee stopped */
         if (key == ERR && mem_visible()) {          /* live values: once a second, F8 only */
             if (mem_ui_refresh_due()) full_redraw(false);
             continue;
@@ -2226,7 +2321,7 @@ void editor_run(const char *initial_file) {
                     } else if (in_paste && paste_len > 0 && E.mode == MODE_NORMAL) {
                         paste_batch[paste_len] = '\0';
                         Pane *ap2 = E.panes[E.active];
-                        if (!ap2->hex_mode && !ap2->table_mode && !ap2->mem_mode &&
+                        if (!ap2->hex_mode && !ap2->table_mode && !ap2->mem_mode && !ap2->dis_mode &&
                             !ap2->img_mode && !ap2->doc_mode) {
                             pane_insert_str(ap2, paste_batch, paste_len);
                             if (E.hl && E.hl->visible) E.hl->dirty = true;
@@ -2350,6 +2445,7 @@ void editor_run(const char *initial_file) {
         full_redraw(force);
     }
 
+    mousemask(0, NULL);
     printf("\033[?2004l");  
     printf("\033[<u");      /* pop the keyboard-protocol flags */
     fflush(stdout);

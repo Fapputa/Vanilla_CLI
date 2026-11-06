@@ -1,4 +1,5 @@
 #include "abyss.h"
+#include "disview.h"
 
 extern char E_notify[256];
 #include "utf8.h"
@@ -102,6 +103,7 @@ void pane_free(Pane *p) {
     tbl_free(p->table);
     img_free(p->img);
     doc_free(p->doc);
+    dis_free(p->dis);
     free(p);
 }
 
@@ -172,6 +174,8 @@ void pane_open_file(Pane *p, const char *path) {
     /* pictures and binary documents (PDF, Word...) are shown, not loaded
      * as text: the buffer stays empty and saving is disabled */
     p->img_mode = p->doc_mode = p->binary_view = false;
+    p->dis_mode = false;                   /* the F9 view belongs to the old file */
+    dis_free(p->dis); p->dis = NULL;
     if (p->img) { img_free(p->img); p->img = NULL; }
     if (p->doc) { doc_free(p->doc); p->doc = NULL; }
     if (img_is_image(p->filename) || doc_is_binary_doc(p->filename)) {
@@ -459,6 +463,11 @@ static int hex_color_at(const GapBuf *g, size_t pos, size_t start, size_t end,
 
 void pane_render(Pane *p, bool force) {
 
+    if (p->dis_mode && p->dis) {
+        dis_render(p->dis, p->win, p->win_h, p->win_w);
+        return;
+    }
+
     if (p->mem_mode) {
         mem_ui_render(p->win, p->win_h, p->win_w);
         return;
@@ -571,7 +580,7 @@ void pane_render(Pane *p, bool force) {
                 }
             }
 
-            char tmp[4]; uint32_t cp;
+            char tmp[5]; uint32_t cp;           /* 4 bytes + the NUL added below */
             int blen_cp = utf8_byte_len((unsigned char)gb_at(p->buf, byte_pos));
             int avail = (int)(line_start + line_len - byte_pos);
             if (blen_cp > avail) blen_cp = avail;

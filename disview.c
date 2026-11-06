@@ -308,10 +308,45 @@ static int fortify_calls(const ElfFile *ef, char *names, size_t sz) {
     return n;
 }
 
+/* PE: the DllCharacteristics flags, the /GS cookie, CFG, W+X sections */
+static void build_protections_pe(DisView *v) {
+    const ElfFile *ef = &v->d.elf;
+    const PeInfo *pe = &ef->pe;
+    const short GOOD = COLOR_PAIR_STRING, BAD = COLOR_PAIR_KEYWORD, MEH = COLOR_PAIR_NUMBER;
+    uint16_t dc = pe->dllchars;
+    if (!(dc & 0x40))            add_kv(v, BAD, "ASLR", "no (DYNAMIC_BASE not set: fixed load address)");
+    else if (!pe->relocs)        add_kv(v, MEH, "ASLR", "DYNAMIC_BASE set but no relocations: loaded at its base");
+    else if (dc & 0x20)          add_kv(v, GOOD, "ASLR", "yes, high entropy (64-bit)");
+    else                         add_kv(v, GOOD, "ASLR", "yes (DYNAMIC_BASE)");
+    if (dc & 0x100)              add_kv(v, GOOD, "DEP / NX", "yes (NX_COMPAT)");
+    else                         add_kv(v, BAD, "DEP / NX", "no NX_COMPAT flag");
+    if (dc & 0x4000)             add_kv(v, GOOD, "CFG", "yes (Control Flow Guard)%s", pe->guard_flags & 0x100 ? ", with a function table" : "");
+    else                         add_kv(v, COLOR_PAIR_COMMENT, "CFG", "no");
+    bool gs = pe->cookie || has_name(ef, "__security_check_cookie") || has_name(ef, "__security_init_cookie");
+    bool ssp = has_name(ef, "__stack_chk_fail") || has_name(ef, "__stack_chk_guard");
+    if (gs)                      add_kv(v, GOOD, "Canary", "yes (/GS security cookie%s)", pe->cookie ? " in the load config" : "");
+    else if (ssp)                add_kv(v, GOOD, "Canary", "yes (__stack_chk_fail)");
+    else                         add_kv(v, BAD, "Canary", "not found");
+    if (dc & 0x400)              add_kv(v, COLOR_PAIR_COMMENT, "SEH", "NO_SEH (no structured exception handler)");
+    if (dc & 0x80)               add_kv(v, GOOD, "Integrity", "FORCE_INTEGRITY (signature checked at load)");
+    if (pe->signature)           add_kv(v, GOOD, "Signature", "Authenticode certificate present (not verified here)");
+    else                         add_kv(v, COLOR_PAIR_COMMENT, "Signature", "not signed");
+    int nrwx = 0;
+    for (int i = 0; i < ef->nsec; i++)
+        if ((ef->sec[i].flags & 5) == 5) {
+            if (!nrwx) add_kv(v, BAD, "W+X section", "%s at 0x%llx: writable and executable", ef->sec[i].name,
+                              (unsigned long long)ef->sec[i].addr);
+            nrwx++;
+        }
+    if (nrwx > 1)                add_kv(v, BAD, "", "%d writable + executable sections in all", nrwx);
+    else if (!nrwx)              add_kv(v, GOOD, "W+X section", "none");
+}
+
 static void build_protections(DisView *v) {
     const ElfFile *ef = &v->d.elf;
     const short GOOD = COLOR_PAIR_STRING, BAD = COLOR_PAIR_KEYWORD, MEH = COLOR_PAIR_NUMBER;
     add_title(v, "PROTECTIONS");
+    if (ef->fmt == ELF_FMT_PE) { build_protections_pe(v); return; }
 
     if (ef->type == 1) { add_text(v, COLOR_PAIR_COMMENT, "   object file (.o): decided at link time"); return; }
 
@@ -352,7 +387,7 @@ static void build_protections(DisView *v) {
 }
 
 static const char *fn_kind_name(int k) {
-    static const char *n[] = { "symtab", "dynsym", "plt", "entry", "main", "ctor",
+    static const char *n[] = { "symtab", "dynsym", "plt", "entry", "main", "ctor", "pdata",
                                "call", "codeptr", "dataptr", "prologue" };
     return k >= 0 && k < (int)(sizeof n / sizeof *n) ? n[k] : "?";
 }
@@ -381,10 +416,95 @@ static void build_analysis(DisView *v) {
            d->att ? "AT&T" : "Intel");
 }
 
+/* PE: header, imports by DLL, exports, then the same sections table */
+static void build_info_pe(DisView *v) {
+    const Disasm *d = &v->d;
+    const ElfFile *ef = &d->elf;
+    const PeInfo *pe = &ef->pe;
+    char tmp[256], sz[32];
+
+    add_title(v, "FILE");
+    add_kv(v, COLOR_PAIR_NORMAL, "Path", "%s", v->path);
+    human_size(ef->size, sz, sizeof sz);
+    add_kv(v, COLOR_PAIR_NORMAL, "Size", "%s (%zu bytes)", sz, ef->size);
+    add_kv(v, COLOR_PAIR_NORMAL, "Type", "%s  ·  %s%s", pe->dll ? "DLL (dynamic-link library)" : "executable (.exe)",
+           pe_subsystem_name(pe->subsystem), pe->dotnet ? "  ·  .NET assembly" : "");
+    add_kv(v, COLOR_PAIR_NORMAL, "Architecture", "%s  ·  PE32+ (64-bit)", pe_machine_name(pe->machine));
+    add_kv(v, COLOR_PAIR_NORMAL, "Image base", "0x%llx  ·  %u bytes in memory  ·  addresses = base + RVA",
+           (unsigned long long)pe->image_base, pe->size_image);
+    if (!ef->entry) add_kv(v, COLOR_PAIR_COMMENT, "Entry point", "none");
+    else {
+        const char *nm = da_name_for(d, ef->entry, tmp, sizeof tmp);
+        const ElfSection *s = elf_section_at(ef, ef->entry);
+        add_kv(v, elf_va_exec(ef, ef->entry) ? COLOR_PAIR_NUMBER : COLOR_PAIR_KEYWORD, "Entry point",
+               "0x%llx  (RVA 0x%llx)%s%s%s%s%s%s", (unsigned long long)ef->entry,
+               (unsigned long long)(ef->entry - pe->image_base), nm ? "  " : "", nm ? nm : "",
+               s ? "  (" : "", s ? s->name : "", s ? ")" : "", pe->dll ? "  ·  DllMain-style entry" : "");
+    }
+    long mi = da_func_named(d, "main");
+    if (mi >= 0 && d->fn[mi].kind == FN_MAIN)
+        add_kv(v, COLOR_PAIR_NUMBER, "main", "0x%llx  (called by the CRT start-up after argc / argv)", (unsigned long long)d->fn[mi].addr);
+    add_kv(v, COLOR_PAIR_NORMAL, "Linker", "%u.%u  ·  OS %u.%u", pe->linker_major, pe->linker_minor, pe->os_major, pe->os_minor);
+    if (pe->timestamp) add_kv(v, COLOR_PAIR_COMMENT, "Timestamp", "0x%08x (may be a build hash, not a date)", pe->timestamp);
+    if (pe->pdb[0]) add_kv(v, COLOR_PAIR_STRING, "PDB", "%s", pe->pdb);
+    if (ef->soname[0]) add_kv(v, COLOR_PAIR_NORMAL, "Export name", "%s", ef->soname);
+
+    add_title(v, "IMPORTS (%d from %d DLL%s)", ef->nimp, ef->nneeded, ef->nneeded == 1 ? "" : "s");
+    if (!ef->nneeded) add_text(v, COLOR_PAIR_COMMENT, "   none");
+    for (int i = 0; i < ef->nneeded; i++) {
+        char dll[128];
+        snprintf(dll, sizeof dll, "%s", ef->needed[i]);
+        char *sp = strstr(dll, " (delay-load)");
+        if (sp) *sp = '\0';
+        int n = 0;
+        char first[200] = "";
+        size_t u = 0;
+        for (int k = 0; k < ef->nimp; k++) {
+            if (strncmp(ef->imp[k].version, dll, sizeof ef->imp[k].version - 1)) continue;   /* version: cut at 31 */
+            if (n < 6 && u + strlen(ef->imp[k].name) + 3 < sizeof first)
+                u += (size_t)snprintf(first + u, sizeof first - u, "%s%s", n ? ", " : "", ef->imp[k].name);
+            n++;
+        }
+        add_kv(v, COLOR_PAIR_STRING, i ? "" : "DLLs", "%-34s %4d  %s%s", ef->needed[i], n, first, n > 6 ? ", ..." : "");
+    }
+    int nfs = 0;
+    for (int i = 0; i < ef->nsym; i++) if (!ef->sym[i].dynamic) nfs++;
+    add_title(v, "SYMBOLS");
+    add_kv(v, COLOR_PAIR_NORMAL, "Exports", "%d", pe->nexports);
+    if (ef->stripped) add_kv(v, COLOR_PAIR_NUMBER, "COFF symbols", "none (stripped: names from exports and imports only)");
+    else              add_kv(v, COLOR_PAIR_NORMAL, "COFF symbols", "%d (MinGW debug names)", nfs);
+    if (ef->nfstart) add_kv(v, COLOR_PAIR_NORMAL, "Unwind table", "%d functions in .pdata", ef->nfstart);
+    if (ef->nctors) add_kv(v, COLOR_PAIR_NUMBER, "TLS callbacks", "%d (run by the loader before the entry point)", ef->nctors);
+    if (pe->overlay_size) {
+        human_size(pe->overlay_size, sz, sizeof sz);
+        add_kv(v, COLOR_PAIR_NUMBER, "Overlay", "%s after the sections (offset 0x%llx): appended data", sz, (unsigned long long)pe->overlay_off);
+    }
+
+    build_protections(v);
+    build_analysis(v);
+
+    add_title(v, "SECTIONS (%d)", ef->nsec);
+    add_text(v, COLOR_PAIR_LINENUM, "   %3s  %-20s %-12s %18s %10s %10s  %s", "NR", "NAME", "TYPE", "ADDR", "OFFSET", "SIZE", "FLAGS");
+    for (int i = 0; i < ef->nsec; i++) {
+        const ElfSection *s = &ef->sec[i];
+        char f[8];
+        elf_sec_flags_str(s->flags, f);
+        add_text(v, s->bad ? COLOR_PAIR_KEYWORD : (s->flags & 4) ? COLOR_PAIR_NUMBER : COLOR_PAIR_NORMAL,
+                 "   %3d  %-20.20s %-12.12s %#18llx %#10llx %#10llx  %s%s", i, s->name[0] ? s->name : "-",
+                 s->type == 8 ? "BSS" : (s->flags & 4) ? "CODE" : "DATA", (unsigned long long)s->addr,
+                 (unsigned long long)s->off, (unsigned long long)s->size, f, s->bad ? "  outside the file" : "");
+    }
+
+    add_title(v, "LOADER WARNINGS (%d)", ef->nwarn);
+    if (!ef->nwarn) add_text(v, COLOR_PAIR_COMMENT, "   none");
+    for (int i = 0; i < ef->nwarn; i++) add_text(v, COLOR_PAIR_NUMBER, "   ! %s", ef->warn[i]);
+}
+
 static void build_info(DisView *v) {
     const Disasm *d = &v->d;
     const ElfFile *ef = &d->elf;
     char tmp[256], sz[32];
+    if (ef->fmt == ELF_FMT_PE) { build_info_pe(v); return; }
 
     add_title(v, "FILE");
     add_kv(v, COLOR_PAIR_NORMAL, "Path", "%s", v->path);
@@ -824,6 +944,19 @@ static const char *sec_desc(const char *n) {
         { ".itablink",      "Go interface table" },
         { ".noptrdata",     "Go data without pointers" },
         { ".noptrbss",      "Go zero data without pointers" },
+        /* PE */
+        { ".rdata",         "read-only data: strings, constants, import names" },
+        { ".idata",         "imports: DLL names and the IAT (addresses filled by the loader)" },
+        { ".edata",         "exports: the functions this DLL gives" },
+        { ".pdata",         "unwind table: start and end of each function" },
+        { ".xdata",         "unwind codes (exceptions, stack traces)" },
+        { ".reloc",         "base relocations, applied when loaded elsewhere (ASLR)" },
+        { ".rsrc",          "resources: icons, version info, dialogs, manifest" },
+        { ".tls",           "thread-local data, initial values" },
+        { ".CRT*",          "C runtime start-up tables (initialisers)" },
+        { ".didat",         "delay-load import addresses" },
+        { ".gfids",         "Control Flow Guard function table" },
+        { ".debug_*",       "DWARF debug information (MinGW)" },
     };
     for (size_t i = 0; i < sizeof t / sizeof *t; i++) {
         size_t k = strlen(t[i][0]);
@@ -1290,19 +1423,29 @@ static const char *input_fn(const char *nm) {
         "scanf", "vscanf", "fscanf", "vfscanf", "wscanf", "fwscanf",
         "getchar", "getchar_unlocked", "getc", "getc_unlocked", "_IO_getc", "fgetc", "fgetc_unlocked",
         "fgets", "fgets_unlocked", "gets", "getline", "getdelim", "read", "fread", "fread_unlocked",
-        "getwchar", "getwc", "fgetwc", "fgetws", "readline" };
+        "getwchar", "getwc", "fgetwc", "fgetws", "readline",
+        /* Windows: kernel32, the UCRT / msvcrt, MinGW */
+        "ReadFile", "ReadConsoleA", "ReadConsoleW", "ReadConsoleInputA", "ReadConsoleInputW",
+        "getch", "getche", "getwch", "getwche", "cgets", "cgetws", "gets_s", "getws",
+        "scanf_s", "fscanf_s", "wscanf_s", "stdio_common_vfscanf", "stdio_common_vfwscanf", "fgetchar" };
     char b[64];
     size_t n = strcspn(nm, "@");
     if (n >= sizeof b) return NULL;
     memcpy(b, nm, n);
     b[n] = '\0';
     const char *s = b;
+    if (!strncmp(s, "__imp_", 6)) s += 6;           /* PE: call through the IAT slot */
     if (!strncmp(s, "__isoc99_", 9) || !strncmp(s, "__isoc23_", 9)) s += 9;
-    else if (!strncmp(s, "__", 2)) s += 2;          /* __fgets_chk, __getdelim */
-    size_t m = strlen(s);
-    if (m > 4 && !strcmp(s + m - 4, "_chk")) m -= 4;
-    for (size_t k = 0; k < sizeof t / sizeof t[0]; k++)
-        if (strlen(t[k]) == m && !strncmp(t[k], s, m)) return t[k];
+    else if (!strncmp(s, "__mingw_", 8)) s += 8;    /* __mingw_scanf, __mingw_vfscanf */
+    else if (!strncmp(s, "__", 2)) s += 2;          /* __fgets_chk, __getdelim, __stdio_common_vfscanf */
+    for (int pass = 0; pass < 2; pass++) {          /* then _getch, _read, _fgetchar (Windows) */
+        if (pass && (s[0] != '_' || s[1] == '_')) break;
+        if (pass) s++;
+        size_t m = strlen(s);
+        if (m > 4 && !strcmp(s + m - 4, "_chk")) m -= 4;
+        for (size_t k = 0; k < sizeof t / sizeof t[0]; k++)
+            if (strlen(t[k]) == m && !strncmp(t[k], s, m)) return t[k];
+    }
     return NULL;
 }
 
@@ -1340,6 +1483,10 @@ static int auto_add(const DisView *v) {
  * once per wait). */
 static bool     g_wait;
 static unsigned g_wait_gen;
+/* resumed onto a call to an input function (F7 over it, F5 from its
+ * input breakpoint): where /proc/pid/syscall is missing (Windows), the
+ * program is taken as waiting for its input until its next stop */
+static bool     g_input_run;
 
 static bool dbg_reading(void) {
 #ifdef __linux__
@@ -1358,7 +1505,9 @@ static bool dbg_reading(void) {
     ssize_t n = readlink(p, b, sizeof b - 1);
     return n > 9 && !strncmp(b, "/dev/pts/", 9);
 #else
-    return false;
+    /* no console (dbg_console_read -1: dbg_win.c, whose program has its
+     * own console window): nothing to type into here */
+    return g_input_run && dbg_state() == DBG_RUNNING && dbg_console_read(NULL, 0) >= 0;
 #endif
 }
 
@@ -1386,6 +1535,7 @@ static bool dbg_alive(void) {
 static void dbg_changed(void) {
     g_dbg_gen++;
     g_runto_on = false;
+    if (dbg_state() != DBG_RUNNING) g_input_run = false;
     if (g_main_tmp && dbg_state() != DBG_RUNNING) {
         char e[200];
         if (dbg_bp_remove(g_main_addr, e, sizeof e)) g_main_tmp = false;
@@ -1427,25 +1577,14 @@ static size_t dl_line_of(const DisView *v, uint64_t a) {
     return SIZE_MAX;
 }
 
-/* name of the mapping of `pid` holding address a ("libc.so.6") */
+/* name of the mapping / module of the debuggee holding address a
+ * ("libc.so.6", "KERNEL32.DLL"), see dbg_map_name */
 static bool map_name(int pid, uint64_t a, char *out, size_t sz) {
-    char p[64], line[4400];
-    snprintf(p, sizeof p, "/proc/%d/maps", pid);
-    FILE *f = fopen(p, "r");
-    if (!f) return false;
-    bool ok = false;
-    while (!ok && fgets(line, sizeof line, f)) {
-        unsigned long long lo, hi;
-        int n = 0;
-        if (sscanf(line, "%llx-%llx %*s %*s %*s %*s %n", &lo, &hi, &n) < 2 || !n) continue;
-        if (a < lo || a >= hi) continue;
-        char *nm = line + n;
-        nm[strcspn(nm, "\n")] = '\0';
-        snprintf(out, sz, "%s", nm[0] ? base_name(nm) : "anonymous memory");
-        ok = true;
-    }
-    fclose(f);
-    return ok;
+    (void)pid;
+    char nm[4096];
+    if (!dbg_map_name(a, nm, sizeof nm)) return false;
+    snprintf(out, sz, "%.*s", (int)(sz ? sz - 1 : 0), nm[0] ? base_name(nm) : "anonymous memory");
+    return true;
 }
 
 /* Shows the last stop of the debuggee in v, once per stop: the function
@@ -1510,6 +1649,10 @@ bool dis_ui_poll(void) {
 static void dbg_key_console(DisView *v) {
     if (!dbg_mine(v) || !dbg_alive()) {
         list_msg(v, COLOR_PAIR_NUMBER, "no process: F5 runs %s, then i types into its console", base_name(v->path));
+        return;
+    }
+    if (dbg_console_read(NULL, 0) < 0) {
+        list_msg(v, COLOR_PAIR_NUMBER, "%s has no console here: type its input in its own window", base_name(v->path));
         return;
     }
     v->in_mode = IN_CONSOLE;
@@ -1605,12 +1748,36 @@ static void dbg_key_run(DisView *v, int key, int win_h) {
         return;
     }
     if (s != DBG_STOPPED) {
-        /* F5 runs up to a breakpoint; F6 / F7 start it and stop at main,
-         * to go through it from its first line */
-        long mf = key != KEY_F(5) ? da_func_named(&v->d, "main") : -1;
-        if (key != KEY_F(5) && mf < 0) {
-            list_msg(v, COLOR_PAIR_NUMBER, "no main found: F5 runs %s up to a breakpoint", base_name(v->path));
+        const ElfFile *ef = &v->d.elf;
+#ifdef _WIN32
+        if (ef->fmt != ELF_FMT_PE) {
+            list_msg(v, COLOR_PAIR_NUMBER, "%s is a Linux program: the debugger (F5) runs Windows programs only, the analysis works here",
+                     base_name(v->path));
             return;
+        }
+#else
+        if (ef->fmt == ELF_FMT_PE) {
+            list_msg(v, COLOR_PAIR_NUMBER, "%s is a Windows program: the debugger (F5) runs Linux programs only, the analysis works here",
+                     base_name(v->path));
+            return;
+        }
+#endif
+        if (ef->fmt == ELF_FMT_PE && ef->pe.dll) {
+            list_msg(v, COLOR_PAIR_NUMBER, "%s is a DLL: it does not run by itself (F5 on the .exe that loads it)", base_name(v->path));
+            return;
+        }
+        /* F5 runs up to a breakpoint; F6 / F7 start it and stop at main,
+         * to go through it from its first line (no main found: at the
+         * entry point) */
+        long mf = key != KEY_F(5) ? da_func_named(&v->d, "main") : -1;
+        uint64_t first = 0;
+        if (key != KEY_F(5)) {
+            if (mf >= 0) first = v->d.fn[mf].addr;
+            else if (ef->entry && elf_va_exec(ef, ef->entry)) first = ef->entry;
+            else {
+                list_msg(v, COLOR_PAIR_NUMBER, "no main nor entry point found: F5 runs %s up to a breakpoint", base_name(v->path));
+                return;
+            }
         }
         g_regs_ok = g_prev_ok = false;
         con_clear();
@@ -1621,14 +1788,17 @@ static void dbg_key_run(DisView *v, int key, int win_h) {
             return;
         }
         if (!g_auto_done) auto_add(v);
-        if (mf >= 0 && !g_main_tmp && !dbg_bp_has(v->d.fn[mf].addr)) {
+        if (first && !g_main_tmp && !dbg_bp_has(first)) {
             char e[200];
-            g_main_addr = v->d.fn[mf].addr;
+            g_main_addr = first;
             g_main_tmp = dbg_bp_add(g_main_addr, e, sizeof e);
         }
         ok = dbg_cont(err, sizeof err);
     } else if (key == KEY_F(5)) {
+        uint64_t fa;
+        bool in = dbg_rip(&fa, NULL) && input_call_at(v, fa);       /* from its input breakpoint */
         ok = dbg_cont(err, sizeof err);
+        g_input_run = ok && in;
     } else if (key == KEY_F(6)) {
         ok = dbg_step(err, sizeof err);
     } else {
@@ -1642,6 +1812,7 @@ static void dbg_key_run(DisView *v, int key, int win_h) {
         if (l && (!strncmp(mnem_base(l->mnem), "call", 4) || !strncmp(l->mnem, "rep", 3))) {
             g_runto = l->addr + l->len;
             ok = runto = dbg_run_to(g_runto, err, sizeof err);
+            g_input_run = ok && input_call_at(v, l->addr);
         } else
             ok = dbg_step(err, sizeof err);
     }
@@ -1666,7 +1837,8 @@ static bool check_header(const char *path, char *err, size_t esz) {
     uint8_t h[20];
     size_t n = fread(h, 1, sizeof h, f);
     fclose(f);
-    if (n < 4 || memcmp(h, "\x7f" "ELF", 4)) { snprintf(err, esz, "%.200s is not an ELF file", base_name(path)); return false; }
+    if (n >= 2 && h[0] == 'M' && h[1] == 'Z') return true;       /* PE: pe_parse checks the rest */
+    if (n < 4 || memcmp(h, "\x7f" "ELF", 4)) { snprintf(err, esz, "%.200s is not an executable (ELF or PE)", base_name(path)); return false; }
     if (n < sizeof h) { snprintf(err, esz, "truncated ELF: %zu bytes, the header is incomplete", n); return false; }
     if (h[4] == 1) { snprintf(err, esz, "32-bit ELF: only ELF64 x86-64 is analysed"); return false; }
     if (h[4] != 2) { snprintf(err, esz, "ELF of unknown class %u", h[4]); return false; }
@@ -2496,7 +2668,7 @@ void dis_render(DisView *v, WINDOW *win, int h, int w) {
     char line[512];
     static const char *const scr[] = { "INFO", "FUNCTIONS", "DISASSEMBLY", "DATA SECTIONS", "DATA" };
     snprintf(line, sizeof line, " DISASM  ·  %s  ·  %.200s  ·  %s %s  ·  %zu functions  ·  %zu data sections",
-             scr[v->screen], base_name(v->path), elf_machine_name(ef->machine), elf_type_name(ef->type),
+             scr[v->screen], base_name(v->path), elf_machine_name(ef->machine), elf_kind_name(ef),
              v->d.nfn, v->nds);
     bar(win, 0, w, HEX_CP_HEADER, A_BOLD, line);
     if (v->screen == SCR_FUNCS) render_funcs(v, win, h, w);
@@ -2855,7 +3027,7 @@ void dis_status(const DisView *v, char *out, size_t sz) {
         return;
     }
     snprintf(out, sz, " [DISASM]  %s  ·  %s %s%s  ·  %zu functions  ·  %zu instructions%s  ·  %d warning%s ",
-             base_name(v->path), elf_machine_name(ef->machine), elf_type_name(ef->type),
+             base_name(v->path), elf_machine_name(ef->machine), elf_kind_name(ef),
              ef->stripped ? "  stripped" : "", v->d.nfn, v->d.nins, v->d.capped ? " (partial)" : "",
              ef->nwarn, ef->nwarn == 1 ? "" : "s");
 }

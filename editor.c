@@ -22,6 +22,16 @@ void win_init_utf8(void);
 Editor E;
 char E_notify[256] = "";
 
+/* copies src into dst (size n), truncated and always NUL-terminated
+ * (snprintf "%s" would do the same but warns -Wformat-truncation) */
+static void str_copy(char *dst, size_t n, const char *src) {
+    if (!n) return;
+    size_t l = strlen(src);
+    if (l >= n) l = n - 1;
+    memmove(dst, src, l);
+    dst[l] = '\0';
+}
+
 /* ^B builds and runs; ^B pressed twice within BUILD_DOUBLE_TAP_MS opens the
  * build-options menu instead (F5 too). The first ^B only arms
  * `build_tap_pending`; the main loop then waits that long for the second
@@ -235,7 +245,7 @@ static void render_title(void) {
             const char *bs = strrchr(ap->filename, '\\');
             if (bs && (!sl || bs > sl)) sl = bs;
 #endif
-            snprintf(base, sizeof base, "%s", sl ? sl + 1 : ap->filename);
+            str_copy(base, sizeof base, sl ? sl + 1 : ap->filename);
             if (sl) {
                 const char *home = home_dir();
                 size_t hl = home ? strlen(home) : 0;
@@ -948,7 +958,7 @@ static void force_full_dirty(void) {
 
 static void open_dialog(EditorMode m, const char *prefill) {
     E.mode = m;
-    if (prefill) snprintf(E.dialog_buf, sizeof(E.dialog_buf), "%s", prefill);
+    if (prefill) str_copy(E.dialog_buf, sizeof(E.dialog_buf), prefill);
     else E.dialog_buf[0] = '\0';
     E.dialog_cursor = strlen(E.dialog_buf);
 }
@@ -1064,7 +1074,7 @@ static void dialog_confirm(void) {
 
         case MODE_SEARCH_DIALOG:
             if (strcmp(E.dialog_buf, ap->search.query) != 0) {
-                snprintf(ap->search.query,     sizeof ap->search.query,     "%s", E.dialog_buf);
+                str_copy(ap->search.query, sizeof ap->search.query,     E.dialog_buf);
                 search_find(&ap->search, ap->buf);
                 if (ap->search.count > 0) {
                     ap->search.current = 0;
@@ -1372,8 +1382,8 @@ static void tree_query_submit(void) {
     ft_query_set(ft, "");
     if (S_ISDIR(st.st_mode)) {
         char r[4096];
-        if (realpath(path, r)) snprintf(ft->cwd, sizeof ft->cwd, "%s", r);
-        else                   snprintf(ft->cwd, sizeof ft->cwd, "%s", path);
+        if (realpath(path, r)) str_copy(ft->cwd, sizeof ft->cwd, r);
+        else                   str_copy(ft->cwd, sizeof ft->cwd, path);
         ft->selected = 0; ft->scroll = 0;
         ft_reload(ft);
     } else {
@@ -1955,7 +1965,7 @@ static void handle_key_dialog(int key) {
             if (E.mode == MODE_SEARCH_DIALOG) {
                 Pane *ap = E.panes[E.active];
                 if (strcmp(E.dialog_buf, ap->search.query) != 0) {
-                    snprintf(ap->search.query, sizeof ap->search.query, "%s", E.dialog_buf);
+                    str_copy(ap->search.query, sizeof ap->search.query, E.dialog_buf);
                     search_find(&ap->search, ap->buf);
                 }
                 snprintf(ap->syn->search_word, sizeof ap->syn->search_word, "%s", ap->search.query);

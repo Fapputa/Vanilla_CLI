@@ -2,7 +2,7 @@
 
 A high-performance, versatile toolkit designed to supercharge the terminal experience on Linux and Windows. From low-level system monitoring to a high-speed C-engineered text editor, this suite brings efficiency and fun to the command line.
 
-![Demo](.lain.gif)
+![Demo](.rem.gif)
 
 ---
 
@@ -171,7 +171,7 @@ abyss main.c
 | `F4` | Smart highlight panel |
 | `F6` | Table view (CSV, JSON, SQL, SQLite...) |
 | `F8` | Memory editor (scan and change a running program's variables) |
-| `F9` | Static analysis of an ELF x86-64 binary (read-only) |
+| `F9` | Static analysis and debugger of an ELF x86-64 binary |
 
 ### File tree (F1)
 
@@ -348,9 +348,10 @@ first one hits the cap.
 
 ### Static analysis (F9)
 
-`F9` opens a read-only analysis of the file behind the current buffer, in the
-current pane, when it is an ELF64 x86-64 binary (executable, PIE, shared
-object or `.o`). The binary is only read: never run, emulated or modified.
+`F9` opens an analysis of the file behind the current buffer, in the current
+pane, when it is an ELF64 x86-64 binary (executable, PIE, shared object or
+`.o`). The analysis only reads the binary: it never runs, emulates or
+modifies it (the debugger, below, runs it only when asked to).
 Anything else gets a message in the status bar (not an ELF file, 32-bit or
 another architecture, truncated or malformed file). The file on disk is
 analysed, not unsaved changes in the buffer.
@@ -387,7 +388,55 @@ points to, the start of another function. A line marked `!` is one the
 recursive analysis did not decode (bytes hidden in code, or code it did not
 reach, e.g. the cases of a switch whose table it does not follow). Arrows /
 `j` `k`, `PgUp` / `PgDn` / `Space` and `g` / `G` move; `Esc` goes back to the
-list. `Tab` then cycles the three screens: information, list, disassembly.
+list.
+
+`Enter` (or a click) on a line with an address (a call or jump target, a
+`[rip + X]` operand) follows it: to the disassembly of the function holding
+it, or to its row in a data section. `Backspace` goes back along the links
+followed. `:` jumps to a hex address from the disassembly and data screens
+too.
+
+`d` lists the data sections (name, address, size, permissions, type and what
+the section usually holds); `Enter` shows the contents of one, cut into rows:
+a string, an address (with the name of what it points to; `Enter` follows it),
+a run of zero bytes, or 16 bytes of hex. `d` again goes back to where you
+were. `Tab` cycles the screens: information, list, disassembly, data
+sections, contents.
+
+#### Debugger (Linux)
+
+The disassembly screen is also a debugger of the binary (ptrace, one program
+at a time, run under Abyss and killed with it):
+
+| Key | Action |
+|-----|--------|
+| `b` | Set / remove a breakpoint on the selected line (`•` in the margin) |
+| `F5` | Run up to the next breakpoint, or continue |
+| `F6` | Step one instruction; with no program running, start it and stop at the first line of `main` |
+| `F7` | Step over (a `call` runs to the line after it); starts at `main` like `F6` |
+| `p` | Pause the running program |
+| `K` / `Shift + F5` | Kill it |
+| `i` / click on the panel | Type into its console |
+
+While the program is stopped, its line (`▶`) is highlighted and a panel on the
+right shows the registers (`rip rsp rbp rax rbx rcx rdx rsi rdi rflags`, the
+changed ones highlighted, `rflags` decoded, where `rip` is). A stop on a
+signal says why, with the faulting address for a segmentation fault.
+Breakpoints work with PIE binaries (ASLR is taken into account), can be set
+while the program runs, and are kept from one run to the next.
+
+At the first run, a breakpoint is set on every call to an input function of
+the C library in the program's own code (`scanf`, `fgets`, `getchar`,
+`read`...), drawn in another colour: the program stops before it waits for
+its input. `b` removes one for good.
+
+The bottom of the panel is the program's console: its stdin / stdout /
+stderr are a pseudo-terminal, so it behaves as in a terminal (line-buffered
+`printf`, echo of what is typed). While the program waits for its input the
+panel says `WAITING FOR INPUT` and the keys go to the console by themselves:
+`Enter` sends the line, `^D` ends the input, `^C` sends `SIGINT`, arrows and
+`PgUp` / `PgDn` still move the disassembly, `Esc` gives the keys back (they
+also come back at the next stop).
 
 The view needs [capstone](https://www.capstone-engine.org/) (`pacman -S
 capstone`, `apt install libcapstone-dev`), found through `pkg-config` at build

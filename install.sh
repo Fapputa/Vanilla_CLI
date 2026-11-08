@@ -57,8 +57,11 @@ detect_pkg_manager() {
     elif command -v pacman &>/dev/null; then
         PKG_MANAGER="pacman"
         info "Package manager detected: pacman (Arch)"
+    elif command -v dnf &>/dev/null; then
+        PKG_MANAGER="dnf"
+        info "Package manager detected: dnf (Fedora/RHEL)"
     else
-        fail "No supported package manager found (apt / pacman). Aborting."
+        fail "No supported package manager found (apt / pacman / dnf). Aborting."
     fi
 }
 
@@ -77,6 +80,13 @@ PACMAN_PKGS=(
     python python-pip python-rich python-prompt_toolkit
     python-pygments python-psutil
     poppler sqlite unzip xclip xsel wireless_tools net-tools
+)
+
+DNF_PKGS=(
+    gcc gcc-c++ make ncurses-devel rust cargo
+    python3 python3-pip python3-rich python3-prompt-toolkit
+    python3-pygments python3-psutil
+    poppler-utils sqlite unzip xclip xsel wireless-tools net-tools
 )
 
 # Seuls les paquets absents sont installes ; s'il n'en manque aucun, le
@@ -121,6 +131,27 @@ install_system_deps() {
             warn "Could not install from the current package database"
             warn "(it is probably older than the mirrors)."
             fail "Update your system when convenient (pacman -Syu), then re-run this installer."
+        fi
+
+    elif [ "$PKG_MANAGER" = "dnf" ]; then
+        # rpm -q echoue pour chaque paquet non installe.
+        local p
+        for p in "${DNF_PKGS[@]}"; do
+            rpm -q --quiet "$p" 2>/dev/null || missing+=("$p")
+        done
+
+        if [ ${#missing[@]} -eq 0 ]; then
+            ok "All system dependencies already installed."
+            return 0
+        fi
+
+        info "Missing: ${missing[*]}"
+
+        # dnf install rafraichit lui-meme ses metadonnees si besoin ; pas de
+        # upgrade impose du systeme.
+        if ! dnf install -y "${missing[@]}"; then
+            warn "dnf could not install some packages."
+            fail "Check your repositories (dnf makecache), then re-run this installer."
         fi
     fi
 

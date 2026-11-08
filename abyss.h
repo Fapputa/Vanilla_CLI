@@ -5,6 +5,13 @@
 #define _GNU_SOURCE
 #endif
 
+#ifdef _WIN32
+/* ncurses formats printw() & co with the C99 vsnprintf of UCRT: checked as such (the
+ * "printf" archetype of MinGW's GCC is the old msvcrt one, which knows no %zu) */
+#  ifndef GCC_PRINTFLIKE
+#    define GCC_PRINTFLIKE(fmt, var) __attribute__((format(gnu_printf, fmt, var)))
+#  endif
+#endif
 #include <ncurses.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -56,6 +63,15 @@ static inline void *mmap(void *addr, size_t len, int prot, int flags, int fd, of
     return p;
 }
 static inline int munmap(void *p, size_t len) { (void)len; free(p); return 0; }
+
+/* winsize.c: the console (before initscr) and Abyss's own folder, %LOCALAPPDATA%\abyss */
+int  win_console_size(int *rows, int *cols);
+void win_init_utf8(void);                       /* console checked, VT + UTF-8, or exit 1 */
+const char *win_console_note(void);             /* for the status bar, NULL if none */
+const char *win_appdir(void);                   /* created if missing; NULL, errno set */
+int  win_apppath(char *out, size_t sz, const char *name);   /* <appdir>\name; 0, errno set */
+#define WIN_KEY_CHAR 0x40000000                  /* | a typed UTF-16 unit, from winsize.c */
+int  win_key_utf8(int key, unsigned char b[4]);  /* its UTF-8 bytes; 0 half a pair; -1 not one */
 #else
 #  include <sys/mman.h>
 #  include <sys/wait.h>

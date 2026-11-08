@@ -393,26 +393,39 @@ static bool cargo_root(const char *path, char *out, size_t out_sz) {
  * server plus a URL to open. Paths in commands are relative to cwd. */
 
 #define CMD_MAX 32768
+#define URL_MAX (3 * 4096 + 16)   /* "file:///" + a path of 4095 bytes, each %XX-encoded */
 
 typedef struct {
     char cwd[4096];
     char build[CMD_MAX];
     char run[CMD_MAX];
     bool server;            /* `run` is a long-lived server             */
-    char url[2048];         /* opened in the browser (server or file)   */
+    char url[URL_MAX];      /* opened in the browser (server or file)   */
     bool open_browser;
     char produced[4096];    /* what stays on disk once built            */
     char cleanup[8][4400];   /* temporary files removed after the run    */
     int  ncleanup;
 } Plan;
 
-static void sappend(char *dst, size_t sz, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
+static void sappend(char *dst, size_t sz, const char *fmt, ...) __attribute__((format(gnu_printf, 3, 4)));
 static void sappend(char *dst, size_t sz, const char *fmt, ...) {
     size_t n = strlen(dst);
     if (n >= sz - 1) return;
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(dst + n, sz - n, fmt, ap);
+    va_end(ap);
+}
+
+/* a temporary file for after the run. The arguments come from other members
+ * (pl->cwd) or from outside, never from pl->cleanup: no overlap. Written with
+ * snprintf, gcc reports one (-Wrestrict) as it does not bound the index. */
+static void add_cleanup(Plan *pl, const char *fmt, ...) __attribute__((format(gnu_printf, 2, 3)));
+static void add_cleanup(Plan *pl, const char *fmt, ...) {
+    if (pl->ncleanup < 0 || pl->ncleanup >= 8) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(pl->cleanup[pl->ncleanup++], sizeof pl->cleanup[0], fmt, ap);
     va_end(ap);
 }
 
@@ -476,7 +489,9 @@ static bool file_mentions(const char *path, const char *const *needles) {
 }
 
 static void obj_name(const char *src, char *out, size_t sz) {
-    snprintf(out, sz, "%s", src);
+    size_t n = strnlen(src, sz - 1);      /* src: a file name (< 256), never cut */
+    memcpy(out, src, n);
+    out[n] = '\0';
     char *dot = strrchr(out, '.');
     if (dot) *dot = '\0';
     sappend(out, sz, ".o");
@@ -512,6 +527,21 @@ static void unbuf_header_write(void) {
     unbuf_header_path(p, sizeof p);
     FILE *f = fopen(p, "wb");
     if (f) { fputs(UNBUF_H, f); fclose(f); }
+}
+#endif
+
+#ifdef _WIN32
+/* "run only": the scratch binary is %LOCALAPPDATA%\abyss\abyss_run-PID<ext>, not a file
+ * beside the source (it still runs from the source's folder, which the DLL search order
+ * includes). false: there is no such folder, the plan says so instead of building. */
+static bool scratch_path(Plan *pl, char *out, size_t sz, const char *ext) {
+    char n[64];
+    snprintf(n, sizeof n, "abyss_run-%d%s", (int)getpid(), ext);
+    if (win_apppath(out, sz, n)) return true;
+    snprintf(pl->build, sizeof pl->build, "echo abyss: no folder to build into (%%LOCALAPPDATA%%\\abyss: %s) && exit /b 1",
+             strerror(errno));
+    pl->run[0] = '\0';
+    return false;
 }
 #endif
 
@@ -559,7 +589,7 @@ static void plan_native(Plan *pl, Language lang, const char *dir, const char *ba
                 char o[300];
                 obj_name(names[i], o, sizeof o);
                 sappend(objs, sizeof objs, "%s\"%s\"", i ? " " : "", o);
-                if (pl->ncleanup < 8) snprintf(pl->cleanup[pl->ncleanup++], sizeof pl->cleanup[0], "%s/%s", dir, o);
+                add_cleanup(pl, "%s/%s", dir, o);
             }
             sappend(pl->build, sizeof pl->build, " && ar rcs \"lib%s.a\" %s", stem, objs);
             snprintf(pl->produced, sizeof pl->produced, "lib%s.a", stem);
@@ -573,12 +603,19 @@ static void plan_native(Plan *pl, Language lang, const char *dir, const char *ba
             char hp[4096];
             unbuf_header_path(hp, sizeof hp);
             size_t pl_len = strlen(pre);
-            snprintf(pre + pl_len, sizeof pre - pl_len, "%s-include \"%s\"", pl_len ? " " : "", hp);
+            int w = hp[0] ? snprintf(pre + pl_len, sizeof pre - pl_len, "%s-include \"%s\"", pl_len ? " " : "", hp) : 0;
+            if (w < 0 || (size_t)w >= sizeof pre - pl_len) pre[pl_len] = '\0';   /* no room: built without it, not with a cut path */
         }
-#endif
+        char tb[4096];
+        if (!scratch_path(pl, tb, sizeof tb, EXE_EXT)) return;
+        snprintf(pl->build, sizeof pl->build, "%s %s %s -o \"%s\" %s", cc, pre, srcs, tb, post);
+        snprintf(pl->run, sizeof pl->run, "\"%s\"", tb);
+        add_cleanup(pl, "%s", tb);
+#else
         snprintf(pl->build, sizeof pl->build, "%s %s %s -o \"" TMP_BIN "\" %s", cc, pre, srcs, post);
         snprintf(pl->run, sizeof pl->run, "\"" RUN_PREFIX TMP_BIN "\"");
-        snprintf(pl->cleanup[pl->ncleanup++], sizeof pl->cleanup[0], "%s/" TMP_BIN, dir);
+        add_cleanup(pl, "%s/" TMP_BIN, dir);
+#endif
     }
 }
 
@@ -627,9 +664,17 @@ static void plan_rust(Plan *pl, const char *path, const char *base, const char *
                  pre, base, stem);
         snprintf(pl->produced, sizeof pl->produced, "lib%s.a", stem);
     } else {
+#ifdef _WIN32
+        char tb[4096];
+        if (!scratch_path(pl, tb, sizeof tb, EXE_EXT)) return;
+        snprintf(pl->build, sizeof pl->build, "rustc %s \"%s\" -o \"%s\"", pre, base, tb);
+        snprintf(pl->run, sizeof pl->run, "\"%s\"", tb);
+        add_cleanup(pl, "%s", tb);
+#else
         snprintf(pl->build, sizeof pl->build, "rustc %s \"%s\" -o \"" TMP_BIN "\"", pre, base);
         snprintf(pl->run, sizeof pl->run, "\"" RUN_PREFIX TMP_BIN "\"");
-        snprintf(pl->cleanup[pl->ncleanup++], sizeof pl->cleanup[0], "%s/" TMP_BIN, pl->cwd);
+        add_cleanup(pl, "%s/" TMP_BIN, pl->cwd);
+#endif
     }
 }
 
@@ -656,9 +701,17 @@ static void plan_cs(Plan *pl, const char *dir, const char *base, const char *ste
         snprintf(pl->run, sizeof pl->run, "%s" "\"" RUN_PREFIX "%s.exe\"", host, stem);
         snprintf(pl->produced, sizeof pl->produced, "%s.exe", stem);
     } else {
+#ifdef _WIN32
+        char tb[4096];
+        if (!scratch_path(pl, tb, sizeof tb, ".exe")) return;
+        snprintf(pl->build, sizeof pl->build, "%s %s %s -out:\"%s\"", cc, flags, srcs, tb);
+        snprintf(pl->run, sizeof pl->run, "%s\"%s\"", host, tb);
+        add_cleanup(pl, "%s", tb);
+#else
         snprintf(pl->build, sizeof pl->build, "%s %s %s -out:\"abyss_run.exe\"", cc, flags, srcs);
         snprintf(pl->run, sizeof pl->run, "%s\"" RUN_PREFIX "abyss_run.exe\"", host);
-        snprintf(pl->cleanup[pl->ncleanup++], sizeof pl->cleanup[0], "%s/abyss_run.exe", dir);
+        add_cleanup(pl, "%s/abyss_run.exe", dir);
+#endif
     }
 }
 
@@ -676,13 +729,22 @@ static void plan_asm(Plan *pl, const char *dir, const char *base, const char *st
                  as, flags, base, stem, stem, stem);
         snprintf(pl->run, sizeof pl->run, "\"" RUN_PREFIX "%s" EXE_EXT "\"", stem);
         snprintf(pl->produced, sizeof pl->produced, "%s" EXE_EXT, stem);
-        snprintf(pl->cleanup[pl->ncleanup++], sizeof pl->cleanup[0], "%s/%s.o", dir, stem);
+        add_cleanup(pl, "%s/%s.o", dir, stem);
     } else {
+#ifdef _WIN32
+        char tb[4096], to[4096];
+        if (!scratch_path(pl, tb, sizeof tb, EXE_EXT) || !scratch_path(pl, to, sizeof to, ".o")) return;
+        snprintf(pl->build, sizeof pl->build, "%s %s \"%s\" -o \"%s\" && ld \"%s\" -o \"%s\"", as, flags, base, to, to, tb);
+        snprintf(pl->run, sizeof pl->run, "\"%s\"", tb);
+        add_cleanup(pl, "%s", to);
+        add_cleanup(pl, "%s", tb);
+#else
         snprintf(pl->build, sizeof pl->build,
                  "%s %s \"%s\" -o \"abyss_run.o\" && ld \"abyss_run.o\" -o \"" TMP_BIN "\"", as, flags, base);
         snprintf(pl->run, sizeof pl->run, "\"" RUN_PREFIX TMP_BIN "\"");
-        snprintf(pl->cleanup[pl->ncleanup++], sizeof pl->cleanup[0], "%s/abyss_run.o", dir);
-        snprintf(pl->cleanup[pl->ncleanup++], sizeof pl->cleanup[0], "%s/" TMP_BIN, dir);
+        add_cleanup(pl, "%s/abyss_run.o", dir);
+        add_cleanup(pl, "%s/" TMP_BIN, dir);
+#endif
     }
 }
 
@@ -717,7 +779,7 @@ static void plan_web(Plan *pl, Language lang, const char *path, const char *base
     if (!strcmp(mode, "file")) {
         char abs[4096];
         if (!realpath(path, abs)) snprintf(abs, sizeof abs, "%s", path);
-        char enc[3072];
+        char enc[3 * sizeof abs + 4];      /* every byte %XX: never cut (url_path) */
 #ifdef _WIN32
         for (char *c = abs; *c; c++) if (*c == '\\') *c = '/';
         url_path(enc, sizeof enc, abs);
@@ -815,7 +877,7 @@ static int __attribute__((unused)) exit_code(int status) {
 
 /* ─── Background server ─────────────────────────────────────────── */
 
-static char srv_url[2048];
+static char srv_url[URL_MAX];
 static char srv_log[4096];
 #ifndef _WIN32
 static pid_t srv_pid = 0;
@@ -853,9 +915,7 @@ void server_stop(void) {
 
 static void temp_path(char *out, size_t sz, const char *name) {
 #ifdef _WIN32
-    const char *t = getenv("TEMP");
-    if (!t) t = ".";
-    snprintf(out, sz, "%s\\%s", t, name);
+    if (!win_apppath(out, sz, name)) out[0] = '\0';   /* %LOCALAPPDATA%\abyss only; "" if none */
 #else
     const char *t = getenv("TMPDIR");
     if (!t || !*t) t = "/tmp";
@@ -1039,7 +1099,7 @@ static void out_byte(char c) {
 
 static void out_str(const char *s) { while (*s) out_byte(*s++); }
 
-static void out_fmt(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void out_fmt(const char *fmt, ...) __attribute__((format(gnu_printf, 1, 2)));
 static void out_fmt(const char *fmt, ...) {
     static char tmp[8192];
     va_list ap;

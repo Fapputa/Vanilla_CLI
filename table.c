@@ -2229,13 +2229,32 @@ static bool export_sqlite(const TableView *tv, const TblSheet *t, const char *pa
     free(schema);
 
     char script[4200];
+#ifdef _WIN32
+    char sn[48];                                    /* %LOCALAPPDATA%\abyss, not beside the export */
+    snprintf(sn, sizeof sn, "export-%d.abyss-tmp.sql", (int)getpid());
+    if (!win_apppath(script, sizeof script, sn)) {
+        free(o.s);
+        snprintf(msg, msz, "No folder for the export script (%%LOCALAPPDATA%%\\abyss): %s", strerror(errno));
+        return false;
+    }
+#else
     snprintf(script, sizeof script, "%s.abyss-tmp.sql", path);
+#endif
     bool ok = write_all(script, o.s, o.n);
     free(o.s);
     if (!ok) { snprintf(msg, msz, "Cannot write %.150s: %s", script, strerror(errno)); return false; }
     remove(path);                                   /* a fresh database */
     char rd[4300];
+#ifdef _WIN32
+    /* the sqlite3 shell: no escape inside '...', backslashes resolved inside "...": forward
+     * slashes between double quotes take any Windows path (none holds a '"'), O'Brien too */
+    char fwd[4200];
+    snprintf(fwd, sizeof fwd, "%s", script);
+    for (char *q = fwd; *q; q++) if (*q == '\\') *q = '/';
+    snprintf(rd, sizeof rd, ".read \"%s\"", fwd);
+#else
     snprintf(rd, sizeof rd, ".read '%s'", script);
+#endif
     char *ra[] = { "sqlite3", "-batch", "-bail", (char *)path, rd, NULL };
     char *out; size_t olen;
     int rc = run_capture(ra, &out, &olen);

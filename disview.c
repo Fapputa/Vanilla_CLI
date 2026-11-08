@@ -25,6 +25,7 @@
  * the disassembly screen (b, F5, F6, F7) run it, through dbg.c. */
 #include "disview.h"
 #include "disasm.h"
+#include "peload.h"
 #include "utf8.h"
 #include <stdarg.h>
 
@@ -70,7 +71,7 @@ typedef struct {
 
 #define DIS_HIST 64
 enum { SORT_ADDR, SORT_NAME, SORT_SIZE, SORT_CALLERS, SORT_COUNT };
-enum { IN_NONE, IN_FILTER, IN_GOTO, IN_CONSOLE };   /* DisView.in_mode */
+enum { IN_NONE, IN_FILTER, IN_GOTO, IN_CONSOLE, IN_BREAK };   /* DisView.in_mode */
 
 struct DisView {
     Disasm    d;
@@ -121,6 +122,7 @@ struct DisView {
     bool      drip_ok;
     int       dpanel;
     bool      con_auto;
+    bool      bp_panel;            /* L: the panel lists the breakpoints  */
 
     /* data screens: the sections (ds, by address), then the rows of
      * section xsec (xi). data_back: screen to go back to (d / Esc). */
@@ -212,7 +214,7 @@ static InfoLine *push_line(DisView *v) {
 }
 
 static void add_kv(DisView *v, short vp, const char *lbl, const char *fmt, ...)
-    __attribute__((format(printf, 4, 5)));
+    __attribute__((format(gnu_printf, 4, 5)));
 static void add_kv(DisView *v, short vp, const char *lbl, const char *fmt, ...) {
     char buf[1024];
     va_list ap;
@@ -228,7 +230,7 @@ static void add_kv(DisView *v, short vp, const char *lbl, const char *fmt, ...) 
 
 #define add_text(v, vp, ...) add_kv(v, vp, NULL, __VA_ARGS__)
 
-static void add_title(DisView *v, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void add_title(DisView *v, const char *fmt, ...) __attribute__((format(gnu_printf, 2, 3)));
 static void add_title(DisView *v, const char *fmt, ...) {
     char buf[256];
     va_list ap;
@@ -308,29 +310,65 @@ static int fortify_calls(const ElfFile *ef, char *names, size_t sz) {
     return n;
 }
 
-/* PE: the DllCharacteristics flags, the /GS cookie, CFG, W+X sections */
+/* PE: the DllCharacteristics flags (DYNAMIC_BASE 0x40, HIGH_ENTROPY_VA
+ * 0x20, FORCE_INTEGRITY 0x80, NX_COMPAT 0x100, NO_ISOLATION 0x200,
+ * NO_SEH 0x400, APPCONTAINER 0x1000, GUARD_CF 0x4000), the load config
+ * (SecurityCookie, SafeSEH table, CFG table and GuardFlags), the
+ * relocations, the certificate table, W+X sections: what the file
+ * declares, not checked further */
 static void build_protections_pe(DisView *v) {
     const ElfFile *ef = &v->d.elf;
     const PeInfo *pe = &ef->pe;
-    const short GOOD = COLOR_PAIR_STRING, BAD = COLOR_PAIR_KEYWORD, MEH = COLOR_PAIR_NUMBER;
+    const short GOOD = COLOR_PAIR_STRING, BAD = COLOR_PAIR_KEYWORD, MEH = COLOR_PAIR_NUMBER, NOTE = COLOR_PAIR_COMMENT;
     uint16_t dc = pe->dllchars;
-    if (!(dc & 0x40))            add_kv(v, BAD, "ASLR", "no (DYNAMIC_BASE not set: fixed load address)");
-    else if (!pe->relocs)        add_kv(v, MEH, "ASLR", "DYNAMIC_BASE set but no relocations: loaded at its base");
-    else if (dc & 0x20)          add_kv(v, GOOD, "ASLR", "yes, high entropy (64-bit)");
-    else                         add_kv(v, GOOD, "ASLR", "yes (DYNAMIC_BASE)");
+    bool b64 = ef->bits == 64;
+    PeLoadConfig lc;
+    bool haslc = pe_load_config(ef, &lc);
+    const char *rel = pe->relocs ? "relocations present"
+                    : (pe->chars & 1) ? "relocations stripped (RELOCS_STRIPPED)" : "no relocation table";
+    const char *he = (dc & 0x20) ? (b64 ? ", HIGH_ENTROPY_VA" : ", HIGH_ENTROPY_VA (no effect in 32-bit)")
+                                 : (b64 ? ", no HIGH_ENTROPY_VA (low entropy)" : "");
+    if (!(dc & 0x40))            add_kv(v, BAD, "ASLR", "no (DYNAMIC_BASE not set: loaded at its base)  ·  %s", rel);
+    else if (!pe->relocs)        add_kv(v, MEH, "ASLR", "DYNAMIC_BASE set but %s: loaded at its base%s", rel, he);
+    else                         add_kv(v, (dc & 0x20) || !b64 ? GOOD : MEH, "ASLR", "yes (DYNAMIC_BASE, %d relocations)%s", ef->nrel, he);
     if (dc & 0x100)              add_kv(v, GOOD, "DEP / NX", "yes (NX_COMPAT)");
     else                         add_kv(v, BAD, "DEP / NX", "no NX_COMPAT flag");
-    if (dc & 0x4000)             add_kv(v, GOOD, "CFG", "yes (Control Flow Guard)%s", pe->guard_flags & 0x100 ? ", with a function table" : "");
-    else                         add_kv(v, COLOR_PAIR_COMMENT, "CFG", "no");
+    if (dc & 0x400)              add_kv(v, NOTE, "SEH", "NO_SEH: no structured exception handler in the image");
+    else if (b64) {
+        PePdata pd;
+        if (pe_pdata(ef, &pd)) add_kv(v, NOTE, "SEH", "table-based (x64 .pdata, SafeSEH does not apply): %u functions, %u with a handler", pd.nfunc, pd.nhandler);
+        else                   add_kv(v, NOTE, "SEH", "table-based (x64), no .pdata");
+        pe_pdata_free(&pd);
+    } else {
+        PeTable t;
+        bool ok = pe_safeseh(ef, &t);
+        if (ok)                add_kv(v, GOOD, "SEH", "SafeSEH: %u registered handler%s%s", t.n, t.n == 1 ? "" : "s",
+                                      t.nout ? " (some entries outside the code)" : "");
+        else if (t.present)    add_kv(v, BAD, "SEH", "SafeSEH table unusable (%s)", t.err);
+        else                   add_kv(v, BAD, "SEH", "no SafeSEH table (any handler accepted)%s", haslc ? "" : ", no load config");
+        pe_table_free(&t);
+    }
+    if (dc & 0x4000) {
+        PeTable t;
+        bool ok = pe_guard_cf(ef, &t);
+        if (ok)                add_kv(v, GOOD, "CFG", "yes (GUARD_CF, %u functions in the table, GuardFlags 0x%x)", t.n, lc.guard_flags);
+        else if (t.present)    add_kv(v, MEH, "CFG", "GUARD_CF set, function table unusable (%s)", t.err);
+        else if (lc.has_gflags) add_kv(v, MEH, "CFG", "GUARD_CF set, no function table (GuardFlags 0x%x)", lc.guard_flags);
+        else                   add_kv(v, MEH, "CFG", "GUARD_CF set but no load config guard fields");
+        pe_table_free(&t);
+    } else if (lc.has_gflags && (lc.guard_flags & PE_GUARD_CF_INSTRUMENTED))
+                                 add_kv(v, NOTE, "CFG", "no (code instrumented, GUARD_CF not set in DllCharacteristics)");
+    else                         add_kv(v, NOTE, "CFG", "no");
     bool gs = pe->cookie || has_name(ef, "__security_check_cookie") || has_name(ef, "__security_init_cookie");
     bool ssp = has_name(ef, "__stack_chk_fail") || has_name(ef, "__stack_chk_guard");
     if (gs)                      add_kv(v, GOOD, "Canary", "yes (/GS security cookie%s)", pe->cookie ? " in the load config" : "");
     else if (ssp)                add_kv(v, GOOD, "Canary", "yes (__stack_chk_fail)");
     else                         add_kv(v, BAD, "Canary", "not found");
-    if (dc & 0x400)              add_kv(v, COLOR_PAIR_COMMENT, "SEH", "NO_SEH (no structured exception handler)");
-    if (dc & 0x80)               add_kv(v, GOOD, "Integrity", "FORCE_INTEGRITY (signature checked at load)");
+    add_kv(v, dc & 0x80 ? GOOD : NOTE, "Integrity", "%s", dc & 0x80 ? "FORCE_INTEGRITY (signature checked at load)" : "no FORCE_INTEGRITY");
+    add_kv(v, NOTE, "Isolation", "%s", dc & 0x200 ? "NO_ISOLATION (manifest ignored)" : "manifest isolation allowed");
+    add_kv(v, dc & 0x1000 ? GOOD : NOTE, "AppContainer", "%s", dc & 0x1000 ? "yes (APPCONTAINER: runs in an app container)" : "no");
     if (pe->signature)           add_kv(v, GOOD, "Signature", "Authenticode certificate present (not verified here)");
-    else                         add_kv(v, COLOR_PAIR_COMMENT, "Signature", "not signed");
+    else                         add_kv(v, NOTE, "Signature", "not signed");
     int nrwx = 0;
     for (int i = 0; i < ef->nsec; i++)
         if ((ef->sec[i].flags & 5) == 5) {
@@ -388,7 +426,7 @@ static void build_protections(DisView *v) {
 
 static const char *fn_kind_name(int k) {
     static const char *n[] = { "symtab", "dynsym", "plt", "entry", "main", "ctor", "pdata",
-                               "call", "codeptr", "dataptr", "prologue" };
+                               "call", "codeptr", "dataptr", "prologue", "seh", "cfg" };
     return k >= 0 && k < (int)(sizeof n / sizeof *n) ? n[k] : "?";
 }
 
@@ -399,8 +437,10 @@ static void build_analysis(DisView *v) {
     for (size_t i = 0; i < d->nfn; i++) if (d->fn[i].kind < 16) cnt[d->fn[i].kind]++;
     char by[400] = "";
     size_t u = 0;
-    for (int k = FN_SYMTAB; k <= FN_PROLOGUE && u < sizeof by; k++)
-        if (cnt[k]) u += (size_t)snprintf(by + u, sizeof by - u, "%s%s %d", u ? ", " : "", fn_kind_name(k), cnt[k]);
+    static const uint8_t order[] = { FN_SYMTAB, FN_DYNSYM, FN_PLT, FN_ENTRY, FN_MAIN, FN_CTOR, FN_PDATA,
+                                     FN_SEH, FN_GUARD, FN_CALL, FN_CODEPTR, FN_DATAPTR, FN_PROLOGUE };
+    for (size_t j = 0; j < sizeof order && u < sizeof by; j++)
+        if (cnt[order[j]]) u += (size_t)snprintf(by + u, sizeof by - u, "%s%s %d", u ? ", " : "", fn_kind_name(order[j]), cnt[order[j]]);
     add_kv(v, COLOR_PAIR_NUMBER, "Functions", "%zu", d->nfn);
     if (by[0]) add_kv(v, COLOR_PAIR_COMMENT, "", "%s", by);
     if (cnt[FN_DATAPTR] || cnt[FN_PROLOGUE])
@@ -429,16 +469,24 @@ static void build_info_pe(DisView *v) {
     add_kv(v, COLOR_PAIR_NORMAL, "Size", "%s (%zu bytes)", sz, ef->size);
     add_kv(v, COLOR_PAIR_NORMAL, "Type", "%s  ·  %s%s", pe->dll ? "DLL (dynamic-link library)" : "executable (.exe)",
            pe_subsystem_name(pe->subsystem), pe->dotnet ? "  ·  .NET assembly" : "");
-    add_kv(v, COLOR_PAIR_NORMAL, "Architecture", "%s  ·  PE32+ (64-bit)", pe_machine_name(pe->machine));
+    bool p32 = ef->bits == 32;
+    add_kv(v, COLOR_PAIR_NORMAL, "Architecture", "%s  ·  %s", pe_machine_name(pe->machine), p32 ? "PE32 (32-bit)" : "PE32+ (64-bit)");
+    if (p32)
+        add_kv(v, COLOR_PAIR_NUMBER, "", "32-bit PE: debug directory and COFF symbols not read yet  ·  "
+               "partial function discovery (no switch tables yet)");
     add_kv(v, COLOR_PAIR_NORMAL, "Image base", "0x%llx  ·  %u bytes in memory  ·  addresses = base + RVA",
            (unsigned long long)pe->image_base, pe->size_image);
     if (!ef->entry) add_kv(v, COLOR_PAIR_COMMENT, "Entry point", "none");
     else {
         const char *nm = da_name_for(d, ef->entry, tmp, sizeof tmp);
         const ElfSection *s = elf_section_at(ef, ef->entry);
+        uint32_t rva = (uint32_t)(ef->entry - pe->image_base);
+        uint64_t off = 0;
+        char offs[40] = "";
+        if (pe_rva_to_off(ef, rva, &off)) snprintf(offs, sizeof offs, ", offset 0x%llx", (unsigned long long)off);
         add_kv(v, elf_va_exec(ef, ef->entry) ? COLOR_PAIR_NUMBER : COLOR_PAIR_KEYWORD, "Entry point",
-               "0x%llx  (RVA 0x%llx)%s%s%s%s%s%s", (unsigned long long)ef->entry,
-               (unsigned long long)(ef->entry - pe->image_base), nm ? "  " : "", nm ? nm : "",
+               "0x%llx  (RVA 0x%x%s)%s%s%s%s%s%s", (unsigned long long)ef->entry, rva, offs,
+               nm ? "  " : "", nm ? nm : "",
                s ? "  (" : "", s ? s->name : "", s ? ")" : "", pe->dll ? "  ·  DllMain-style entry" : "");
     }
     long mi = da_func_named(d, "main");
@@ -448,6 +496,57 @@ static void build_info_pe(DisView *v) {
     if (pe->timestamp) add_kv(v, COLOR_PAIR_COMMENT, "Timestamp", "0x%08x (may be a build hash, not a date)", pe->timestamp);
     if (pe->pdb[0]) add_kv(v, COLOR_PAIR_STRING, "PDB", "%s", pe->pdb);
     if (ef->soname[0]) add_kv(v, COLOR_PAIR_NORMAL, "Export name", "%s", ef->soname);
+
+    PeHeaders h;
+    if (pe_read_headers(ef->data, ef->size, &h, NULL, 0)) {
+        add_title(v, "HEADERS");
+        add_kv(v, COLOR_PAIR_NORMAL, "Alignment", "sections 0x%x  ·  file 0x%x", h.sect_align, h.file_align);
+        add_kv(v, COLOR_PAIR_NORMAL, "Headers", "0x%x bytes  ·  PE header at 0x%x  ·  section table at 0x%llx",
+               h.size_headers, h.lfanew, (unsigned long long)h.sec_off);
+        int nd = 0;
+        for (unsigned i = 0; i < h.ndir; i++) if (h.dir[i].rva || h.dir[i].size) nd++;
+        add_kv(v, COLOR_PAIR_NORMAL, "Directories", "%d data directories used of %u%s", nd, h.nrva,
+               p32 && nd ? "  (32-bit PE: DEBUG not interpreted yet)" : "");
+        for (unsigned i = 0; i < h.ndir; i++) {
+            const PeDir *e = &h.dir[i];
+            if (!e->rva && !e->size) continue;
+            bool in = i == 4 ? e->rva <= ef->size && e->size <= ef->size - e->rva     /* a file offset */
+                             : e->rva && (uint64_t)e->rva + e->size <= pe->size_image;
+            const ElfSection *ds = i == 4 || !in ? NULL : elf_section_at(ef, pe_rva_to_va(ef, e->rva));
+            add_kv(v, in ? COLOR_PAIR_COMMENT : COLOR_PAIR_KEYWORD, "", "%2u %-13s %s 0x%08x  0x%-8x %s", i, pe_dir_name(i),
+                   i == 4 ? "offset" : "RVA   ", e->rva, e->size,
+                   !in ? (i == 4 ? "outside the file: ignored" : "outside the image: ignored") : ds ? ds->name : "");
+        }
+        PeLoadConfig lc;
+        if (pe_load_config(ef, &lc)) {
+            add_kv(v, lc.err[0] ? COLOR_PAIR_KEYWORD : COLOR_PAIR_NORMAL, "Load config", "Size 0x%x (directory 0x%x)%s%s",
+                   lc.size, lc.dirsize, lc.err[0] ? "  ·  " : "", lc.err);
+            char b[200] = "";
+            size_t u = 0;
+            if (lc.has_cookie) u += (size_t)snprintf(b + u, sizeof b - u, "cookie 0x%llx", (unsigned long long)lc.cookie);
+            if (lc.has_seh && u < sizeof b)
+                u += (size_t)snprintf(b + u, sizeof b - u, "%sSEHandlerTable 0x%llx x %llu", u ? "  ·  " : "",
+                                      (unsigned long long)lc.seh_table, (unsigned long long)lc.seh_count);
+            if (lc.has_cf && u < sizeof b)
+                u += (size_t)snprintf(b + u, sizeof b - u, "%sGuardCFFunctionTable 0x%llx x %llu", u ? "  ·  " : "",
+                                      (unsigned long long)lc.cf_table, (unsigned long long)lc.cf_count);
+            if (lc.has_gflags && u < sizeof b)
+                snprintf(b + u, sizeof b - u, "%sGuardFlags 0x%x", u ? "  ·  " : "", lc.guard_flags);
+            if (b[0]) add_kv(v, COLOR_PAIR_COMMENT, "", "%s", b);
+        } else if (lc.err[0]) add_kv(v, COLOR_PAIR_KEYWORD, "Load config", "%s", lc.err);
+        PePdata pd;
+        if (pe_pdata(ef, &pd)) {
+            bool bad = pd.rest || pd.capped || pd.nunsorted || pd.noverlap || pd.nempty || pd.nout ||
+                       pd.nbadunw || pd.ncycle || pd.ndeep || pd.norphan || pd.nbadhandler;
+            add_kv(v, COLOR_PAIR_NORMAL, ".pdata", "%u entries: %u functions, %u chained fragments, %u with a handler",
+                   pd.nent, pd.nfunc, pd.nfrag, pd.nhandler);
+            if (bad)
+                add_kv(v, COLOR_PAIR_KEYWORD, "", "rejected: %u empty, %u outside the code, %u overlapping, %u bad unwind, %u cyclic, %u too deep, %u orphan%s%s",
+                       pd.nempty, pd.nout, pd.noverlap, pd.nbadunw, pd.ncycle, pd.ndeep, pd.norphan,
+                       pd.nunsorted ? "  ·  not sorted" : "", pd.rest ? "  ·  size not a multiple of 12" : "");
+        } else if (pd.err[0]) add_kv(v, COLOR_PAIR_KEYWORD, ".pdata", "%s", pd.err);
+        pe_pdata_free(&pd);
+    }
 
     add_title(v, "IMPORTS (%d from %d DLL%s)", ef->nimp, ef->nneeded, ef->nneeded == 1 ? "" : "s");
     if (!ef->nneeded) add_text(v, COLOR_PAIR_COMMENT, "   none");
@@ -467,13 +566,37 @@ static void build_info_pe(DisView *v) {
         }
         add_kv(v, COLOR_PAIR_STRING, i ? "" : "DLLs", "%-34s %4d  %s%s", ef->needed[i], n, first, n > 6 ? ", ..." : "");
     }
+    if (pe->ndelay) add_kv(v, COLOR_PAIR_COMMENT, "Delay-load", "%d DLL%s loaded on first call", pe->ndelay, pe->ndelay > 1 ? "s" : "");
+    PeBound bd;
+    int nb = pe_bound_imports(ef, &bd);
+    if (nb || bd.n) {
+        char bl[200] = "";
+        size_t bu = 0;
+        for (int i = 0; i < bd.n && i < PE_BOUND_SHOW && bu < sizeof bl; i++)
+            bu += (size_t)snprintf(bl + bu, sizeof bl - bu, "%s%s", i ? ", " : "", bd.name[i]);
+        add_kv(v, nb < 0 ? COLOR_PAIR_KEYWORD : COLOR_PAIR_COMMENT, "Bound", "%d DLL%s%s: %s%s", bd.n, bd.n == 1 ? "" : "s",
+               nb < 0 ? " (malformed table)" : "", bl, bd.n > PE_BOUND_SHOW ? ", ..." : "");
+    }
     int nfs = 0;
     for (int i = 0; i < ef->nsym; i++) if (!ef->sym[i].dynamic) nfs++;
     add_title(v, "SYMBOLS");
-    add_kv(v, COLOR_PAIR_NORMAL, "Exports", "%d", pe->nexports);
-    if (ef->stripped) add_kv(v, COLOR_PAIR_NUMBER, "COFF symbols", "none (stripped: names from exports and imports only)");
+    PeExports ex;
+    if (pe_exports(ef, &ex)) {
+        add_kv(v, COLOR_PAIR_NORMAL, "Exports", "%u  (%u code, %u data, %u forwarded)  ·  ordinal base %u  ·  %u names",
+               ex.ncode + ex.ndata + ex.nfwd, ex.ncode, ex.ndata, ex.nfwd, ex.base, ex.nname);
+        for (int i = 0; i < ex.nfwdshow; i++)
+            add_kv(v, COLOR_PAIR_COMMENT, i ? "" : "Forwarders", "%s", ex.fwd[i]);
+        if (ex.nfwd > (uint32_t)ex.nfwdshow) add_kv(v, COLOR_PAIR_COMMENT, "", "... %u more", ex.nfwd - (uint32_t)ex.nfwdshow);
+    } else add_kv(v, ex.err[0] ? COLOR_PAIR_KEYWORD : COLOR_PAIR_NORMAL, "Exports", "%s", ex.err[0] ? ex.err : "none");
+    uint32_t clr;
+    if (pe->dotnet && pe_clr_flags(ef, &clr))
+        add_kv(v, COLOR_PAIR_NUMBER, ".NET", "%s  (CLR flags 0x%x)", clr & PE_CLR_ILONLY
+               ? "IL only: CIL bytecode, only the entry stub is native code (no guessed functions)"
+               : "mixed-mode: native code analysed, CIL methods not disassembled", clr);
+    if (p32) add_kv(v, COLOR_PAIR_COMMENT, "COFF symbols", "not read yet (32-bit PE)");
+    else if (ef->stripped) add_kv(v, COLOR_PAIR_NUMBER, "COFF symbols", "none (stripped: names from exports and imports only)");
     else              add_kv(v, COLOR_PAIR_NORMAL, "COFF symbols", "%d (MinGW debug names)", nfs);
-    if (ef->nfstart) add_kv(v, COLOR_PAIR_NORMAL, "Unwind table", "%d functions in .pdata", ef->nfstart);
+    if (ef->nfstart) add_kv(v, COLOR_PAIR_NORMAL, "Unwind table", "%d functions in .pdata (chained fragments go to their parent)", ef->nfstart);
     if (ef->nctors) add_kv(v, COLOR_PAIR_NUMBER, "TLS callbacks", "%d (run by the loader before the entry point)", ef->nctors);
     if (pe->overlay_size) {
         human_size(pe->overlay_size, sz, sizeof sz);
@@ -515,8 +638,11 @@ static void build_info(DisView *v) {
                      : ef->type == 3 ? (ef->pie ? "PIE executable" : "shared object")
                      : ef->type == 4 ? "core dump" : "?";
     add_kv(v, COLOR_PAIR_NORMAL, "Type", "%s  ·  %s", elf_type_name(ef->type), what);
-    add_kv(v, COLOR_PAIR_NORMAL, "Architecture", "%s  ·  ELF64 little endian  ·  OS/ABI %u%s",
-           elf_machine_name(ef->machine), ef->osabi, ef->osabi == 0 ? " (System V)" : ef->osabi == 3 ? " (GNU/Linux)" : "");
+    add_kv(v, COLOR_PAIR_NORMAL, "Architecture", "%s  ·  ELF%u little endian  ·  OS/ABI %u%s",
+           elf_machine_name(ef->machine), ef->bits == 32 ? 32u : 64u, ef->osabi,
+           ef->osabi == 0 ? " (System V)" : ef->osabi == 3 ? " (GNU/Linux)" : "");
+    if (ef->arch == ELF_ARCH_X86_32)
+        add_kv(v, COLOR_PAIR_NUMBER, "", "32-bit: partial function discovery (no switch tables yet)");
 
     if (ef->type == 1 || !ef->entry) add_kv(v, COLOR_PAIR_COMMENT, "Entry point", "none");
     else {
@@ -695,7 +821,7 @@ static bool list_init(DisView *v) {
     return true;
 }
 
-static void list_msg(DisView *v, short pair, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
+static void list_msg(DisView *v, short pair, const char *fmt, ...) __attribute__((format(gnu_printf, 3, 4)));
 static void list_msg(DisView *v, short pair, const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
@@ -895,6 +1021,19 @@ static bool line_ref(const DisLine *l, uint64_t *t) {
         return true;
     }
     return false;
+}
+
+/* 32-bit PE: absolute memory operand `[0x402030]` (an IAT slot for
+ * `call dword ptr [0x402030]`), no register in the brackets */
+static bool abs_ref(const DisLine *l, uint64_t *t) {
+    if (l->bad) return false;
+    const char *r = strstr(l->ops, "[0x");
+    if (!r) return false;
+    char *end;
+    unsigned long long x = strtoull(r + 1, &end, 16);
+    if (*end != ']') return false;
+    *t = x;
+    return true;
 }
 
 /* ─── Data sections ────────────────────────────────────────────── */
@@ -1428,6 +1567,8 @@ static const char *input_fn(const char *nm) {
         "ReadFile", "ReadConsoleA", "ReadConsoleW", "ReadConsoleInputA", "ReadConsoleInputW",
         "getch", "getche", "getwch", "getwche", "cgets", "cgetws", "gets_s", "getws",
         "scanf_s", "fscanf_s", "wscanf_s", "stdio_common_vfscanf", "stdio_common_vfwscanf", "fgetchar" };
+    const char *bang = strchr(nm, '!');             /* PE IAT slot: "dll!function" */
+    if (bang) nm = bang + 1;
     char b[64];
     size_t n = strcspn(nm, "@");
     if (n >= sizeof b) return NULL;
@@ -1500,7 +1641,9 @@ static bool dbg_reading(void) {
     unsigned long long fd = 0;
     bool in = fgets(b, sizeof b, f) && sscanf(b, "%ld %llx", &nr, &fd) == 2;
     fclose(f);
-    if (!in || (nr != 0 && nr != 17 && nr != 19) || fd > 1u << 20) return false;   /* read, pread64, readv */
+    bool rd = dbg_bits() == 32 ? nr == 3 || nr == 180 || nr == 145     /* i386: read, pread64, readv */
+                               : nr == 0 || nr == 17 || nr == 19;     /* x86-64 */
+    if (!in || !rd || fd > 1u << 20) return false;
     snprintf(p, sizeof p, "/proc/%d/fd/%llu", pid, fd);
     ssize_t n = readlink(p, b, sizeof b - 1);
     return n > 9 && !strncmp(b, "/dev/pts/", 9);
@@ -1557,6 +1700,7 @@ static bool dbg_claim(DisView *v) {
     auto_reset();
     g_regs_ok = g_prev_ok = false;
     snprintf(g_dbg_file, sizeof g_dbg_file, "%s", v->path);
+    dbg_bp_image(v->path);
     v->dbg_seen = g_dbg_gen;                         /* the stops of the other file are not ours */
     return true;
 }
@@ -1587,14 +1731,14 @@ static bool map_name(int pid, uint64_t a, char *out, size_t sz) {
     return true;
 }
 
+static const char *ip_name(void) { return dbg_bits() == 32 ? "eip" : "rip"; }
+
 /* Shows the last stop of the debuggee in v, once per stop: the function
  * holding rip on the disassembly screen, its line selected (and brought
  * into view among `rows`), and the reason in the bar. Waits while a
  * filter / address is typed; leaves the console when nothing is typed
  * there (the keys go back to the disassembly). */
-static void dbg_sync(DisView *v, int rows) {
-    if (!dbg_mine(v) || v->dbg_seen == g_dbg_gen || v->in_mode == IN_FILTER || v->in_mode == IN_GOTO) return;
-    v->dbg_seen = g_dbg_gen;
+static void dbg_show_stop(DisView *v, int rows) {
     char st[160];
     dbg_status(st, sizeof st);
     DbgState s = dbg_state();
@@ -1612,9 +1756,9 @@ static void dbg_sync(DisView *v, int rows) {
     if (!dbg_rip(&fa, &rt)) {
         char mp[200];
         if (map_name(dbg_pid(), rt, mp, sizeof mp))
-            list_msg(v, COLOR_PAIR_NUMBER, "%s  ·  rip in %.80s, outside the file", st, mp);
+            list_msg(v, COLOR_PAIR_NUMBER, "%s  ·  %s in %.80s, outside the file", st, ip_name(), mp);
         else
-            list_msg(v, COLOR_PAIR_NUMBER, "%s  ·  rip outside the file", st);
+            list_msg(v, COLOR_PAIR_NUMBER, "%s  ·  %s outside the file", st, ip_name());
         return;
     }
     char nb[200];
@@ -1622,8 +1766,14 @@ static void dbg_sync(DisView *v, int rows) {
     if (dbg_stop_reason() == DBG_STOP_BP && in)
         list_msg(v, COLOR_PAIR_NUMBER, "before %s (input) at 0x%llx  ·  F7: run it, then type the input in the console  ·  "
                  "F5: continue  ·  b: no breakpoint here", in, (unsigned long long)fa);
-    else
-        list_msg(v, COLOR_PAIR_STRING, "%s  ·  %.100s 0x%llx", st, nm ? nm : "file address", (unsigned long long)fa);
+    else {
+        DbgBp b;
+        if (dbg_stop_reason() == DBG_STOP_BP && dbg_bp_info(dbg_bp_stopped_on(), &b))
+            list_msg(v, COLOR_PAIR_STRING, "%s  ·  %.100s 0x%llx  ·  pass %llu%s%s", st, nm ? nm : "file address", (unsigned long long)fa,
+                     (unsigned long long)b.hits, b.has_cond ? "  ·  if " : "", b.cond);
+        else
+            list_msg(v, COLOR_PAIR_STRING, "%s  ·  %.100s 0x%llx", st, nm ? nm : "file address", (unsigned long long)fa);
+    }
     long f = da_func_containing(&v->d, fa);
     if (f < 0) return;
     if (!disasm_open(v, f)) return;
@@ -1634,6 +1784,14 @@ static void dbg_sync(DisView *v, int rows) {
     v->dsel = li;
     size_t r = rows > 0 ? (size_t)rows : 1;
     if (li < v->dtop || li >= v->dtop + r) v->dtop = land_top(li);
+}
+
+static void dbg_sync(DisView *v, int rows) {
+    if (!dbg_mine(v) || v->dbg_seen == g_dbg_gen || v->in_mode == IN_FILTER || v->in_mode == IN_GOTO || v->in_mode == IN_BREAK) return;
+    v->dbg_seen = g_dbg_gen;
+    dbg_show_stop(v, rows);
+    char news[160];                                  /* could not be placed, overwritten: said over the stop */
+    if (dbg_bp_take_news(news, sizeof news)) list_msg(v, COLOR_PAIR_KEYWORD, "%s", news);
 }
 
 bool dis_ui_poll(void) {
@@ -1667,35 +1825,51 @@ static bool con_send(DisView *v, const char *s, size_t n) {
     return false;
 }
 
+/* The list of breakpoints cannot change while the program runs: it is paused
+ * for that (dbg_hold) and let go again the same way (dbg_release). false:
+ * nothing to do, the message is given. */
+static bool dbg_hold(DisView *v, bool *resume) {
+    *resume = false;
+    if (dbg_state() != DBG_RUNNING) return true;
+    if (!dbg_interrupt()) {
+        dbg_changed();                           /* exited meanwhile, or stuck */
+        if (dbg_state() == DBG_RUNNING) { list_msg(v, COLOR_PAIR_KEYWORD, "breakpoint: the program does not stop"); v->dbg_seen = g_dbg_gen; }
+        return false;
+    }
+    *resume = dbg_stop_reason() == DBG_STOP_INTERRUPT;   /* else a stop of its own: shown */
+    if (!*resume) dbg_changed();
+    return true;
+}
+
+static bool dbg_release(DisView *v, bool resume) {
+    if (!resume) return true;
+    bool runto = g_runto_on;
+    char e2[200];
+    bool go = runto ? dbg_run_to(g_runto, e2, sizeof e2) : dbg_cont(e2, sizeof e2);
+    con_drain();
+    if (!go || dbg_state() != DBG_RUNNING) dbg_changed();       /* stopped again at once */
+    else g_runto_on = runto;
+    if (!go) { list_msg(v, COLOR_PAIR_KEYWORD, "breakpoint: cannot resume: %s", e2); v->dbg_seen = g_dbg_gen; }
+    return go;
+}
+
+/* keeps the message just given over the "running" one of the next draw */
+static void dbg_keep_msg(DisView *v) {
+    if (v->dbg_seen != g_dbg_gen && dbg_state() == DBG_RUNNING) v->dbg_seen = g_dbg_gen;
+}
+
 /* b: breakpoint on the selected line, set or removed */
 static void dbg_key_bp(DisView *v) {
     if (v->dsel >= v->ndl || !v->dl[v->dsel].len) { list_msg(v, COLOR_PAIR_NUMBER, "no instruction on this line"); return; }
     if (!dbg_claim(v)) return;
     uint64_t a = v->dl[v->dsel].addr;
     char err[200] = "", nb[200];
-    /* running: paused for the change, then let go again the same way */
-    bool resume = false;
-    if (dbg_state() == DBG_RUNNING) {
-        if (!dbg_interrupt()) {
-            dbg_changed();                           /* exited meanwhile, or stuck */
-            if (dbg_state() == DBG_RUNNING) { list_msg(v, COLOR_PAIR_KEYWORD, "breakpoint: the program does not stop"); v->dbg_seen = g_dbg_gen; }
-            return;
-        }
-        resume = dbg_stop_reason() == DBG_STOP_INTERRUPT;   /* else a stop of its own: shown */
-        if (!resume) dbg_changed();
-    }
+    bool resume;
+    if (!dbg_hold(v, &resume)) return;
     bool had = dbg_bp_has(a), was_auto = auto_index(a) >= 0;
     bool ok = had ? dbg_bp_remove(a, err, sizeof err) : dbg_bp_add(a, err, sizeof err);
     if (ok && had) auto_drop(a);
-    if (resume) {
-        bool runto = g_runto_on;
-        char e2[200];
-        bool go = runto ? dbg_run_to(g_runto, e2, sizeof e2) : dbg_cont(e2, sizeof e2);
-        con_drain();
-        if (!go || dbg_state() != DBG_RUNNING) dbg_changed();       /* stopped again at once */
-        else g_runto_on = runto;
-        if (!go) { list_msg(v, COLOR_PAIR_KEYWORD, "breakpoint: cannot resume: %s", e2); v->dbg_seen = g_dbg_gen; return; }
-    }
+    if (!dbg_release(v, resume)) return;
     if (!ok) {
         list_msg(v, COLOR_PAIR_KEYWORD, "breakpoint 0x%llx: %s", (unsigned long long)a, err);
         v->dbg_seen = g_dbg_gen;
@@ -1706,7 +1880,217 @@ static void dbg_key_bp(DisView *v) {
     list_msg(v, COLOR_PAIR_STRING, "%sbreakpoint %s at 0x%llx%s%.100s  ·  %d breakpoint%s",
              was_auto ? "input " : "", had ? "removed" : "set", (unsigned long long)a, nm ? " " : "", nm ? nm : "",
              n, n == 1 ? "" : "s");
-    if (v->dbg_seen != g_dbg_gen && dbg_state() == DBG_RUNNING) v->dbg_seen = g_dbg_gen;   /* keep this message */
+    dbg_keep_msg(v);
+}
+
+/* e: the breakpoint of the selected line on / off, h: by debug register or
+ * int3 (no breakpoint there: one is set) */
+static void dbg_key_bp_flag(DisView *v, int key) {
+    if (v->dsel >= v->ndl || !v->dl[v->dsel].len) { list_msg(v, COLOR_PAIR_NUMBER, "no instruction on this line"); return; }
+    if (!dbg_claim(v)) return;
+    uint64_t a = v->dl[v->dsel].addr;
+    if (key == 'e' && !dbg_bp_has(a)) { list_msg(v, COLOR_PAIR_NUMBER, "no breakpoint on this line (b sets one)"); return; }
+    char err[200] = "";
+    bool resume;
+    if (!dbg_hold(v, &resume)) return;
+    bool isnew = !dbg_bp_has(a), ok = isnew ? dbg_bp_add(a, err, sizeof err) : true, on = false;
+    int i = dbg_bp_index(a);
+    DbgBp b;
+    if (ok && dbg_bp_info(i, &b)) {
+        on = key == 'e' ? !b.enabled : !b.hw;
+        ok = key == 'e' ? dbg_bp_enable_i(i, on, err, sizeof err) : dbg_bp_hw_i(i, on, err, sizeof err);
+        if (!ok && isnew) { char e2[64]; dbg_bp_remove_i(i, e2, sizeof e2); }
+    }
+    if (!dbg_release(v, resume)) return;
+    if (!ok) {
+        list_msg(v, COLOR_PAIR_KEYWORD, "breakpoint 0x%llx: %s", (unsigned long long)a, err);
+        v->dbg_seen = g_dbg_gen;
+        return;
+    }
+    list_msg(v, COLOR_PAIR_STRING, "breakpoint 0x%llx %s", (unsigned long long)a,
+             key == 'e' ? (on ? "enabled" : "disabled") : (on ? "by debug register (no byte written)" : "by int3"));
+    dbg_keep_msg(v);
+}
+
+/* L: the panel lists the breakpoints instead of the registers */
+static void dbg_key_bp_panel(DisView *v) {
+    if (!dbg_claim(v)) return;
+    v->bp_panel = !v->bp_panel;
+}
+
+/* n: the next breakpoint of the program after the selected line (the first
+ * one after the last) */
+static void dbg_key_bp_next(DisView *v) {
+    int n = dbg_mine(v) ? dbg_bp_list(NULL, 0) : 0;
+    uint64_t cur = v->dsel < v->ndl ? v->dl[v->dsel].addr : 0, first = 0, next = 0;
+    bool have_first = false, have_next = false;
+    for (int i = 0; i < n; i++) {
+        DbgBp b;
+        if (!dbg_bp_info(i, &b) || !b.main) continue;
+        if (!have_first) { first = b.va; have_first = true; }
+        if (b.va > cur && !have_next) { next = b.va; have_next = true; }
+    }
+    if (!have_first) { list_msg(v, COLOR_PAIR_NUMBER, "no breakpoint in this file"); return; }
+    follow(v, have_next ? next : first);
+}
+
+/* Where a breakpoint command points: an address of the file, or an offset
+ * in another module. */
+typedef struct { bool module; char mod[DBG_MOD_MAX]; uint64_t addr; } BpWhere;
+
+/* "." (selected line), "main", "main+0x10", "sub_1149", "0x1149", "libc.so.6+0x2a1c0".
+ * A name of the analysis wins over the same letters read as hex. */
+static bool bp_where(const DisView *v, const char *text, BpWhere *w, char *err, size_t esz) {
+    const Disasm *d = &v->d;
+    const ElfFile *ef = &d->elf;
+    char buf[128];
+    snprintf(buf, sizeof buf, "%s", text);
+    size_t n = strlen(buf);
+    while (n && (buf[n - 1] == ' ' || buf[n - 1] == '\t')) buf[--n] = '\0';
+    char *s = buf;
+    while (*s == ' ' || *s == '\t') s++;
+    if (!*s) { snprintf(err, esz, "expected a name or an address"); return false; }
+    w->module = false;
+    w->mod[0] = '\0';
+    if (!strcmp(s, ".")) {
+        if (v->dsel >= v->ndl || !v->dl[v->dsel].len) { snprintf(err, esz, "no instruction on this line"); return false; }
+        w->addr = v->dl[v->dsel].addr;
+        return true;
+    }
+    uint64_t off = 0, a = 0;
+    bool has_off = false;
+    long f = da_func_named(d, s);                    /* a name may hold a '+' */
+    char *plus = f < 0 ? strrchr(s, '+') : NULL;
+    if (plus) {
+        *plus = '\0';
+        if (!*s || !parse_hex(plus + 1, &off)) { *plus = '+'; snprintf(err, esz, "\"%.80s\": expected name+0xOFFSET", s); return false; }
+        has_off = true;
+        f = da_func_named(d, s);
+    }
+    if (f >= 0) {
+        a = d->fn[f].addr + off;
+        if (a < off) { snprintf(err, esz, "%.80s+0x%llx: past the end of the address space", s, (unsigned long long)off); return false; }
+    } else if (!has_off && parse_hex(s, &a)) {
+        /* an address */
+    } else if (has_off) {
+        if (strcspn(s, " \t/\\") != strlen(s)) { snprintf(err, esz, "\"%.80s\": a module is a file name, without a path", s); return false; }
+        if (strlen(s) >= DBG_MOD_MAX) { snprintf(err, esz, "module name too long"); return false; }
+        if (strcmp(s, base_name(v->path))) {
+            if (!strchr(s, '.')) { snprintf(err, esz, "no function nor module named \"%.80s\"", s); return false; }
+            w->module = true;
+            snprintf(w->mod, sizeof w->mod, "%.*s", DBG_MOD_MAX - 1, s);
+            w->addr = off;
+            return true;
+        }
+        a = dbg_link_base() + off;                   /* the program by its name */
+    } else {
+        snprintf(err, esz, "no function named \"%.80s\", and not a hex address", s);
+        return false;
+    }
+    if (!elf_va_exec(ef, a)) { snprintf(err, esz, "0x%llx is not code of %.60s", (unsigned long long)a, base_name(v->path)); return false; }
+    long i = d->nins ? da_insn_floor(d, a) : -1;
+    if (i >= 0 && a > d->ins[i].addr && a - d->ins[i].addr < d->ins[i].len) {
+        snprintf(err, esz, "0x%llx is inside the instruction at 0x%llx", (unsigned long long)a, (unsigned long long)d->ins[i].addr);
+        return false;
+    }
+    w->addr = a;
+    return true;
+}
+
+static int bp_where_index(const BpWhere *w) {
+    return w->module ? dbg_bp_index_module(w->mod, w->addr) : dbg_bp_index(w->addr);
+}
+
+static const char *bp_where_text(const BpWhere *w, char *out, size_t sz) {
+    if (w->module) snprintf(out, sz, "%s+0x%llx", w->mod, (unsigned long long)w->addr);
+    else snprintf(out, sz, "0x%llx", (unsigned long long)w->addr);
+    return out;
+}
+
+/* One line typed after B:
+ *   WHERE [hw] [if COND]   set (or change the one already there)
+ *   -WHERE, -*             remove it, remove them all
+ *   !WHERE                 on / off
+ * false + err when nothing was done. *msg: what was done. */
+static bool bp_apply(DisView *v, const char *line, char *msg, size_t msz, char *err, size_t esz) {
+    char buf[128];
+    snprintf(buf, sizeof buf, "%s", line);
+    char *s = buf;
+    while (*s == ' ' || *s == '\t') s++;
+    char what[128];
+    BpWhere w;
+    if (*s == '-' && !strcmp(s + 1 + strspn(s + 1, " \t"), "*")) {
+        int n = dbg_bp_list(NULL, 0);
+        dbg_bp_clear();
+        g_nauto = 0;
+        g_main_tmp = false;
+        snprintf(msg, msz, "%d breakpoint%s removed", n, n == 1 ? "" : "s");
+        return true;
+    }
+    if (*s == '-' || *s == '!') {
+        if (!bp_where(v, s + 1, &w, err, esz)) return false;
+        int i = bp_where_index(&w);
+        bp_where_text(&w, what, sizeof what);
+        if (i < 0) { snprintf(err, esz, "no breakpoint at %s", what); return false; }
+        if (*s == '-') {
+            if (!dbg_bp_remove_i(i, err, esz)) return false;
+            if (!w.module) auto_drop(w.addr);
+            snprintf(msg, msz, "breakpoint removed at %s", what);
+            return true;
+        }
+        DbgBp b;
+        if (!dbg_bp_info(i, &b) || !dbg_bp_enable_i(i, !b.enabled, err, esz)) return false;
+        snprintf(msg, msz, "breakpoint %s at %s", b.enabled ? "disabled" : "enabled", what);
+        return true;
+    }
+    /* set: [if COND], then a last word hw */
+    const char *cond = NULL;
+    for (char *p = s; (p = strstr(p, " if ")) != NULL; p++) { *p = '\0'; cond = p + 4; break; }
+    if (!cond && !strncmp(s, "if ", 3)) { snprintf(err, esz, "expected a name or an address before if"); return false; }
+    bool hw = false;
+    size_t n = strlen(s);
+    while (n && (s[n - 1] == ' ' || s[n - 1] == '\t')) s[--n] = '\0';
+    if (n > 3 && !strcmp(s + n - 3, " hw")) { hw = true; s[n - 3] = '\0'; }
+    if (!bp_where(v, s, &w, err, esz)) return false;
+    bp_where_text(&w, what, sizeof what);
+    int i = bp_where_index(&w);
+    bool isnew = i < 0;
+    if (isnew) {
+        bool ok = w.module ? dbg_bp_add_module(w.mod, w.addr, err, esz) : dbg_bp_add(w.addr, err, esz);
+        if (!ok) return false;
+        i = bp_where_index(&w);
+    } else if (!hw && !cond) {
+        snprintf(msg, msz, "already a breakpoint at %s", what);
+        return true;
+    }
+    if ((cond && !dbg_bp_cond_i(i, cond, err, esz)) || (hw && !dbg_bp_hw_i(i, true, err, esz))) {
+        char e2[64];
+        if (isnew) dbg_bp_remove_i(i, e2, sizeof e2);
+        return false;
+    }
+    DbgBp b;
+    dbg_bp_info(i, &b);
+    snprintf(msg, msz, "breakpoint %s at %s%s%s%s", isnew ? "set" : "changed", what, b.hw ? "  ·  debug register" : "",
+             b.has_cond ? "  ·  if " : "", b.cond);
+    return true;
+}
+
+static void dbg_bp_command(DisView *v, const char *line) {
+    if (!line[strspn(line, " \t")]) return;
+    if (!dbg_claim(v)) return;
+    char err[240] = "", msg[240] = "";
+    bool resume;
+    if (!dbg_hold(v, &resume)) return;
+    bool ok = bp_apply(v, line, msg, sizeof msg, err, sizeof err);
+    if (!dbg_release(v, resume)) return;
+    if (!ok) {
+        list_msg(v, COLOR_PAIR_KEYWORD, "breakpoint: %s", err);
+        v->dbg_seen = g_dbg_gen;
+        return;
+    }
+    int n = dbg_bp_list(NULL, 0);
+    list_msg(v, COLOR_PAIR_STRING, "%s  ·  %d breakpoint%s", msg, n, n == 1 ? "" : "s");
+    dbg_keep_msg(v);
 }
 
 /* p: pauses the running program where it is */
@@ -1787,6 +2171,14 @@ static void dbg_key_run(DisView *v, int key, int win_h) {
             v->dbg_seen = g_dbg_gen;                 /* keep the message */
             return;
         }
+        if (dbg_bits() && dbg_bits() != ef->bits) {      /* the file changed under the view? */
+            int pb = dbg_bits();
+            dbg_kill();
+            dbg_changed();
+            list_msg(v, COLOR_PAIR_KEYWORD, "F5: the process is %d-bit, the disassembly %d-bit: reopen the file", pb, ef->bits);
+            v->dbg_seen = g_dbg_gen;
+            return;
+        }
         if (!g_auto_done) auto_add(v);
         if (first && !g_main_tmp && !dbg_bp_has(first)) {
             char e[200];
@@ -1840,10 +2232,14 @@ static bool check_header(const char *path, char *err, size_t esz) {
     if (n >= 2 && h[0] == 'M' && h[1] == 'Z') return true;       /* PE: pe_parse checks the rest */
     if (n < 4 || memcmp(h, "\x7f" "ELF", 4)) { snprintf(err, esz, "%.200s is not an executable (ELF or PE)", base_name(path)); return false; }
     if (n < sizeof h) { snprintf(err, esz, "truncated ELF: %zu bytes, the header is incomplete", n); return false; }
-    if (h[4] == 1) { snprintf(err, esz, "32-bit ELF: only ELF64 x86-64 is analysed"); return false; }
-    if (h[4] != 2) { snprintf(err, esz, "ELF of unknown class %u", h[4]); return false; }
-    if (h[5] != 1) { snprintf(err, esz, "big-endian ELF: only ELF64 x86-64 is analysed"); return false; }
+    if (h[4] != 1 && h[4] != 2) { snprintf(err, esz, "ELF of unknown class %u", h[4]); return false; }
+    if (h[5] != 1) { snprintf(err, esz, "big-endian ELF: only x86-64 (ELF64) and x86 (ELF32) are analysed"); return false; }
     unsigned m = h[18] | (unsigned)h[19] << 8;
+    if (h[4] == 1) {                               /* ELF32: i386 only */
+        if (m == 62) { snprintf(err, esz, "32-bit ELF for x86-64 (x32 ABI): not analysed"); return false; }
+        if (m != 3) { snprintf(err, esz, "32-bit ELF for %s (machine %u): only x86 (i386) is analysed in 32 bits", elf_machine_name((uint16_t)m), m); return false; }
+        return true;
+    }
     if (m != 62) { snprintf(err, esz, "ELF for %s (machine %u): only x86-64 is analysed", elf_machine_name((uint16_t)m), m); return false; }
     return true;
 }
@@ -1988,10 +2384,10 @@ static void draw_fn_row(const DisView *v, WINDOW *win, int y, int w, uint32_t fi
 
 /* the prompt replaces the bottom bar while a filter / address is typed */
 static void draw_prompt(const DisView *v, WINDOW *win, int y, int w) {
-    bool flt = v->in_mode == IN_FILTER, con = v->in_mode == IN_CONSOLE;
+    bool flt = v->in_mode == IN_FILTER, con = v->in_mode == IN_CONSOLE, brk = v->in_mode == IN_BREAK;
     attr_t st = COLOR_PAIR(COLOR_PAIR_STATUS);
     bar(win, y, w, COLOR_PAIR_STATUS, 0, "");
-    int x = piece(win, y, 0, w, st | A_BOLD, con ? " Console (stdin): " : flt ? " Filter (name): " : " Go to address (hex): ");
+    int x = piece(win, y, 0, w, st | A_BOLD, con ? " Console (stdin): " : flt ? " Filter (name): " : brk ? " Breakpoint: " : " Go to address (hex): ");
     int room = w - x - 1;                                   /* one cell for the cursor */
     size_t n = strlen(v->in_buf);
     const char *s = v->in_buf;                              /* ASCII only: bytes = cells */
@@ -2003,6 +2399,7 @@ static void draw_prompt(const DisView *v, WINDOW *win, int y, int w) {
                                             "↑↓ PgUp PgDn: move  ·  Esc: leave"
                                           : "   Enter: send the line  ·  ^D: end of input  ·  ^C: interrupt  ·  "
                                             "F5 F6 F7: run  ·  Shift-F5: kill  ·  ↑↓ PgUp PgDn: move  ·  Esc: leave")
+                          : brk ? "   main, 0x1149, main+0x10, libc.so.6+0x2a1c0, . (this line)  [hw]  [if rax == 3 | hits >= 2]  ·  -x removes, -* all  ·  !x on/off  ·  Esc: cancel"
                           : flt ? "   Enter: keep  ·  Esc: cancel  ·  ^U: clear  ·  ↑↓: move"
                                 : "   Enter: go  ·  Esc: cancel  ·  ^U: clear");
 }
@@ -2156,7 +2553,8 @@ static void draw_dl_row(const DisView *v, WINDOW *win, int y, int w, size_t i, b
         nm[0] = '\0';
         da_format(d, (size_t)ai, m2, sizeof m2, o2, sizeof o2, nm, sizeof nm);
         if (nm[0]) u += (size_t)snprintf(cmt + u, sizeof cmt - u, "%s%s", u ? "  " : "; ", nm);
-    } else if (line_ref(l, &t) && da_name_for(d, t, nm, sizeof nm))
+    } else if ((line_ref(l, &t) || (d->elf.fmt == ELF_FMT_PE && d->elf.bits == 32 && abs_ref(l, &t))) &&
+               da_name_for(d, t, nm, sizeof nm))
         u += (size_t)snprintf(cmt + u, sizeof cmt - u, "%s%s", u ? "  " : "; ", nm);
     if (u >= sizeof cmt) u = sizeof cmt - 1;
     long fs = i ? da_func_at(d, l->addr) : -1;
@@ -2167,8 +2565,10 @@ static void draw_dl_row(const DisView *v, WINDOW *win, int y, int w, size_t i, b
                : mnem_flow(l->mnem) ? COLOR_PAIR(COLOR_PAIR_KEYWORD) | A_BOLD : COLOR_PAIR(COLOR_PAIR_NORMAL);
     /* margin: breakpoint, not decoded by the analysis, rip */
     int x = 0;
+    DbgBp bi;
+    bool bon = bp && dbg_bp_info(dbg_bp_index(l->addr), &bi);
     x = piece(win, y, x, w, sel ? hs : COLOR_PAIR(bp && auto_index(l->addr) >= 0 ? COLOR_PAIR_TYPE : HEX_CP_NONPRINT) | A_BOLD,
-              bp ? "•" : " ");
+              !bon ? " " : !bi.enabled ? "○" : bi.hw ? "◆" : "•");
     x = piece(win, y, x, w, sel ? hs : COLOR_PAIR(COLOR_PAIR_NUMBER) | A_BOLD, off ? "!" : " ");
     x = piece(win, y, x, w, sel ? hs : COLOR_PAIR(COLOR_PAIR_NUMBER) | A_BOLD, rip ? "▶" : " ");
     x = piece(win, y, x, w, sel ? hs : COLOR_PAIR(COLOR_PAIR_LINENUM), a) + 2;
@@ -2308,24 +2708,38 @@ static void draw_regs(const DisView *v, WINDOW *win, int x0, int y0, int y1, int
     y++;
     if (s == DBG_STOPPED && g_regs_ok) {
         static const char *const rn[] = { "rip", "rsp", "rbp", "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rflags" };
+        static const char *const rn32[] = { "eip", "esp", "ebp", "eax", "ebx", "ecx", "edx", "esi", "edi", "eflags" };
+        bool w32 = dbg_bits() == 32;
+        int dig = w32 ? 8 : 16;
         const DbgRegs *r = &g_regs, *p = &g_prev;
         uint64_t cur[10] = { r->rip, r->rsp, r->rbp, r->rax, r->rbx, r->rcx, r->rdx, r->rsi, r->rdi, r->rflags };
         uint64_t old[10] = { p->rip, p->rsp, p->rbp, p->rax, p->rbx, p->rcx, p->rdx, p->rsi, p->rdi, p->rflags };
         for (int i = 0; i < 10 && y < y1; i++) {
             bool chg = g_prev_ok && cur[i] != old[i];
-            snprintf(line, sizeof line, "%-6s ", rn[i]);
+            snprintf(line, sizeof line, "%-6s ", w32 ? rn32[i] : rn[i]);
             int xx = piece(win, y, x, w, COLOR_PAIR(COLOR_PAIR_TYPE), line);
-            snprintf(line, sizeof line, "0x%016llx", (unsigned long long)cur[i]);
+            snprintf(line, sizeof line, "0x%0*llx", dig, (unsigned long long)cur[i]);
             piece(win, y++, xx, w, chg ? COLOR_PAIR(COLOR_PAIR_KEYWORD) | A_BOLD : COLOR_PAIR(COLOR_PAIR_NORMAL), line);
             if (i == 0 && y < y1) {                  /* where rip is */
                 char nb[200], where[120] = "";
                 uint64_t fa;
+                bool in_file = dbg_to_file(r->rip, &fa);
                 const char *nm;
-                if (dbg_to_file(r->rip, &fa))
+                if (in_file)
                     snprintf(where, sizeof where, "%.100s", (nm = da_name_for(&v->d, fa, nb, sizeof nb)) ? nm : "(no name)");
                 else if (map_name(dbg_pid(), r->rip, nb, sizeof nb))
                     snprintf(where, sizeof where, "in %.100s", nb);
                 if (where[0]) piece(win, y++, x + 7, w, COLOR_PAIR(COLOR_PAIR_COMMENT), where);
+                uint8_t code[8];                     /* its bytes, as the program has them */
+                if (y < y1 && dbg_read_mem(r->rip, code, sizeof code)) {
+                    size_t avail = 0, u = 0;
+                    const uint8_t *fp = in_file ? elf_va_ptr(&v->d.elf, fa, &avail) : NULL;
+                    bool differs = fp && avail >= sizeof code && memcmp(fp, code, sizeof code);
+                    line[0] = '\0';
+                    for (size_t k = 0; k < sizeof code; k++) u += (size_t)snprintf(line + u, sizeof line - u, "%02x ", code[k]);
+                    if (differs) snprintf(line + u, sizeof line - u, "≠ file");
+                    piece(win, y++, x + 7, w, differs ? COLOR_PAIR(COLOR_PAIR_KEYWORD) | A_BOLD : COLOR_PAIR(COLOR_PAIR_COMMENT), line);
+                }
             }
         }
         if (y < y1) {                                /* rflags, decoded */
@@ -2339,6 +2753,19 @@ static void draw_regs(const DisView *v, WINDOW *win, int x0, int y0, int y1, int
                     u += (size_t)snprintf(line + u, sizeof line - u, "%s%s", u ? " " : "", fl[k].n);
             piece(win, y++, x + 7, w, COLOR_PAIR(COLOR_PAIR_COMMENT), line);
         }
+        if (!w32 && w - x >= 46 && y1 - y >= 12) {   /* r8-r15, on two columns */
+            static const char *const rx[] = { "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15" };
+            uint64_t c8[8] = { r->r8, r->r9, r->r10, r->r11, r->r12, r->r13, r->r14, r->r15 };
+            uint64_t o8[8] = { p->r8, p->r9, p->r10, p->r11, p->r12, p->r13, p->r14, p->r15 };
+            for (int i = 0; i < 8; i++) {
+                int yy = y + i / 2, cx = x + (i & 1) * 23;
+                snprintf(line, sizeof line, "%-3s ", rx[i]);
+                int xx = piece(win, yy, cx, w, COLOR_PAIR(COLOR_PAIR_TYPE), line);
+                snprintf(line, sizeof line, "0x%016llx", (unsigned long long)c8[i]);
+                piece(win, yy, xx, w, g_prev_ok && c8[i] != o8[i] ? COLOR_PAIR(COLOR_PAIR_KEYWORD) | A_BOLD : COLOR_PAIR(COLOR_PAIR_NORMAL), line);
+            }
+            y += 4;
+        }
         y++;
     }
     if (y < y1) {
@@ -2349,6 +2776,49 @@ static void draw_regs(const DisView *v, WINDOW *win, int x0, int y0, int y1, int
     }
     y++;
     draw_console(v, win, y, y1, x, w);
+}
+
+/* L: the breakpoints, in the panel: mark, address, name, passes, condition,
+ * why it is not placed. The selected line's one first when they do not all
+ * fit. */
+static void draw_bps(const DisView *v, WINDOW *win, int x0, int y0, int y1, int w) {
+    wattrset(win, COLOR_PAIR(COLOR_PAIR_INACTIVE_BORDER));
+    for (int y = y0; y < y1; y++) mvwaddch(win, y, x0, ACS_VLINE);
+    wattrset(win, A_NORMAL);
+    int x = x0 + 2, y = y0, n = dbg_bp_list(NULL, 0);
+    char line[200];
+    snprintf(line, sizeof line, "BREAKPOINTS  %d/%d", n, DBG_MAX_BP);
+    piece(win, y++, x, w, COLOR_PAIR(COLOR_PAIR_KEYWORD) | A_BOLD, line);
+    if (!n) { piece(win, y, x, w, COLOR_PAIR(COLOR_PAIR_COMMENT), "none  ·  b: this line  ·  B: by name"); return; }
+    uint64_t cur = v->dsel < v->ndl ? v->dl[v->dsel].addr : 0;
+    int rows = y1 - y, first = 0, on = dbg_bp_stopped_on();
+    if (n > rows) {                                  /* around the selected line */
+        int k = dbg_bp_index(cur);
+        if (k > rows / 2) first = k - rows / 2;
+        if (first > n - rows) first = n - rows;
+        if (first < 0) first = 0;
+    }
+    for (int i = first; i < n && y < y1; i++) {
+        DbgBp b;
+        if (!dbg_bp_info(i, &b)) break;
+        char nb[200], where[160], tail[120];
+        const char *nm = b.main ? da_name_for(&v->d, b.va, nb, sizeof nb) : NULL;
+        if (b.main) snprintf(where, sizeof where, "0x%llx %.60s", (unsigned long long)b.va, nm ? nm : "");
+        else snprintf(where, sizeof where, "%.60s+0x%llx", b.module, (unsigned long long)b.rva);
+        static const char *const st[] = { "", "", "pending", "not mapped", "not code", "shared", "hw refused" };
+        size_t u = (size_t)snprintf(tail, sizeof tail, " ×%llu", (unsigned long long)b.hits);
+        if (b.has_cond) u += (size_t)snprintf(tail + u, sizeof tail - u, " if %s", b.cond);
+        if ((unsigned)b.state < sizeof st / sizeof st[0] && st[b.state][0])
+            u += (size_t)snprintf(tail + u, sizeof tail - u, " [%s]", st[b.state]);
+        if (b.overwritten) snprintf(tail + u, sizeof tail - u, " [overwritten]");
+        bool bad = b.overwritten || (b.state >= DBG_BPS_UNMAPPED);
+        attr_t a = i == on ? COLOR_PAIR(HEX_CP_CURSOR_A) | A_BOLD
+                 : b.main && b.va == cur ? COLOR_PAIR(COLOR_PAIR_SELECTION) | A_BOLD
+                 : !b.enabled ? COLOR_PAIR(COLOR_PAIR_COMMENT) : COLOR_PAIR(COLOR_PAIR_NORMAL);
+        int xx = piece(win, y, x, w, a, !b.enabled ? "○ " : b.hw ? "◆ " : "• ");
+        xx = piece(win, y, xx, w, a, where);
+        piece(win, y++, xx, w, bad ? COLOR_PAIR(COLOR_PAIR_KEYWORD) | A_BOLD : COLOR_PAIR(COLOR_PAIR_COMMENT), tail);
+    }
 }
 
 /* title bar, function header (h >= 4), lines, bottom bar (h >= 3); the
@@ -2363,7 +2833,7 @@ static void render_disasm(DisView *v, WINDOW *win, int h, int w) {
     const DisFunc *fn = &d->fn[v->dfn];
     v->drip_ok = dbg_mine(v) && dbg_rip(&v->drip, NULL);
     int full = w;
-    if (dbg_mine(v) && dbg_state() != DBG_NONE && w >= 72 && h >= 4) {
+    if (dbg_mine(v) && (dbg_state() != DBG_NONE || v->bp_panel) && w >= 72 && h >= 4) {
         int pw = w / 3 < DBG_PANEL_W ? DBG_PANEL_W : w / 3 > DBG_PANEL_MAX ? DBG_PANEL_MAX : w / 3;
         v->dpanel = w - pw;
         w = v->dpanel;                               /* the lines stop before it */
@@ -2393,7 +2863,10 @@ static void render_disasm(DisView *v, WINDOW *win, int h, int w) {
     keep_in_view(&v->dsel, &v->dtop, v->ndl, rows);
     for (int r = 0; r < rows && v->dtop + (size_t)r < v->ndl; r++)
         draw_dl_row(v, win, y0 + r, w, v->dtop + (size_t)r, v->dtop + (size_t)r == v->dsel);
-    if (v->dpanel) draw_regs(v, win, v->dpanel, 1, h - 1, full);
+    if (v->dpanel) {
+        if (v->bp_panel) draw_bps(v, win, v->dpanel, 1, h - 1, full);
+        else draw_regs(v, win, v->dpanel, 1, h - 1, full);
+    }
     w = full;
 
     if (h < 3) return;
@@ -2405,7 +2878,7 @@ static void render_disasm(DisView *v, WINDOW *win, int h, int w) {
     int x = piece(win, h - 1, 0, w, COLOR_PAIR(COLOR_PAIR_LINENUM), line);
     if (v->msg[0]) piece(win, h - 1, x, w, COLOR_PAIR(v->msg_pair) | A_BOLD, v->msg);
     else piece(win, h - 1, x, w, COLOR_PAIR(COLOR_PAIR_LINENUM),
-               "b: breakpoint  ·  F5: run / continue  ·  F6: step (from main)  ·  F7: step over  ·  p: pause  ·  K / Shift-F5: kill  ·  i: console  ·  "
+               "b: breakpoint  ·  B: by name, condition  ·  e: on/off  ·  h: hardware  ·  L: list  ·  n: next  ·  F5: run / continue  ·  F6: step this thread (from main)  ·  F7: step over  ·  p: pause  ·  K / Shift-F5: kill  ·  i: console  ·  "
                "Enter/click: follow the address  ·  Backspace: back  ·  :: go to address  ·  d: data  ·  "
                "Esc: back to the list  ·  Tab: data  ·  F9: close");
 }
@@ -2772,7 +3245,12 @@ static bool input_key(DisView *v, int key, int win_h) {
             cancel_input(v);
             return true;
         case '\n': case '\r': case KEY_ENTER:
-            if (v->in_mode == IN_GOTO) {
+            if (v->in_mode == IN_BREAK) {
+                char line[sizeof v->in_buf];
+                snprintf(line, sizeof line, "%s", v->in_buf);
+                v->in_mode = IN_NONE;
+                dbg_bp_command(v, line);
+            } else if (v->in_mode == IN_GOTO) {
                 v->in_mode = IN_NONE;
                 uint64_t a;
                 if (!n) ;
@@ -2840,13 +3318,19 @@ static bool funcs_key(DisView *v, int key, int win_h) {
 static bool disasm_key(DisView *v, int key, int win_h) {
     if (key == 27) { v->screen = SCR_FUNCS; return true; }   /* back to the list */
     if (key == 'b') { dbg_key_bp(v); return true; }
+    if (key == 'B') { v->in_mode = IN_BREAK; v->in_buf[0] = '\0'; return true; }
+    if (key == 'e' || key == 'h') { dbg_key_bp_flag(v, key); return true; }
+    if (key == 'L') { dbg_key_bp_panel(v); return true; }
+    if (key == 'n') { dbg_key_bp_next(v); return true; }
     if (key == 'i') { dbg_key_console(v); return true; }
     if (key == 'p') { dbg_key_pause(v); return true; }
     if (key == 'K' || key == KEY_F(17)) { dbg_key_kill(v); return true; }
     if (key == KEY_F(5) || key == KEY_F(6) || key == KEY_F(7)) { dbg_key_run(v, key, win_h); return true; }
     if (key == '\n' || key == '\r' || key == KEY_ENTER) {    /* follow the address of the line */
         uint64_t t;
-        if (v->dsel < v->ndl && v->dl[v->dsel].len && line_ref(&v->dl[v->dsel], &t)) follow(v, t);
+        if (v->dsel < v->ndl && v->dl[v->dsel].len &&
+            (line_ref(&v->dl[v->dsel], &t) ||
+             (v->d.elf.fmt == ELF_FMT_PE && v->d.elf.bits == 32 && abs_ref(&v->dl[v->dsel], &t)))) follow(v, t);
         else list_msg(v, COLOR_PAIR_NUMBER, "no address to follow on this line");
         return true;
     }

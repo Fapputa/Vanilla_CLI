@@ -100,7 +100,7 @@ static struct {
     long long   last_render;       /* last draw of the F8 view (ms)       */
 } M ={ .type = MT_I32, .mode = MS_EXACT, .aligned = true };
 
-static void note(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void note(const char *fmt, ...) __attribute__((format(gnu_printf, 1, 2)));
 static void note(const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);

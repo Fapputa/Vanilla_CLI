@@ -1115,9 +1115,9 @@ static int  url_tmp_seq = 0;
 static const char *url_tmpdir(void) {
     if (url_tmp_dir[0]) return url_tmp_dir;
 #ifdef _WIN32
-    const char *t = getenv("TEMP");
-    if (!t || !*t) t = ".";
-    snprintf(url_tmp_dir, sizeof url_tmp_dir, "%s\\abyss-url-%d", t, (int)getpid());
+    char sub[32];                                   /* %LOCALAPPDATA%\abyss\url-PID */
+    snprintf(sub, sizeof sub, "url-%d", (int)getpid());
+    if (!win_apppath(url_tmp_dir, sizeof url_tmp_dir, sub)) return NULL;
     if (mkdir(url_tmp_dir) != 0 && errno != EEXIST) { url_tmp_dir[0] = '\0'; return NULL; }
 #else
     const char *t = getenv("TMPDIR");
@@ -2105,17 +2105,68 @@ void editor_cleanup(void) {
     server_stop();
     mem_ui_shutdown();                     /* F8: detach, free the scans */
     url_tmp_cleanup();
-    unlink("./temp_bin");
 }
+
+#ifndef _WIN32
+/* initscr() without its exit on a terminal it does not know. TERM unset, empty, or
+ * found neither in the terminfo databases nor among the entries built into ncurses
+ * (static build, static/build.sh): xterm-256color instead, said on stderr (seen after
+ * the quit) and in the status bar, and passed on to the programs Abyss starts.
+ * Otherwise exactly what initscr() does.
+ * The entry is looked up with setupterm() first: a newterm() that fails loses the screen
+ * it allocated (LeakSanitizer, ncurses 6.6). Declared here rather than through <term.h>,
+ * whose capability macros (lines, columns...) would reach the whole file. */
+struct term;
+extern int setupterm(const char *, int, int *);
+extern struct term *set_curterm(struct term *);
+extern int del_curterm(struct term *);
+static char term_note[96];            /* put in E_notify once the first file is open */
+static void curses_start(void) {
+    const char *t = getenv("TERM");
+    int err = 0;
+    bool known = t && *t && setupterm(t, fileno(stdout), &err) == OK;
+    if (known) del_curterm(set_curterm(NULL));     /* only a lookup: newterm() reads it again */
+    if (known && newterm(t, stdout, stdin)) { def_prog_mode(); return; }
+    char was[64];
+    snprintf(was, sizeof was, "%s", t && *t ? t : "(unset)");
+    fprintf(stderr, "abyss: terminal type \"%s\" unknown (no terminfo entry): using xterm-256color\n", was);
+    if (!newterm("xterm-256color", stdout, stdin)) {
+        fprintf(stderr, "Error opening terminal: %s.\n", t && *t ? t : "unknown");
+        exit(EXIT_FAILURE);
+    }
+    setenv("TERM", "xterm-256color", 1);
+    def_prog_mode();
+    snprintf(term_note, sizeof term_note, "Terminal \"%.40s\" unknown: shown as xterm-256color", was);
+}
+#endif
+
+#ifdef _WIN32
+/* wgetch() as on Linux: a typed character beyond ASCII comes as its UTF-8 bytes, one per
+ * call (the console driver gives WIN_KEY_CHAR | its UTF-16 unit: winsize.c) */
+static int key_read(WINDOW *w) {
+    static unsigned char q[4];
+    static int qn, qi;
+    if (qi < qn) return q[qi++];
+    for (;;) {
+        int k = wgetch(w), n = win_key_utf8(k, q);
+        if (n < 0) return k;
+        if (n > 0) { qn = n; qi = 1; return q[0]; }
+    }
+}
+#else
+#  define key_read(w) wgetch(w)
+#endif
 
 void editor_run(const char *initial_file) {
     #ifdef _WIN32
     win_init_utf8();
     setlocale(LC_ALL, ".UTF-8");   /* "" donnerait French_France.1252 → UTF-8 mal décodé */
+    initscr();
 #else
     setlocale(LC_ALL, "");
+    curses_start();
 #endif
-    initscr(); raw(); noecho();
+    raw(); noecho();
     keypad(stdscr, TRUE);
     set_escdelay(25);
     mouseinterval(0);                       /* F9: a press is a click, no wait */
@@ -2129,7 +2180,11 @@ void editor_run(const char *initial_file) {
     ft_init_color_pairs();          /* fixed pairs first: the image view allocates the rest */
     colors_win_polish();
 
-    printf("\033[?2004h");  
+#ifndef _WIN32
+    /* (not on Windows: the console driver of ncurses reads key events, never these
+     * sequences, and a terminal behind the console that took the kitty push would send
+     * keys nothing there decodes) */
+    printf("\033[?2004h");
     /* Kitty keyboard protocol, level 1 ("disambiguate escape codes"): makes
      * the terminal report modifiers for keys the legacy encoding folds
      * together (Ctrl+I vs Tab, Ctrl+M vs Enter, ...).
@@ -2137,12 +2192,18 @@ void editor_run(const char *initial_file) {
      * are decoded back below; terminals without support ignore the push. */
     printf("\033[>1u");
     fflush(stdout);
+#endif
     layout_windows();
 
     if (initial_file) {
         pane_open_file(E.panes[0], initial_file);
         layout_windows();
     }
+#ifndef _WIN32
+    if (term_note[0] && !E_notify[0]) snprintf(E_notify, sizeof E_notify, "%s", term_note);
+#else
+    if (win_console_note() && !E_notify[0]) snprintf(E_notify, sizeof E_notify, "%s", win_console_note());
+#endif
     full_redraw(true);
 
     {
@@ -2195,7 +2256,7 @@ void editor_run(const char *initial_file) {
             if (want != mouse_on) { mousemask(want, NULL); mouse_on = want; }
         }
         if (tmo >= 0) wtimeout(kw, tmo);
-        int key = wgetch(kw);
+        int key = key_read(kw);
         if (tmo >= 0) wtimeout(kw, -1);
         {                                           /* live console: new output, end */
             int ev = run_poll();
@@ -2257,11 +2318,11 @@ void editor_run(const char *initial_file) {
             WINDOW *ew = iw ? iw : stdscr;
             wtimeout(ew, 5);
             int sq[16]; int sn = 0;
-            for (; sn < 16; sn++) {
-                sq[sn] = wgetch(ew);
-                if (sq[sn] == ERR) { sn--; break; }
+            while (sn < 16) {
+                int c = key_read(ew);
+                if (c == ERR) break;
+                sq[sn++] = c;
             }
-            sn++; if (sn < 0) sn = 0;
             wtimeout(ew, -1);
 
             bool consumed = false;
@@ -2456,9 +2517,11 @@ void editor_run(const char *initial_file) {
     }
 
     mousemask(0, NULL);
-    printf("\033[?2004l");  
+#ifndef _WIN32
+    printf("\033[?2004l");
     printf("\033[<u");      /* pop the keyboard-protocol flags */
     fflush(stdout);
+#endif
     endwin();
 }
 

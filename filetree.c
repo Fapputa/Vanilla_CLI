@@ -117,8 +117,7 @@ static void parse_colorrc_line(const char *line)
     }
 
     ColorRule *r = &g_rules[g_nrules];
-    strncpy(r->key, key, sizeof r->key - 1);
-    r->key[sizeof r->key - 1] = '\0';
+    snprintf(r->key, sizeof r->key, "%s", key);          /* key: 31 bytes at most */
     r->fg        = fg;
     r->bold      = bold;
     r->italic    = italic;
@@ -138,7 +137,7 @@ static void load_colorrc(void)
         snprintf(sudo_home, sizeof sudo_home, "/home/%s", sudo_user);
         home = sudo_home;
     }
-    if (!home) home = getenv("HOME");
+    if (!home) home = home_dir();
     if (!home) return;
 
     char path[4096];
@@ -169,6 +168,9 @@ void ft_init_color_pairs(void)
     init_pair(TREE_CP_HEADER, COLOR_WHITE, COLOR_RED);
     init_pair(TREE_CP_BORDER, COLOR_CYAN,  -1);
     init_pair(TREE_CP_FIELD,  COLOR_WHITE, COLOR_BLACK);
+#ifdef _WIN32
+    colors_win_polish();             /* same theme as the rest (and no -1 bg on Windows) */
+#endif
 }
 
 static const ColorRule *find_rule(const FTEntry *e)
@@ -272,11 +274,11 @@ void ft_reload(FileTree *ft)
         if (filtering && (strcmp(de->d_name, "..") == 0 ||
                           !name_has(de->d_name, ft->query))) continue;
 
-        char full[4096];
+        char full[sizeof ft->cwd + sizeof de->d_name];   /* never cut: too long, lstat refuses it */
         snprintf(full, sizeof full, "%s/%s", ft->cwd, de->d_name);
 
         struct stat st;
-        if (lstat(full, &st) != 0) continue;   
+        if (lstat(full, &st) != 0) continue;
 
         if (ft->count >= ft->cap) {
             ft->cap     = ft->cap ? ft->cap * 2 : 64;
@@ -310,14 +312,16 @@ void ft_enter(FileTree *ft)
 
     if (strcmp(e->name, "..") == 0) { ft_go_up(ft); return; }
 
-    char new_cwd[4096];
+    char new_cwd[sizeof ft->cwd + 256];      /* never cut, nor entered when too long */
     snprintf(new_cwd, sizeof new_cwd, "%s/%s", ft->cwd, e->name);
 
     char resolved[4096];
     if (realpath(new_cwd, resolved))
-        strncpy(ft->cwd, resolved, sizeof ft->cwd - 1);
+        snprintf(ft->cwd, sizeof ft->cwd, "%s", resolved);
+    else if (strlen(new_cwd) < sizeof ft->cwd)
+        memcpy(ft->cwd, new_cwd, strlen(new_cwd) + 1);
     else
-        strncpy(ft->cwd, new_cwd,  sizeof ft->cwd - 1);
+        return;
 
     ft->selected = 0;
     ft->scroll   = 0;
@@ -333,12 +337,12 @@ void ft_go_up(FileTree *ft)
     if (slash && slash != ft->cwd)
         strncpy(old_name, slash + 1, sizeof old_name - 1);
 
-    char new_cwd[4096];
+    char new_cwd[sizeof ft->cwd + 3];        /* never cut */
     snprintf(new_cwd, sizeof new_cwd, "%s/..", ft->cwd);
 
     char resolved[4096];
     if (realpath(new_cwd, resolved))
-        strncpy(ft->cwd, resolved, sizeof ft->cwd - 1);
+        snprintf(ft->cwd, sizeof ft->cwd, "%s", resolved);
 
     ft->selected = 0;
     ft->scroll   = 0;
@@ -395,12 +399,12 @@ void ft_render(FileTree *ft, WINDOW *win, int win_h, int win_w, bool is_active)
         wmove(win, 0, 1);
 
         char display_cwd[4096];
-        const char *home = getenv("HOME");
+        const char *home = home_dir();
         if (home && strncmp(ft->cwd, home, strlen(home)) == 0)
             snprintf(display_cwd, sizeof display_cwd,
                      "~%s", ft->cwd + strlen(home));
         else
-            strncpy(display_cwd, ft->cwd, sizeof display_cwd - 1);
+            snprintf(display_cwd, sizeof display_cwd, "%s", ft->cwd);
 
         
         const char *cwd_disp = display_cwd;
@@ -577,17 +581,27 @@ bool ft_query_complete(FileTree *ft) {
     if (!q[0] || ft_query_is_filter(q) || query_is_url(q)) return false;
 
     char full[4096];
-    const char *home = getenv("HOME");
-    if (q[0] == '~' && home) snprintf(full, sizeof full, "%s%s", home, q + 1);
-    else if (q[0] == '/' || (isalpha((unsigned char)q[0]) && q[1] == ':'))
-        snprintf(full, sizeof full, "%s", q);
-    else snprintf(full, sizeof full, "%s/%s", ft->cwd, q);
+    const char *home = home_dir();
+    int fl;
+    if (q[0] == '~' && home) fl = snprintf(full, sizeof full, "%s%s", home, q + 1);
+    else if (q[0] == '/' || q[0] == '\\' || (isalpha((unsigned char)q[0]) && q[1] == ':'))
+        fl = snprintf(full, sizeof full, "%s", q);
+    else fl = snprintf(full, sizeof full, "%s/%s", ft->cwd, q);
+    if (fl < 0 || (size_t)fl >= sizeof full) return false;    /* longer than a path: nothing to complete */
 
     char *sl = strrchr(full, '/');
+#ifdef _WIN32
+    char *bs = strrchr(full, '\\');                /* C:\Users\... */
+    if (bs && (!sl || bs > sl)) sl = bs;
+#endif
     if (!sl) return false;
     char dir[4096], part[1024];
     snprintf(part, sizeof part, "%s", sl + 1);
     if (sl == full) snprintf(dir, sizeof dir, "/");
+#ifdef _WIN32
+    else if (sl == full + 2 && full[1] == ':')    /* "C:\" is the root, "C:" is not */
+        snprintf(dir, sizeof dir, "%.3s", full);
+#endif
     else            snprintf(dir, sizeof dir, "%.*s", (int)(sl - full), full);
 
     DIR *d = opendir(dir);
@@ -599,11 +613,15 @@ bool ft_query_complete(FileTree *ft) {
     struct dirent *de;
     while ((de = readdir(d))) {
         if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+#ifdef _WIN32
+        if (strncasecmp(de->d_name, part, pl) != 0) continue;
+#else
         if (strncmp(de->d_name, part, pl) != 0) continue;
+#endif
         if (pl == 0 && de->d_name[0] == '.') continue;          /* hidden: type the dot */
         if (nmatch++ == 0) {
             snprintf(common, sizeof common, "%s", de->d_name);
-            char p2[4096]; struct stat st;
+            char p2[sizeof dir + sizeof de->d_name]; struct stat st;   /* never cut */
             snprintf(p2, sizeof p2, "%s/%s", dir, de->d_name);
             only_dir = stat(p2, &st) == 0 && S_ISDIR(st.st_mode);
         } else {

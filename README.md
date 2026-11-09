@@ -831,11 +831,3 @@ An interactive ncurses editor for `~/.colorrc`.
 | `redem` | Emergency reset for WiFi drivers. Restarts stuck or crashing wireless interfaces. |
 
 ---
-
-
-
-```bash
-minesweeper <width> <height>
-# Example:
-minesweeper 4 4
-```

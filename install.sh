@@ -86,7 +86,7 @@ DNF_PKGS=(
     gcc gcc-c++ make ncurses-devel rust cargo
     python3 python3-pip python3-rich python3-prompt-toolkit
     python3-pygments python3-psutil
-    poppler-utils sqlite unzip xclip xsel wireless-tools net-tools
+    poppler-utils sqlite unzip xclip xsel
 )
 
 # Seuls les paquets absents sont installes ; s'il n'en manque aucun, le

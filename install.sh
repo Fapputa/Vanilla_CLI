@@ -83,7 +83,7 @@ PACMAN_PKGS=(
 )
 
 DNF_PKGS=(
-    gcc gcc-c++ make ncurses-devel rust cargo
+    gcc gcc-c++ make ncurses-devel pkgconf-pkg-config rust cargo
     python3 python3-pip python3-rich python3-prompt-toolkit
     python3-pygments python3-psutil
     poppler-utils sqlite unzip xclip xsel

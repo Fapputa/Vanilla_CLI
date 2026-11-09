@@ -832,32 +832,7 @@ An interactive ncurses editor for `~/.colorrc`.
 
 ---
 
-## Monitoring
 
-### `monitoring`
-
-A dashboard built with the `Rich` library displaying real-time system diagnostics:
-
-- CPU and GPU usage, frequencies, RAM, disk I/O
-- Top processes by resource usage
-- Active network interfaces, mounted network drives, packet counters
-- Python version and installed package count
-
-### `wifi_monitoring`
-
-Focused network monitor tracking wireless interface state and traffic in real time.
-
----
-
-## Terminal Games
-
-### `blackjack`
-
-Classic CLI Blackjack with full dealer AI and a betting system. Player and dealer cards displayed in the terminal.
-
-### `minesweeper`
-
-Customizable Minesweeper with adjustable grid dimensions.
 
 ```bash
 minesweeper <width> <height>

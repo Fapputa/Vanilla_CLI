@@ -131,6 +131,17 @@ struct DisView {
     int       dpanel;
     bool      con_auto;
     bool      bp_panel;            /* L: the panel lists the breakpoints  */
+    /* the panel's [esp+4] / [esp+8] ([rsp+8] / [rsp+16]): rows sarg_y0 ..
+     * sarg_y1 of each at the last draw (0: not drawn), clickable; peek:
+     * the bytes at the value of slot peek_k shown under it, while that
+     * slot still holds peek_a (peek_k 0 / 1: the stack slots, 2 + i:
+     * register i of reg_val). reg_y / reg_x0 .. reg_x1: the row and the
+     * columns of each register at the last draw (row 0: not drawn), clickable */
+    int       sarg_y0[2], sarg_y1[2];
+    int       reg_y[18], reg_x0[18], reg_x1[18];
+    bool      peek_on;
+    int       peek_k;
+    uint64_t  peek_a;
 
     /* data screens: the sections (ds, by address), then the rows of
      * section xsec (xi). data_back: screen to go back to (d / Esc). */
@@ -2240,6 +2251,156 @@ static bool map_name(int pid, uint64_t a, char *out, size_t sz) {
 
 static const char *ip_name(void) { return dbg_bits() == 32 ? "eip" : "rip"; }
 
+/* ─── Stack arguments in the panel: al, [esp+4], [esp+8] ───────── */
+
+/* a C string of the debuggee at rt, quoted and escaped like da_string_at
+ * ("..." when cut); false: under 2 printable ASCII characters */
+static bool live_string(uint64_t rt, char *out, size_t osz) {
+    uint8_t b[48];
+    size_t n = sizeof b, page = 4096 - (size_t)(rt & 4095);
+    if (n > page) n = page;
+    if (osz < 8 || !dbg_read_mem(rt, b, n)) return false;
+    size_t k = 0, o = 0;
+    out[o++] = '"';
+    for (; k < n && b[k]; k++) {
+        uint8_t c = b[k];
+        const char *e = c == '\n' ? "\\n" : c == '\t' ? "\\t" : c == '\r' ? "\\r" : c == '"' ? "\\\"" : c == '\\' ? "\\\\" : NULL;
+        if (!e && (c < 0x20 || c > 0x7e)) return false;
+        if (o + (e ? 2 : 1) + 5 > osz) break;
+        if (e) { out[o++] = e[0]; out[o++] = e[1]; } else out[o++] = (char)c;
+    }
+    if (k < 2) return false;
+    if (k == n || b[k]) { memcpy(out + o, "...", 3); o += 3; }
+    out[o++] = '"';
+    out[o] = '\0';
+    return true;
+}
+
+/* slot k (0, 1) of the stack above the return address: [esp+4], [esp+8]
+ * in 32-bit, [rsp+8], [rsp+16] in 64-bit. *lbl its name; false: not
+ * stopped or not readable */
+static bool stack_arg(int k, uint64_t *val, char *lbl, size_t lsz) {
+    bool w32 = dbg_bits() == 32;
+    unsigned slot = w32 ? 4 : 8;
+    if (lbl) snprintf(lbl, lsz, "[%s+%u]", w32 ? "esp" : "rsp", slot * (unsigned)(k + 1));
+    if (dbg_state() != DBG_STOPPED || !g_regs_ok) return false;
+    uint8_t b[8];
+    if (!dbg_read_mem(g_regs.rsp + slot * (uint64_t)(k + 1), b, slot)) return false;
+    *val = 0;
+    for (unsigned i = 0; i < slot; i++) *val |= (uint64_t)b[i] << (8 * i);
+    return true;
+}
+
+/* what the value rt of a stack slot is, in a few words: the name of the
+ * code it points to, the string there (live memory), the place in the
+ * file, the stack (esp+X) and the slot found there, a mapping, a number */
+static void ptr_note(const DisView *v, uint64_t rt, char *out, size_t sz) {
+    bool w32 = dbg_bits() == 32;
+    uint64_t fa, sp = g_regs.rsp;
+    char nb[200];
+    const char *nm;
+    out[0] = '\0';
+    bool in_file = dbg_to_file(rt, &fa);
+    if (in_file && elf_va_code(&v->d.elf, fa)) {
+        if ((nm = da_name_for(&v->d, fa, nb, sizeof nb))) snprintf(out, sz, "%s", nm);
+        else ref_place(v, fa, out, sz);
+        return;
+    }
+    if (live_string(rt, out, sz)) return;
+    if (in_file) {
+        if ((nm = da_name_for(&v->d, fa, nb, sizeof nb))) snprintf(out, sz, "%s", nm);
+        else ref_place(v, fa, out, sz);
+        return;
+    }
+    long long sv = w32 ? (long long)(int32_t)rt : (long long)rt;
+    if (sv > -0x10000 && sv < 0x10000) { snprintf(out, sz, "= %lld", sv); return; }
+    uint8_t b[8];
+    unsigned slot = w32 ? 4 : 8;
+    if (!dbg_read_mem(rt, b, slot)) {
+        if (sv > -1000000000LL && sv < 1000000000LL) snprintf(out, sz, "= %lld, not an address", sv);
+        else snprintf(out, sz, "not an address");
+        return;
+    }
+    uint64_t at = 0;
+    for (unsigned i = 0; i < slot; i++) at |= (uint64_t)b[i] << (8 * i);
+    size_t u;
+    if (rt >= sp - 0x10000 && rt < sp + 0x100000)
+        u = (size_t)snprintf(out, sz, "stack %s%c0x%llx", w32 ? "esp" : "rsp", rt >= sp ? '+' : '-',
+                             (unsigned long long)(rt >= sp ? rt - sp : sp - rt));
+    else if (map_name(dbg_pid(), rt, nb, sizeof nb)) u = (size_t)snprintf(out, sz, "in %.100s", nb);
+    else u = (size_t)snprintf(out, sz, "not in the file");
+    if (u < sz) snprintf(out + u, sz - u, " → 0x%0*llx", w32 ? 8 : 16, (unsigned long long)at);
+}
+
+/* 1 / 2, a click on [esp+4] / [esp+8]: to what the slot points to in the
+ * file (code: its disassembly, data: its row in the dump); elsewhere
+ * (stack, heap, a library) its bytes shown / hidden under it */
+static void value_go(DisView *v, int k, const char *lbl, uint64_t val);
+static void stack_arg_go(DisView *v, int k) {
+    char lbl[16];
+    uint64_t val;
+    if (!dbg_mine(v) || !stack_arg(k, &val, lbl, sizeof lbl)) {
+        stack_arg(k, &val, lbl, sizeof lbl);
+        list_msg(v, COLOR_PAIR_NUMBER, "%s: %s", lbl, dbg_mine(v) && dbg_state() == DBG_STOPPED
+                 ? "not readable" : "only while the program is stopped (F5 / F6 / F7)");
+        return;
+    }
+    value_go(v, k, lbl, val);
+}
+
+/* the registers of the panel: 0-9 rip rsp rbp rax rbx rcx rdx rsi rdi
+ * rflags, 10-17 r8-r15 (64-bit only); their names in the program's mode */
+static const char *reg_name(int i) {
+    static const char *const rn[] = { "rip", "rsp", "rbp", "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rflags",
+                                      "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15" };
+    static const char *const rn32[] = { "eip", "esp", "ebp", "eax", "ebx", "ecx", "edx", "esi", "edi", "eflags" };
+    return dbg_bits() == 32 && i < 10 ? rn32[i] : i >= 0 && i < 18 ? rn[i] : "?";
+}
+
+static uint64_t reg_val(const DbgRegs *r, int i) {
+    uint64_t c[18] = { r->rip, r->rsp, r->rbp, r->rax, r->rbx, r->rcx, r->rdx, r->rsi, r->rdi, r->rflags,
+                       r->r8, r->r9, r->r10, r->r11, r->r12, r->r13, r->r14, r->r15 };
+    uint64_t x = i >= 0 && i < 18 ? c[i] : 0;
+    return dbg_bits() == 32 ? x & 0xffffffffu : x;
+}
+
+/* a click on register i: to what its value points to, as for [esp+4] */
+static void reg_go(DisView *v, int i) {
+    const char *nm = reg_name(i);
+    if (!dbg_mine(v) || dbg_state() != DBG_STOPPED || !g_regs_ok) {
+        list_msg(v, COLOR_PAIR_NUMBER, "%s: only while the program is stopped (F5 / F6 / F7)", nm);
+        return;
+    }
+    if (i == 9) { list_msg(v, COLOR_PAIR_NUMBER, "%s: the flags, not an address", nm); return; }
+    value_go(v, 2 + i, nm, reg_val(&g_regs, i));
+}
+
+/* what a value of the panel points to (slot k: see peek_k): in the file,
+ * its code or data; elsewhere, its bytes shown / hidden under it */
+static void value_go(DisView *v, int k, const char *lbl, uint64_t val) {
+    uint64_t fa;
+    if (dbg_to_file(val, &fa) && (elf_va_code(&v->d.elf, fa) || data_sec_at(v, fa) >= 0)) {
+        v->peek_on = false;
+        follow(v, fa);
+        return;
+    }
+    uint8_t t;
+    if (!dbg_read_mem(val, &t, 1)) {
+        list_msg(v, COLOR_PAIR_NUMBER, "%s = 0x%llx: not an address of the program", lbl, (unsigned long long)val);
+        return;
+    }
+    if (v->peek_on && v->peek_k == k && v->peek_a == val) { v->peek_on = false; return; }
+    v->peek_on = true;
+    v->peek_k = k;
+    v->peek_a = val;
+    if (k < 2)
+        list_msg(v, COLOR_PAIR_STRING, "%s = 0x%llx: not in the file, its bytes are under it in the panel (%d again: hide)",
+                 lbl, (unsigned long long)val, k + 1);
+    else
+        list_msg(v, COLOR_PAIR_STRING, "%s = 0x%llx: not in the file, its bytes are under it in the panel (click again: hide)",
+                 lbl, (unsigned long long)val);
+}
+
 /* Shows the last stop of the debuggee in v, once per stop: the function
  * holding rip on the disassembly screen, its line selected (and brought
  * into view among `rows`), and the reason in the bar. Waits while a
@@ -3325,7 +3486,75 @@ static void draw_console(const DisView *v, WINDOW *win, int y, int y1, int x, in
     if (typing && ix < w) piece(win, y1 - 1, ix, w, COLOR_PAIR(COLOR_PAIR_STRING) | A_REVERSE, " ");
 }
 
-static void draw_regs(const DisView *v, WINDOW *win, int x0, int y0, int y1, int w) {
+/* the bytes at val in the debuggee from (y, x): hex, then the characters,
+ * 4 to 8 a row, two rows, not past its page. Returns the next row. */
+static int draw_peek(WINDOW *win, int y, int y1, int x, int w, uint64_t val) {
+    char line[96];
+    int per = (w - x) / 4;
+    if (per > 8) per = 8;
+    if (per < 4) per = 4;
+    uint8_t b[16];
+    size_t n = (size_t)per * 2, page = 4096 - (size_t)(val & 4095);
+    if (n > page) n = page;
+    if (!dbg_read_mem(val, b, n)) n = 0;
+    for (size_t o = 0; o < n && y < y1; o += (size_t)per) {
+        size_t m = n - o < (size_t)per ? n - o : (size_t)per, q = 0;
+        for (size_t i = 0; i < m; i++) q += (size_t)snprintf(line + q, sizeof line - q, "%02x ", b[o + i]);
+        for (size_t i = m; i < (size_t)per; i++) q += (size_t)snprintf(line + q, sizeof line - q, "   ");
+        for (size_t i = 0; i < m && q + 1 < sizeof line; i++)
+            line[q++] = b[o + i] >= 0x20 && b[o + i] < 0x7f ? (char)b[o + i] : '.';
+        line[q] = '\0';
+        piece(win, y++, x, w, COLOR_PAIR(COLOR_PAIR_COMMENT), line);
+    }
+    return y;
+}
+
+/* al, then [esp+4] and [esp+8] with what they point to (and the bytes
+ * there when peeked, see stack_arg_go); their rows go to v->sarg_y*.
+ * Returns the next row. */
+static int draw_stack_args(DisView *v, WINDOW *win, int x, int y, int y1, int w) {
+    const DbgRegs *r = &g_regs, *p = &g_prev;
+    bool w32 = dbg_bits() == 32;
+    char line[96], note[200];
+    unsigned al = (unsigned)(r->rax & 0xff);
+    int u = snprintf(line, sizeof line, "0x%02x  %u", al, al);
+    if (al > 127) u += snprintf(line + u, sizeof line - (size_t)u, " / %d", (int)(int8_t)al);
+    if (al >= 0x20 && al < 0x7f) snprintf(line + u, sizeof line - (size_t)u, "  '%c'", (char)al);
+    int xx = piece(win, y, x, w, COLOR_PAIR(COLOR_PAIR_TYPE), "al       ");
+    piece(win, y++, xx, w, g_prev_ok && (p->rax & 0xff) != al ? COLOR_PAIR(COLOR_PAIR_KEYWORD) | A_BOLD
+                                                                : COLOR_PAIR(COLOR_PAIR_NORMAL), line);
+    for (int k = 0; k < 2 && y < y1; k++) {
+        char lbl[16];
+        uint64_t val = 0;
+        bool ok = stack_arg(k, &val, lbl, sizeof lbl);
+        snprintf(line, sizeof line, "%-8s ", lbl);
+        xx = piece(win, y, x, w, COLOR_PAIR(COLOR_PAIR_TYPE), line);
+        if (!ok) { piece(win, y++, xx, w, COLOR_PAIR(COLOR_PAIR_COMMENT), "not readable"); continue; }
+        v->sarg_y0[k] = y;
+        bool peek = v->peek_on && v->peek_k == k && v->peek_a == val;
+        snprintf(line, sizeof line, "0x%0*llx", w32 ? 8 : 16, (unsigned long long)val);
+        xx = piece(win, y, xx, w, COLOR_PAIR(COLOR_PAIR_NORMAL) | A_UNDERLINE, line);
+        piece(win, y++, xx, w, COLOR_PAIR(COLOR_PAIR_LINENUM), k ? " 2" : " 1");
+        ptr_note(v, val, note, sizeof note);
+        if (note[0] && y < y1) piece(win, y++, x + 9, w, COLOR_PAIR(COLOR_PAIR_STRING), note);
+        if (peek) y = draw_peek(win, y, y1, x + 9, w, val);
+        v->sarg_y1[k] = y;
+    }
+    return y;
+}
+
+/* under register i when it is peeked (see value_go): what its value
+ * points to, then the bytes there. Returns the next row. */
+static int draw_reg_peek(DisView *v, WINDOW *win, int i, int x, int y, int y1, int w) {
+    uint64_t val = reg_val(&g_regs, i);
+    if (!v->peek_on || v->peek_k != 2 + i || v->peek_a != val) return y;
+    char note[200];
+    ptr_note(v, val, note, sizeof note);
+    if (note[0] && y < y1) piece(win, y++, x, w, COLOR_PAIR(COLOR_PAIR_STRING), note);
+    return draw_peek(win, y, y1, x, w, val);
+}
+
+static void draw_regs(DisView *v, WINDOW *win, int x0, int y0, int y1, int w) {
     wattrset(win, COLOR_PAIR(COLOR_PAIR_INACTIVE_BORDER));
     for (int y = y0; y < y1; y++) mvwaddch(win, y, x0, ACS_VLINE);
     wattrset(win, A_NORMAL);
@@ -3345,19 +3574,19 @@ static void draw_regs(const DisView *v, WINDOW *win, int x0, int y0, int y1, int
     y = put_wrap(win, y, y1 < y + 3 ? y1 : y + 3, x, w, COLOR_PAIR(COLOR_PAIR_COMMENT), st);
     y++;
     if (s == DBG_STOPPED && g_regs_ok) {
-        static const char *const rn[] = { "rip", "rsp", "rbp", "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rflags" };
-        static const char *const rn32[] = { "eip", "esp", "ebp", "eax", "ebx", "ecx", "edx", "esi", "edi", "eflags" };
         bool w32 = dbg_bits() == 32;
         int dig = w32 ? 8 : 16;
         const DbgRegs *r = &g_regs, *p = &g_prev;
-        uint64_t cur[10] = { r->rip, r->rsp, r->rbp, r->rax, r->rbx, r->rcx, r->rdx, r->rsi, r->rdi, r->rflags };
-        uint64_t old[10] = { p->rip, p->rsp, p->rbp, p->rax, p->rbx, p->rcx, p->rdx, p->rsi, p->rdi, p->rflags };
         for (int i = 0; i < 10 && y < y1; i++) {
-            bool chg = g_prev_ok && cur[i] != old[i];
-            snprintf(line, sizeof line, "%-6s ", w32 ? rn32[i] : rn[i]);
+            uint64_t cur = reg_val(r, i);
+            bool chg = g_prev_ok && cur != reg_val(p, i);
+            uint8_t t;
+            attr_t ua = i != 9 && dbg_read_mem(cur, &t, 1) ? A_UNDERLINE : 0;   /* an address: clickable */
+            snprintf(line, sizeof line, "%-6s ", reg_name(i));
             int xx = piece(win, y, x, w, COLOR_PAIR(COLOR_PAIR_TYPE), line);
-            snprintf(line, sizeof line, "0x%0*llx", dig, (unsigned long long)cur[i]);
-            piece(win, y++, xx, w, chg ? COLOR_PAIR(COLOR_PAIR_KEYWORD) | A_BOLD : COLOR_PAIR(COLOR_PAIR_NORMAL), line);
+            snprintf(line, sizeof line, "0x%0*llx", dig, (unsigned long long)cur);
+            v->reg_y[i] = y; v->reg_x0[i] = x0 + 1; v->reg_x1[i] = w;
+            piece(win, y++, xx, w, (chg ? COLOR_PAIR(COLOR_PAIR_KEYWORD) | A_BOLD : COLOR_PAIR(COLOR_PAIR_NORMAL)) | ua, line);
             if (i == 0 && y < y1) {                  /* where rip is */
                 char nb[200], where[120] = "";
                 uint64_t fa;
@@ -3379,6 +3608,7 @@ static void draw_regs(const DisView *v, WINDOW *win, int x0, int y0, int y1, int
                     piece(win, y++, x + 7, w, differs ? COLOR_PAIR(COLOR_PAIR_KEYWORD) | A_BOLD : COLOR_PAIR(COLOR_PAIR_COMMENT), line);
                 }
             }
+            y = draw_reg_peek(v, win, i, x + 7, y, y1, w);
         }
         if (y < y1) {                                /* rflags, decoded */
             static const struct { int bit; const char *n; } fl[] = {
@@ -3391,18 +3621,26 @@ static void draw_regs(const DisView *v, WINDOW *win, int x0, int y0, int y1, int
                     u += (size_t)snprintf(line + u, sizeof line - u, "%s%s", u ? " " : "", fl[k].n);
             piece(win, y++, x + 7, w, COLOR_PAIR(COLOR_PAIR_COMMENT), line);
         }
-        if (!w32 && w - x >= 46 && y1 - y >= 12) {   /* r8-r15, on two columns */
-            static const char *const rx[] = { "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15" };
-            uint64_t c8[8] = { r->r8, r->r9, r->r10, r->r11, r->r12, r->r13, r->r14, r->r15 };
-            uint64_t o8[8] = { p->r8, p->r9, p->r10, p->r11, p->r12, p->r13, p->r14, p->r15 };
-            for (int i = 0; i < 8; i++) {
-                int yy = y + i / 2, cx = x + (i & 1) * 23;
-                snprintf(line, sizeof line, "%-3s ", rx[i]);
-                int xx = piece(win, yy, cx, w, COLOR_PAIR(COLOR_PAIR_TYPE), line);
-                snprintf(line, sizeof line, "0x%016llx", (unsigned long long)c8[i]);
-                piece(win, yy, xx, w, g_prev_ok && c8[i] != o8[i] ? COLOR_PAIR(COLOR_PAIR_KEYWORD) | A_BOLD : COLOR_PAIR(COLOR_PAIR_NORMAL), line);
+        if (y < y1) y = draw_stack_args(v, win, x, y, y1, w);
+        if (!w32 && w - x >= 46 && y1 - y >= 12) {   /* r8-r15, on two columns; a peeked one: under its row */
+            for (int row = 0; row < 4 && y < y1; row++) {
+                int pk = -1;
+                for (int c = 0; c < 2; c++) {
+                    int i = 10 + row * 2 + c, cx = x + c * 23;
+                    uint64_t cur = reg_val(r, i);
+                    uint8_t t;
+                    attr_t ua = dbg_read_mem(cur, &t, 1) ? A_UNDERLINE : 0;
+                    snprintf(line, sizeof line, "%-3s ", reg_name(i));
+                    int xx = piece(win, y, cx, w, COLOR_PAIR(COLOR_PAIR_TYPE), line);
+                    snprintf(line, sizeof line, "0x%016llx", (unsigned long long)cur);
+                    piece(win, y, xx, w, (g_prev_ok && cur != reg_val(p, i) ? COLOR_PAIR(COLOR_PAIR_KEYWORD) | A_BOLD
+                                                                           : COLOR_PAIR(COLOR_PAIR_NORMAL)) | ua, line);
+                    v->reg_y[i] = y; v->reg_x0[i] = c ? cx : x0 + 1; v->reg_x1[i] = c ? w : cx + 23;
+                    if (v->peek_on && v->peek_k == 2 + i) pk = i;
+                }
+                y++;
+                if (pk >= 0) y = draw_reg_peek(v, win, pk, x + 4, y, y1, w);
             }
-            y += 4;
         }
         y++;
     }
@@ -3503,6 +3741,8 @@ static void render_disasm(DisView *v, WINDOW *win, int h, int w) {
     char line[640];
     v->drip_ok = false;
     v->dpanel = 0;
+    v->sarg_y0[0] = v->sarg_y0[1] = 0;               /* draw_stack_args sets them */
+    memset(v->reg_y, 0, sizeof v->reg_y);            /* draw_regs too */
     if (v->dfn < 0 || (size_t)v->dfn >= d->nfn) return;
     const DisFunc *fn = &d->fn[v->dfn];
     v->drip_ok = dbg_mine(v) && dbg_rip(&v->drip, NULL);
@@ -3555,7 +3795,7 @@ static void render_disasm(DisView *v, WINDOW *win, int h, int w) {
                         "↑/↓: choose  ·  Enter/click: go there  ·  1-9: that one  ·  Esc: cancel");
     else if (v->msg[0]) piece(win, h - 1, x, w, COLOR_PAIR(v->msg_pair) | A_BOLD, v->msg);
     else piece(win, h - 1, x, w, COLOR_PAIR(COLOR_PAIR_LINENUM),
-               "b: breakpoint  ·  B: by name, condition  ·  e: on/off  ·  h: hardware  ·  L: list  ·  n: next  ·  a: arguments  ·  F5: run / continue  ·  F6: step this thread (from main)  ·  F7: step over  ·  p: pause  ·  K / Shift-F5: kill  ·  i: console  ·  "
+               "b: breakpoint  ·  B: by name, condition  ·  e: on/off  ·  h: hardware  ·  L: list  ·  n: next  ·  a: arguments  ·  F5: run / continue  ·  F6: step this thread (from main)  ·  F7: step over  ·  p: pause  ·  1 / 2: follow [esp+4] / [esp+8]  ·  K / Shift-F5: kill  ·  i: console  ·  "
                "Enter/click: follow the address  ·  Backspace: back  ·  :: go to address  ·  d: data  ·  "
                "Esc: back to the list  ·  Tab: data  ·  F9: close");
 }
@@ -4067,6 +4307,7 @@ static bool disasm_key(DisView *v, int key, int win_h) {
     if (key == 'n') { dbg_key_bp_next(v); return true; }
     if (key == 'i') { dbg_key_console(v); return true; }
     if (key == 'p') { dbg_key_pause(v); return true; }
+    if (key == '1' || key == '2') { stack_arg_go(v, key - '1'); return true; }
     if (key == 'K' || key == KEY_F(17)) { dbg_key_kill(v); return true; }
     if (key == KEY_F(5) || key == KEY_F(6) || key == KEY_F(7)) { dbg_key_run(v, key, win_h); return true; }
     if (key == '\n' || key == '\r' || key == KEY_ENTER) {    /* follow the address of the line */
@@ -4184,6 +4425,21 @@ bool dis_mouse(DisView *v, int y, int x, unsigned long bstate, int win_h) {
     }
     int hd = v->screen == SCR_DUMP ? dump_hdr(win_h) : 0;
     int y0 = (win_h >= 4 ? 2 : 1) + hd, rows = list_rows(win_h) - hd, r = y - y0;
+    if (v->screen == SCR_DISASM && v->dpanel && x >= v->dpanel) {  /* a register: what its value points to */
+        for (int i = 0; i < 18; i++)
+            if (v->reg_y[i] && y == v->reg_y[i] && x >= v->reg_x0[i] && x < v->reg_x1[i]) {
+                v->msg[0] = '\0';
+                reg_go(v, i);
+                return true;
+            }
+    }
+    if (v->screen == SCR_DISASM && v->dpanel && x >= v->dpanel)    /* [esp+4] / [esp+8]: what they point to */
+        for (int k = 0; k < 2; k++)
+            if (v->sarg_y0[k] && y >= v->sarg_y0[k] && y < v->sarg_y1[k]) {
+                v->msg[0] = '\0';
+                stack_arg_go(v, k);
+                return true;
+            }
     if (v->screen == SCR_INFO || r < 0 || r >= rows) return false;
     if (v->screen == SCR_DISASM && v->dpanel && x >= v->dpanel) {   /* the panel: type into the console */
         v->msg[0] = '\0';

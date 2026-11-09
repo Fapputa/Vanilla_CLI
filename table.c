@@ -2912,6 +2912,54 @@ static void sheet_switch(TableView *tv, int d) {
     tv->col = tv->scroll_col = 0;
 }
 
+/* Mouse at (y, x) of the table window, laid out as tbl_render draws it:
+ * a tab of the top row shows its sheet, a header cell selects its column,
+ * a data cell its row and column. 0: nothing there, 1: moved, 2: the
+ * click was on the current cell already (the caller edits it). */
+int tbl_click(TableView *tv, int y, int x, int win_h, int win_w) {
+    if (!tv || tv->nsheets == 0 || x < 0) return 0;
+    if (y == 0) {                                     /* tabs: format, then one per sheet */
+        char tab[192];
+        snprintf(tab, sizeof tab, " %s ", tv->fmt ? tv->fmt : "Table");
+        int tx = disp_width(tab);
+        for (int i = 0; i < tv->nsheets; i++) {
+            const TblSheet *s = &tv->sheets[i];
+            if (i == tv->cur && s->nview != s->nrows)
+                snprintf(tab, sizeof tab, " %s (%zu/%zu%s) ", s->name, s->nview, s->nrows, s->truncated ? "+" : "");
+            else
+                snprintf(tab, sizeof tab, " %s (%zu%s) ", s->name, s->nrows, s->truncated ? "+" : "");
+            int tw = disp_width(tab);
+            if (x >= tx && x < tx + tw) {
+                if (i == tv->cur) return 2;
+                sheet_switch(tv, i - tv->cur);
+                return 1;
+            }
+            tx += tw;
+        }
+        return 0;
+    }
+    const TblSheet *t = &tv->sheets[tv->cur];
+    if (y != 2 && y < 4) return 0;
+    fit_cols(tv, t, win_w);
+    int gw = gutter_w(t), cx = gw, c = -1;
+    for (int k = tv->scroll_col; k < t->ncols && cx < win_w; k++) {
+        if (x > cx && x <= cx + CW(k) + 2) { c = k; break; }   /* between its two rules */
+        cx += CW(k) + 3;
+    }
+    if (y == 2) {                                     /* the header: the column */
+        if (c < 0) return 0;
+        tv->col = c;
+        return 1;
+    }
+    size_t row = tv->scroll_row + (size_t)(y - 4);
+    if (y - 4 >= data_rows(win_h) || row >= t->nview) return 0;
+    if (c < 0) c = tv->col;                           /* the gutter: the row only */
+    int same = row == tv->row && c == tv->col;
+    tv->row = row;
+    tv->col = c;
+    return same ? 2 : 1;
+}
+
 bool tbl_handle_key(TableView *tv, int key, int win_h) {
     if (!tv || tv->nsheets == 0) return false;
     const TblSheet *t = &tv->sheets[tv->cur];
@@ -3072,14 +3120,6 @@ bool tbl_filter_menu_key(TableView *tv, int key, int win_h) {
         case KEY_NPAGE: m->sel = m->sel + page < m->nidx ? m->sel + page : m->nidx - 1; break;
         case KEY_HOME:  m->sel = 0; break;
         case KEY_END:   m->sel = m->nidx - 1; break;
-        case KEY_MOUSE: {
-            MEVENT ev;
-            if (getmouse(&ev) == OK) {
-                if (ev.bstate & BUTTON4_PRESSED) m->sel = m->sel > 3 ? m->sel - 3 : 0;
-                if (ev.bstate & BUTTON5_PRESSED) m->sel = m->sel + 3 < m->nidx ? m->sel + 3 : m->nidx - 1;
-            }
-            break;
-        }
         case ' ': {
             /* tick / untick; on "(all)", every entry shown at once */
             int e = (m->sel >= 0 && m->sel < m->nidx) ? m->idx[m->sel] : -1;

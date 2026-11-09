@@ -71,7 +71,7 @@ typedef struct {
 
 #define DIS_HIST 64
 enum { SORT_ADDR, SORT_NAME, SORT_SIZE, SORT_CALLERS, SORT_COUNT };
-enum { IN_NONE, IN_FILTER, IN_GOTO, IN_CONSOLE, IN_BREAK };   /* DisView.in_mode */
+enum { IN_NONE, IN_FILTER, IN_GOTO, IN_CONSOLE, IN_BREAK, IN_ARGS };   /* DisView.in_mode */
 
 struct DisView {
     Disasm    d;
@@ -94,7 +94,8 @@ struct DisView {
     int       aw;                  /* hex digits of the address column    */
     char      filter[128];
     int       in_mode;             /* IN_*: a prompt replaces the bar     */
-    char      in_buf[128], in_save[128];
+    char      in_buf[512], in_save[128];
+    char      args[512];           /* a: arguments of F5 / F6 / F7 launches, as typed */
     char      msg[256];            /* shown in the bar until the next key */
     short     msg_pair;
 
@@ -103,6 +104,13 @@ struct DisView {
      * dl[dmain] is a separator (len 0) and the lines of its .cold part
      * follow. dsel / dtop are line indexes. */
     DisLine  *dl;
+    uint64_t *dref;                /* per line: the address its operands hold
+                                      (data or code, followable), 0: none   */
+    /* Enter / click on a line that leads to several places (a call and
+     * the addresses it is given): the choice, drawn over the lines */
+    int       npick, pick_sel, pick_y, pick_x, pick_w;
+    uint64_t  pick_t[8];
+    char      pick_s[8][160];
     size_t    ndl, dmain;
     long      dfn;                 /* -1: nothing opened yet              */
     uint64_t  dva, dlen;
@@ -132,6 +140,13 @@ struct DisView {
     size_t    nxi, xsel, xtop;
     long      xsec;                /* -1: no section opened yet           */
     bool      xtrunc;              /* section cut to DATA_MAX / DATA_MAX_ITEMS */
+    int       xsymw;               /* width of the SYMBOL column of xi, 0: none */
+    /* the data screens are column blocks (as the table view): column 0
+     * stays, the others scroll whole with Left / Right. dscol / xcol: the
+     * first one shown after column 0; *_more: some on the right are hidden
+     * (as drawn last) */
+    int       dscol, xcol;
+    bool      ds_more, x_more;
     int       data_back;
 
     DisHist   hist[DIS_HIST];      /* followed links, last one on top     */
@@ -892,6 +907,47 @@ static void list_goto(DisView *v, const char *text) {
              p == below ? "below," : "above,", d->fn[v->vis[p]].name, (unsigned long long)d->fn[v->vis[p]].addr);
 }
 
+/* The arguments typed after a (DisView.args), split as a shell would without
+ * expanding anything: blanks separate them, '...' keeps everything as is,
+ * "..." and a \ outside quotes keep the next character (\" \\ inside "...").
+ * On Windows a \ is a path separator: it stays as typed, only \" gives a ".
+ * The words go into buf (at least strlen(s) + 1 bytes), av[0 .. n) point
+ * into it, av[n] = NULL. Returns n, or -1 (why in err): quote not closed,
+ * more than max - 1 words. */
+#ifdef _WIN32
+#define BS_LITERAL 1
+#else
+#define BS_LITERAL 0
+#endif
+static int split_args(const char *s, char *buf, char **av, int max, char *err, size_t esz) {
+    int n = 0;
+    char *o = buf;
+    while (*s) {
+        while (*s == ' ' || *s == '\t') s++;
+        if (!*s) break;
+        if (n + 1 >= max) { snprintf(err, esz, "more than %d arguments", max - 1); return -1; }
+        av[n++] = o;
+        char q = 0;
+        for (; *s; s++) {
+            if (q == '\'') { if (*s == '\'') q = 0; else *o++ = *s; continue; }
+            if (q == '"') {
+                if (*s == '"') q = 0;
+                else if (*s == '\\' && (s[1] == '"' || (!BS_LITERAL && s[1] == '\\'))) *o++ = *++s;
+                else *o++ = *s;
+                continue;
+            }
+            if (*s == ' ' || *s == '\t') break;
+            if (*s == '\'' || *s == '"') q = *s;
+            else if (*s == '\\' && (BS_LITERAL ? s[1] == '"' : s[1] != 0)) *o++ = *++s;
+            else *o++ = *s;
+        }
+        if (q) { snprintf(err, esz, "%s quote not closed", q == '"' ? "double" : "single"); return -1; }
+        *o++ = '\0';
+    }
+    av[n] = NULL;
+    return n;
+}
+
 /* an unfinished prompt when the view is hidden: the old filter comes back */
 static void cancel_input(DisView *v) {
     if (v->in_mode == IN_FILTER) {
@@ -935,6 +991,8 @@ static uint64_t func_range(const DisView *v, long f, bool *guess, bool *trunc, b
 
 /* decodes function f into the disassembly screen; false + a message in
  * the list bar when it cannot be read (the old lines are kept) */
+static void line_refs(DisView *v);
+
 static bool disasm_open(DisView *v, long f) {
     if (f < 0) { list_msg(v, COLOR_PAIR_KEYWORD, "no function selected"); return false; }
     if (f == v->dfn && v->dl) { v->screen = SCR_DISASM; return true; }
@@ -974,6 +1032,7 @@ static bool disasm_open(DisView *v, long f) {
     v->dl = dl;
     v->ndl = ndl;
     v->dmain = nmain;
+    line_refs(v);
     v->dfn = f;
     v->dva = fn->addr;
     v->dlen = n;
@@ -1316,7 +1375,7 @@ static bool item_link(const DisView *v, const DataItem *it, uint64_t *t) {
     }
     uint64_t a = it->target;
     if (!a || !elf_map_of(ef, a)) return false;
-    if (elf_va_exec(ef, a)) {                    /* code: in a function found */
+    if (elf_va_code(ef, a)) {                    /* code: in a function found */
         if (da_func_containing(&v->d, a) < 0) return false;
     } else {                                     /* data: in a section shown */
         long si = data_sec_at(v, a);
@@ -1324,6 +1383,447 @@ static bool item_link(const DisView *v, const DataItem *it, uint64_t *t) {
     }
     *t = a;
     return true;
+}
+
+/* ─── Addresses held by the operands of a line ────────────────── */
+
+/* a is something follow() shows: code in a function found, or data in a
+ * section of the list (within what its dump holds) */
+static bool link_ok(const DisView *v, uint64_t a) {
+    if (!a || !elf_map_of(&v->d.elf, a)) return false;
+    if (elf_va_code(&v->d.elf, a)) return da_func_containing(&v->d, a) >= 0;
+    long si = data_sec_at(v, a);
+    return si >= 0 && !v->ds[si].bad && a - v->ds[si].addr < DATA_MAX;
+}
+
+/* No program is mapped in the first 64 KiB (Linux vm.mmap_min_addr,
+ * Windows' null page area): a smaller constant is a size or an offset.
+ * In a position-independent ELF (linked at 0) no constant is taken. */
+#define REF_MIN 0x10000u
+
+static const char *const g_r32[8] = { "eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi" };
+
+static int r32_index(const char *s, size_t n) {
+    for (int r = 0; r < 8; r++) if (n == 3 && !memcmp(s, g_r32[r], 3)) return r;
+    return -1;
+}
+
+/* where a (link_ok) lies: "section+0x10", "function+0x10" */
+static void ref_place(const DisView *v, uint64_t a, char *out, size_t sz) {
+    long f = elf_va_code(&v->d.elf, a) ? da_func_containing(&v->d, a) : -1;
+    long si = f < 0 ? data_sec_at(v, a) : -1;
+    const char *n = f >= 0 ? v->d.fn[f].name : si >= 0 ? v->ds[si].name : NULL;
+    uint64_t b = f >= 0 ? v->d.fn[f].addr : si >= 0 ? v->ds[si].addr : 0;
+    if (!n || !n[0]) { snprintf(out, sz, "0x%llx", (unsigned long long)a); return; }
+    if (a == b) snprintf(out, sz, "%s", n);
+    else snprintf(out, sz, "%s+0x%llx", n, (unsigned long long)(a - b));
+}
+
+/* the x86-32 register written by a get-pc thunk at a (`mov r32, [esp]; ret`), -1: none */
+static int thunk_reg(const ElfFile *ef, uint64_t a) {
+    size_t av = 0;
+    const uint8_t *p = elf_va_ptr(ef, a, &av);
+    if (!p || av < 4 || p[0] != 0x8b || (p[1] & 0xc7) != 0x04 || p[2] != 0x24 || p[3] != 0xc3) return -1;
+    return (p[1] >> 3) & 7;
+}
+
+static bool parse_num(const char *s, size_t n, uint64_t *out) {
+    if (!n) return false;
+    char tmp[24], *end;
+    if (n >= sizeof tmp) return false;
+    memcpy(tmp, s, n); tmp[n] = '\0';
+    bool hex = n > 2 && tmp[0] == '0' && tmp[1] == 'x';
+    if (!hex && (tmp[0] < '0' || tmp[0] > '9')) return false;
+    *out = strtoull(tmp, &end, hex ? 16 : 10);
+    return !*end;
+}
+
+/* The address a memory operand [ ... ] (body s, n bytes) designates, from
+ * its constant and, in 32-bit code, a base register of known value
+ * (val / known): [0x403014], [eax*4 + 0x403004] (the table), [ebx - 0x1fd8]
+ * with ebx = the pc + a constant. rip is line_ref's. cst: a constant
+ * alone may be an address (see ops_ref). false: none. */
+static bool mem_addr(const char *s, size_t n, const uint64_t *val, const bool *known, uint64_t mask, bool cst, uint64_t *t) {
+    uint64_t disp = 0, base = 0;
+    int sign = 1, nbase = 0;
+    bool index = false, other = false;
+    size_t i = 0;
+    while (i < n) {
+        while (i < n && s[i] == ' ') i++;
+        size_t j = i;
+        while (j < n && s[j] != ' ') j++;
+        if (j == i) break;
+        const char *w = s + i;
+        size_t wn = j - i;
+        uint64_t x;
+        if (wn == 1 && (*w == '+' || *w == '-')) sign = *w == '-' ? -1 : 1;
+        else if (parse_num(w, wn, &x)) disp += sign < 0 ? (uint64_t)0 - x : x;
+        else if (memchr(w, '*', wn)) index = true;          /* reg*scale */
+        else {
+            int r = val ? r32_index(w, wn) : -1;
+            if (r >= 0 && known[r]) { base = val[r]; nbase++; }
+            else other = true;                              /* rip, esp, an unknown register */
+        }
+        i = j;
+    }
+    if (other || nbase > 1) return false;
+    if (nbase) { *t = (base + disp) & mask; return true; }
+    if (!cst) return false;                                 /* a constant alone: not an address here */
+    disp &= mask;
+    (void)index;                                            /* [index*scale + table]: the table */
+    if (disp < REF_MIN) return false;
+    *t = disp;
+    return true;
+}
+
+/* The address held by the operands of line l (memory operand first, then
+ * an immediate), when link_ok; 0: none. Branch targets and rip-relative
+ * operands stay line_ref's. */
+static uint64_t ops_ref(const DisView *v, const DisLine *l, const uint64_t *val, const bool *known) {
+    if (l->bad || !l->len) return 0;
+    const char *m = mnem_base(l->mnem);
+    if (m[0] == 'j' || !strncmp(m, "call", 4) || !strncmp(m, "loop", 4)) {
+        if (l->ops[0] == '0' && l->ops[1] == 'x') return 0;   /* direct: line_ref */
+    }
+    uint64_t mask = v->d.elf.bits == 32 ? 0xffffffffu : ~(uint64_t)0, t;
+    const char *o = l->ops;
+    /* an ELF linked at 0 (PIE, shared object: ET_DYN) reaches its data
+     * relative to the pc, its constants are no addresses; a PE image has
+     * its ImageBase, and its absolute addresses are relocated */
+    bool cst = v->d.elf.fmt == ELF_FMT_PE || v->d.elf.type != 3;
+    for (const char *b = strchr(o, '['); b; b = strchr(b + 1, '[')) {
+        const char *e = strchr(b, ']');
+        if (!e) break;
+        if (b > o + 1 && b[-1] == ':') continue;             /* fs:[...] gs:[...]: thread data */
+        if (mem_addr(b + 1, (size_t)(e - b - 1), v->d.elf.bits == 32 ? val : NULL, known, mask, cst, &t) && link_ok(v, t)) return t;
+    }
+    /* immediates: an operand that is a number alone */
+    for (const char *p = o; *p; ) {
+        const char *q = strchr(p, ',');
+        size_t n = q ? (size_t)(q - p) : strlen(p);
+        while (n && *p == ' ') { p++; n--; }
+        while (n && p[n - 1] == ' ') n--;
+        if (cst && parse_num(p, n, &t) && (t &= mask) >= REF_MIN && link_ok(v, t)) return t;
+        if (!q) break;
+        p = q + 1;
+    }
+    return 0;
+}
+
+/* the register an instruction writes as its first operand (32-bit names,
+ * or their 16 / 8-bit parts), -1: none / not a register */
+static int dest_reg(const DisLine *l) {
+    const char *m = mnem_base(l->mnem);
+    if (!strncmp(m, "cmp", 3) || !strcmp(m, "test") || !strncmp(m, "push", 4) || !strncmp(m, "bt", 2) ||
+        m[0] == 'j' || !strncmp(m, "call", 4) || !strncmp(m, "ret", 3)) return -1;
+    static const char *const part[8][3] = {
+        { "ax", "al", "ah" }, { "cx", "cl", "ch" }, { "dx", "dl", "dh" }, { "bx", "bl", "bh" },
+        { "sp", "spl", "" },  { "bp", "bpl", "" },  { "si", "sil", "" }, { "di", "dil", "" } };
+    size_t n = strcspn(l->ops, ", ");
+    int r = r32_index(l->ops, n);
+    if (r >= 0) return r;
+    for (r = 0; r < 8; r++)
+        for (int k = 0; k < 3; k++)
+            if (part[r][k][0] && strlen(part[r][k]) == n && !memcmp(l->ops, part[r][k], n)) return r;
+    return -1;
+}
+
+/* v->dref of the lines just opened. In 32-bit code a few registers are
+ * followed down the lines: the pc from a get-pc thunk (`call thunk`) or
+ * `call $+5; pop r`, then add / sub of a constant, `mov r2, r` and a
+ * spill to / reload from [ebp ± X] (the GOT base of PIC code, used as
+ * [ebx + X@GOTOFF]). Any other write
+ * forgets a register, a call forgets eax ecx edx. The lines are in address
+ * order, not along the jumps: after a ret / jmp (and at the .cold part),
+ * the registers set from the pc and only lost to a restore (pop, mov from
+ * the slot the caller's value was saved to) come back: the epilogue of an
+ * early return does not end the function. */
+static void line_refs(DisView *v) {
+    v->npick = 0;                                    /* a choice among the old lines */
+    free(v->dref);
+    v->dref = v->ndl ? calloc(v->ndl, sizeof *v->dref) : NULL;
+    if (!v->dref) return;
+    const ElfFile *ef = &v->d.elf;
+    bool x32 = ef->bits == 32;
+    uint64_t val[8] = { 0 }, est[8] = { 0 };
+    bool known[8] = { false }, kest[8] = { false };
+    /* registers of known value spilled to [ebp ± X] (gcc -O3 keeps the GOT
+     * base there): the operand text, its value */
+    struct { char at[32]; uint64_t val; } spill[8];
+    int nspill = 0;
+    /* where the caller's value of each register was saved ([esp + X] /
+     * [ebp - X] stored while the register was not known): a reload from
+     * there is an epilogue's restore, from anywhere else a new value */
+    char save[8][32] = { "" };
+    for (size_t i = 0; i < v->ndl; i++) {
+        const DisLine *l = &v->dl[i];
+        if (!l->len) { memcpy(val, est, sizeof val); memcpy(known, kest, sizeof known); continue; }
+        uint64_t t;
+        if (!line_ref(l, &t)) v->dref[i] = ops_ref(v, l, val, known);
+        if (!x32 || l->bad) continue;
+        const char *m = mnem_base(l->mnem);
+        int d = dest_reg(l);
+        uint64_t next = (l->addr + l->len) & 0xffffffffu, x;
+        /* mov dword ptr [ebp ± X], r: a spill (r known) or a save (r not
+         * known yet); any other write there forgets the slot */
+        bool sp_ = !strncmp(l->ops, "dword ptr [esp", 14), bp_ = !strncmp(l->ops, "dword ptr [ebp ", 15);
+        if (sp_ || bp_) {
+            const char *e = strchr(l->ops, ']');
+            size_t an = e ? (size_t)(e - l->ops - 10 + 1) : 0;   /* "[ebp - 0x10]" */
+            int k = 0;
+            while (k < nspill && (strlen(spill[k].at) != an || memcmp(spill[k].at, l->ops + 10, an))) k++;
+            int sr = e && e[1] == ',' && e[2] == ' ' && !strcmp(m, "mov") ? r32_index(e + 3, strlen(e + 3)) : -1;
+            if (k < nspill) spill[k] = spill[--nspill];
+            if (sr >= 0 && an < sizeof spill[0].at) {
+                if (!known[sr]) { memcpy(save[sr], l->ops + 10, an); save[sr][an] = '\0'; }
+                else if (bp_ && nspill < 8) {                /* esp moves with every push */
+                    memcpy(spill[nspill].at, l->ops + 10, an); spill[nspill].at[an] = '\0';
+                    spill[nspill++].val = val[sr];
+                }
+            }
+        }
+        if (!strncmp(m, "call", 4)) {
+            known[0] = known[1] = known[2] = kest[0] = kest[1] = kest[2] = false;
+            int r = line_ref(l, &t) ? thunk_reg(ef, t) : -1;
+            if (r >= 0) { val[r] = next; known[r] = true; }
+            else if (line_ref(l, &t) && t == next && i + 1 < v->ndl && !strcmp(v->dl[i + 1].mnem, "pop")) {
+                int pr = r32_index(v->dl[i + 1].ops, strlen(v->dl[i + 1].ops));
+                if (pr >= 0) { val[pr] = next; known[pr] = true; i++; }   /* the pop is taken here */
+            }
+        } else if (d >= 0 && (!strcmp(m, "add") || !strcmp(m, "sub")) && known[d] && l->ops[3] == ',' &&
+                   r32_index(l->ops, 3) == d && parse_num(l->ops + 5, strlen(l->ops + 5), &x)) {
+            val[d] = (m[0] == 'a' ? val[d] + x : val[d] - x) & 0xffffffffu;
+        } else if (d >= 0 && !strcmp(m, "mov") && strlen(l->ops) == 8 && r32_index(l->ops + 5, 3) >= 0 &&
+                   known[r32_index(l->ops + 5, 3)]) {
+            val[d] = val[r32_index(l->ops + 5, 3)]; known[d] = true;
+        } else if (d >= 0 && !strcmp(m, "mov") && l->ops[3] == ',' && r32_index(l->ops, 3) == d &&
+                   (!strncmp(l->ops + 3, ", dword ptr [ebp ", 17) || !strncmp(l->ops + 3, ", dword ptr [esp", 16))) {
+            const char *at = l->ops + 15;                    /* reload of a spill, of the save? */
+            int k = 0;
+            while (k < nspill && strcmp(spill[k].at, at)) k++;
+            if (k < nspill) { val[d] = spill[k].val; known[d] = true; }
+            else {
+                known[d] = false;
+                if (!save[d][0] || strcmp(save[d], at)) kest[d] = false;   /* not the restore: a new value */
+            }
+        } else if (d >= 0) {
+            known[d] = false;
+            if (strcmp(m, "pop")) kest[d] = false;           /* written for good (pop: the restore) */
+        } else if (!strcmp(m, "xchg") || !strcmp(m, "cpuid") || !strncmp(m, "popa", 4) || !strcmp(m, "cmpxchg8b")) {
+            memset(known, 0, sizeof known); memset(kest, 0, sizeof kest);
+        }
+        if (!strcmp(m, "mul") || !strcmp(m, "div") || !strcmp(m, "imul") || !strcmp(m, "idiv") ||
+            !strcmp(m, "cdq") || !strcmp(m, "rdtsc"))
+            known[0] = known[2] = kest[0] = kest[2] = false;
+        for (int r = 0; r < 8; r++)                          /* from the pc, and still right */
+            if (known[r]) { est[r] = val[r]; kest[r] = true; }
+        if (!strncmp(m, "ret", 3) || !strcmp(m, "jmp")) { memcpy(val, est, sizeof val); memcpy(known, kest, sizeof known); }
+    }
+}
+
+/* ─── Arguments of a call ──────────────────────────────────────── */
+
+/* 0-15 for rax .. r15 and their 32 / 16 / 8-bit parts, -1: not a register */
+static int reg_id(const char *s, size_t n) {
+    static const char *const nm[16][4] = {
+        { "rax", "eax", "ax", "al" },     { "rcx", "ecx", "cx", "cl" },     { "rdx", "edx", "dx", "dl" },
+        { "rbx", "ebx", "bx", "bl" },     { "rsp", "esp", "sp", "spl" },    { "rbp", "ebp", "bp", "bpl" },
+        { "rsi", "esi", "si", "sil" },    { "rdi", "edi", "di", "dil" },    { "r8", "r8d", "r8w", "r8b" },
+        { "r9", "r9d", "r9w", "r9b" },    { "r10", "r10d", "r10w", "r10b" }, { "r11", "r11d", "r11w", "r11b" },
+        { "r12", "r12d", "r12w", "r12b" }, { "r13", "r13d", "r13w", "r13b" }, { "r14", "r14d", "r14w", "r14b" },
+        { "r15", "r15d", "r15w", "r15b" } };
+    for (int r = 0; r < 16; r++)
+        for (int k = 0; k < 4; k++)
+            if (strlen(nm[r][k]) == n && !memcmp(s, nm[r][k], n)) return r;
+    return -1;
+}
+
+/* the address line j puts somewhere (not a branch): rip-relative operand,
+ * the operands' address (dref), a PE32 [abs] */
+static bool line_value(const DisView *v, size_t j, uint64_t *t) {
+    const DisLine *l = &v->dl[j];
+    const char *m = mnem_base(l->mnem);
+    if (l->bad || !l->len || m[0] == 'j' || !strncmp(m, "call", 4) || !strncmp(m, "loop", 4)) return false;
+    if (line_ref(l, t)) return true;
+    if (v->dref && v->dref[j]) { *t = v->dref[j]; return true; }
+    return v->d.elf.fmt == ELF_FMT_PE && v->d.elf.bits == 32 && abs_ref(l, t);
+}
+
+/* the address register r holds at line j: its last write in the 16
+ * lines before (not past a call, ret, jmp) when that is a mov / lea of an
+ * address; false: not known */
+static bool reg_value(const DisView *v, size_t j, int r, uint64_t *t) {
+    for (size_t i = j; i-- > 0 && j - i <= 16; ) {
+        const DisLine *l = &v->dl[i];
+        if (!l->len || l->bad) return false;
+        const char *m = mnem_base(l->mnem);
+        if (!strncmp(m, "call", 4) || !strncmp(m, "ret", 3) || !strcmp(m, "jmp")) return false;
+        if (!strncmp(m, "cmp", 3) || !strcmp(m, "test") || !strncmp(m, "push", 4) || m[0] == 'j') continue;
+        if (reg_id(l->ops, strcspn(l->ops, ", ")) != r) continue;
+        return (!strcmp(m, "mov") || !strcmp(m, "lea") || !strcmp(m, "movabs")) && line_value(v, i, t);
+    }
+    return false;
+}
+
+/* [ebp - X] / [rbp - X] in operand s (a local of the frame): its
+ * brackets, into slot; false: another operand */
+static bool frame_slot(const char *s, char *slot, size_t sz) {
+    const char *b = strchr(s, '['), *e = b ? strchr(b, ']') : NULL;
+    if (!b || !e || (strncmp(b + 1, "ebp ", 4) && strncmp(b + 1, "rbp ", 4)) || (size_t)(e - b + 1) >= sz) return false;
+    memcpy(slot, b, (size_t)(e - b + 1));
+    slot[e - b + 1] = '\0';
+    return true;
+}
+
+/* The address the local `slot` holds at line j: its last store before
+ * j in the function, `mov <size> ptr [ebp - X], <address>` (or from a
+ * register set just before). The lines are taken in address order, past
+ * calls (a callee does not write the caller's locals, unless their
+ * address was taken: a `lea r, [ebp - X]` of it ends the search). */
+static bool slot_value(const DisView *v, size_t j, const char *slot, uint64_t *t) {
+    size_t sl = strlen(slot);
+    for (size_t i = j; i-- > 0 && j - i <= 400; ) {
+        const DisLine *l = &v->dl[i];
+        if (!l->len || l->bad) continue;
+        const char *m = mnem_base(l->mnem);
+        const char *b = strchr(l->ops, '['), *c = strchr(l->ops, ',');
+        bool here = b && !strncmp(b, slot, sl);
+        if (!here) continue;
+        if (!strcmp(m, "lea")) return false;             /* its address goes elsewhere */
+        if (c && b > c) continue;                        /* read, not written */
+        if (strcmp(m, "mov") || !c) return false;        /* add, inc, a pop...: changed */
+        const char *src = c + 1;
+        while (*src == ' ') src++;
+        if (line_value(v, i, t)) return true;
+        int r = reg_id(src, strcspn(src, " ,"));
+        return r >= 0 && reg_value(v, i, r, t);
+    }
+    return false;
+}
+
+#define CALL_ARGS 6
+typedef struct { uint64_t t; bool mem, idx; } CallArg;   /* mem: the value read at t, not t; idx: at t[index] */
+
+/* The arguments of the call on line i that the lines just before it set
+ * to an address: x86-64 registers (rdi rsi rdx rcx r8 r9, Windows: rcx
+ * rdx r8 r9), x86-32 `push` and `mov dword ptr [esp + 4k], X`; a copy
+ * from another register is followed back (`lea eax, [..]` then
+ * `mov [esp], eax`). Up to 16 lines back, not past a call, ret, jmp.
+ * Returns 1 + the last argument found, 0: none. */
+static int call_args(const DisView *v, size_t i, CallArg *arg) {
+    memset(arg, 0, sizeof *arg * CALL_ARGS);
+    const ElfFile *ef = &v->d.elf;
+    bool x32 = ef->bits == 32, done[CALL_ARGS] = { false };
+    int pend[16];                                    /* register -> the argument it holds */
+    for (int r = 0; r < 16; r++) pend[r] = -1;
+    if (!x32) {
+        static const int sysv[6] = { 7, 6, 2, 1, 8, 9 }, win[4] = { 1, 2, 8, 9 };
+        if (ef->fmt == ELF_FMT_PE) for (int k = 0; k < 4; k++) pend[win[k]] = k;
+        else                       for (int k = 0; k < 6; k++) pend[sysv[k]] = k;
+    }
+    int npush = 0, top = 0;
+    for (size_t j = i; j-- > 0 && i - j <= 16; ) {
+        const DisLine *l = &v->dl[j];
+        if (!l->len || l->bad) break;
+        const char *m = mnem_base(l->mnem);
+        if (!strncmp(m, "call", 4) || !strncmp(m, "ret", 3) || !strcmp(m, "jmp")) break;
+        int k = -1;
+        const char *src = NULL;
+        if (x32 && !strcmp(m, "push")) {
+            k = npush++;
+            src = l->ops;
+            if (k < CALL_ARGS && done[k]) k = -1;
+        } else if (x32 && !strcmp(m, "mov") && !strncmp(l->ops, "dword ptr [esp", 14)) {
+            char *p = (char *)l->ops + 14;
+            unsigned long off = 0;
+            if (!strncmp(p, " + ", 3)) off = strtoul(p + 3, &p, 0);
+            if (p[0] == ']' && p[1] == ',' && !(off & 3) && off / 4 < CALL_ARGS && !done[off / 4]) { k = (int)(off / 4); src = p + 2; }
+        } else if (strncmp(m, "cmp", 3) && strcmp(m, "test") && strncmp(m, "push", 4) && strncmp(m, "bt", 2) && m[0] != 'j') {
+            int d = reg_id(l->ops, strcspn(l->ops, ", "));
+            if (d >= 0 && pend[d] >= 0) {            /* the closest write to it */
+                k = pend[d];
+                pend[d] = -1;
+                src = strchr(l->ops, ',');
+                src = src ? src + 1 : "";
+                if (strcmp(m, "mov") && strcmp(m, "lea") && strcmp(m, "movabs")) continue;   /* xor edi, edi...: not an address */
+            }
+        }
+        if (k < 0 || k >= CALL_ARGS) continue;
+        done[k] = true;
+        while (*src == ' ') src++;
+        uint64_t t;
+        if (line_value(v, j, &t)) {
+            arg[k].t = t;
+            arg[k].mem = strchr(src, '[') && strcmp(m, "lea");
+            arg[k].idx = arg[k].mem && strchr(src, '*');
+            if (k + 1 > top) top = k + 1;
+        } else {
+            int r = reg_id(src, strcspn(src, " ,"));
+            char slot[40];
+            if (r >= 0 && r != 4 && r != 5) pend[r] = k;   /* a copy: where that register was set */
+            else if (r < 0 && (!strcmp(m, "mov") || !strcmp(m, "push")) && frame_slot(src, slot, sizeof slot) &&
+                     slot_value(v, j, slot, &t)) {         /* a local: what was stored there */
+                arg[k].t = t;
+                if (k + 1 > top) top = k + 1;
+            }
+        }
+    }
+    return top;
+}
+
+/* what argument a is: a string, &name of data, name of a function, its
+ * place; the value read at t: the name alone, name[…] when indexed */
+static void arg_text(const DisView *v, const CallArg *a, char *out, size_t sz) {
+    char nm[160];
+    if (!a->mem && da_string_at(&v->d, a->t, nm, sizeof nm)) { snprintf(out, sz, "%s", nm); return; }
+    if (!da_name_for(&v->d, a->t, nm, sizeof nm)) ref_place(v, a->t, nm, sizeof nm);
+    snprintf(out, sz, "%s%s%s", !a->mem && !elf_va_code(&v->d.elf, a->t) ? "&" : "", nm, a->idx ? "[…]" : "");
+}
+
+/* "(a, ?, c)": the arguments of the call on line i, "" when none is known */
+static void call_args_text(const DisView *v, size_t i, char *out, size_t sz) {
+    CallArg arg[CALL_ARGS];
+    int n = call_args(v, i, arg);
+    size_t o = 0;
+    out[0] = '\0';
+    for (int k = 0; k < n && o + 2 < sz; k++) {
+        char a[180] = "?";
+        if (arg[k].t) arg_text(v, &arg[k], a, sizeof a);
+        o += (size_t)snprintf(out + o, sz - o, "%s%s", k ? ", " : "(", a);
+    }
+    if (n && o + 1 < sz) snprintf(out + o, sz - o, ")");
+}
+
+/* The places line i leads to, for Enter / a click: the address of the
+ * line (branch target, operand), then for a call each argument that is
+ * an address. t[k] and a label lab[k] for each; returns how many. */
+static int line_targets(const DisView *v, size_t i, uint64_t *t, char (*lab)[160], int max) {
+    if (i >= v->ndl || !v->dl[i].len || max < 1) return 0;
+    const DisLine *l = &v->dl[i];
+    int n = 0;
+    uint64_t a;
+    char nm[160];
+    if (line_ref(l, &a) || (v->dref && (a = v->dref[i])) ||
+        (v->d.elf.fmt == ELF_FMT_PE && v->d.elf.bits == 32 && abs_ref(l, &a))) {
+        if (!da_string_at(&v->d, a, nm, sizeof nm) && !da_name_for(&v->d, a, nm, sizeof nm)) ref_place(v, a, nm, sizeof nm);
+        snprintf(lab[n], sizeof lab[n], "%.110s  ·  %s 0x%llx", nm, elf_va_code(&v->d.elf, a) ? "code" : "data",
+                 (unsigned long long)a);
+        t[n++] = a;
+    }
+    if (strncmp(mnem_base(l->mnem), "call", 4)) return n;
+    CallArg arg[CALL_ARGS];
+    int na = call_args(v, i, arg);
+    for (int k = 0; k < na && n < max; k++) {
+        if (!arg[k].t) continue;
+        bool dup = false;
+        for (int j = 0; j < n; j++) dup |= t[j] == arg[k].t;
+        if (dup) continue;
+        arg_text(v, &arg[k], nm, sizeof nm);
+        snprintf(lab[n], sizeof lab[n], "argument %d: %.100s  ·  %s 0x%llx", k + 1, nm,
+                 elf_va_code(&v->d.elf, arg[k].t) ? "code" : "data", (unsigned long long)arg[k].t);
+        t[n++] = arg[k].t;
+    }
+    return n;
 }
 
 /* opens section si on the dump screen (its rows built once) */
@@ -1345,6 +1845,13 @@ static bool data_open(DisView *v, long si) {
         }
         v->xsec = si;
         v->xsel = v->xtop = 0;
+        v->xsymw = 0;
+        for (size_t i = 0; i < v->nxi; i++) {
+            const ElfSymbol *sy = elf_symbol_at(&v->d.elf, v->xi[i].addr);
+            int n = sy && sy->name ? (int)strlen(sy->name) : 0;
+            if (n > v->xsymw) v->xsymw = n > 32 ? 32 : n;
+        }
+        if (v->xsymw && v->xsymw < 6) v->xsymw = 6;      /* "SYMBOL" */
     }
     v->dssel = (size_t)si;
     v->screen = SCR_DUMP;
@@ -1397,7 +1904,7 @@ static size_t land_top(size_t sel) { return sel > 4 ? sel - 4 : 0; }
 static bool follow(DisView *v, uint64_t a) {
     const Disasm  *d  = &v->d;
     const ElfFile *ef = &d->elf;
-    if (elf_va_exec(ef, a)) {
+    if (elf_va_code(ef, a)) {
         long f = da_func_containing(d, a);
         if (f < 0) {
             list_msg(v, COLOR_PAIR_KEYWORD, "0x%llx: code in no function found", (unsigned long long)a);
@@ -1787,7 +2294,8 @@ static void dbg_show_stop(DisView *v, int rows) {
 }
 
 static void dbg_sync(DisView *v, int rows) {
-    if (!dbg_mine(v) || v->dbg_seen == g_dbg_gen || v->in_mode == IN_FILTER || v->in_mode == IN_GOTO || v->in_mode == IN_BREAK) return;
+    if (!dbg_mine(v) || v->dbg_seen == g_dbg_gen || v->in_mode == IN_FILTER || v->in_mode == IN_GOTO || v->in_mode == IN_BREAK ||
+        v->in_mode == IN_ARGS) return;
     v->dbg_seen = g_dbg_gen;
     dbg_show_stop(v, rows);
     char news[160];                                  /* could not be placed, overwritten: said over the stop */
@@ -2013,7 +2521,7 @@ static const char *bp_where_text(const BpWhere *w, char *out, size_t sz) {
  *   !WHERE                 on / off
  * false + err when nothing was done. *msg: what was done. */
 static bool bp_apply(DisView *v, const char *line, char *msg, size_t msz, char *err, size_t esz) {
-    char buf[128];
+    char buf[sizeof v->in_buf];
     snprintf(buf, sizeof buf, "%s", line);
     char *s = buf;
     while (*s == ' ' || *s == '\t') s++;
@@ -2163,9 +2671,16 @@ static void dbg_key_run(DisView *v, int key, int win_h) {
                 return;
             }
         }
+        char abuf[sizeof v->args], *av[sizeof v->args / 2 + 2];
+        int ac = split_args(v->args, abuf, av + 1, (int)(sizeof av / sizeof *av) - 1, err, sizeof err);
+        if (ac < 0) {
+            list_msg(v, COLOR_PAIR_KEYWORD, "F5: arguments: %s (a: change them)", err);
+            return;
+        }
+        av[0] = v->path;
         g_regs_ok = g_prev_ok = false;
         con_clear();
-        if (!dbg_launch(v->path, NULL, err, sizeof err)) {
+        if (!dbg_launch(v->path, ac ? av : NULL, err, sizeof err)) {
             list_msg(v, COLOR_PAIR_KEYWORD, "F5: %s", err);
             dbg_changed();
             v->dbg_seen = g_dbg_gen;                 /* keep the message */
@@ -2258,7 +2773,9 @@ bool dis_open(DisView **pv, const char *path, char *err, size_t esz) {
         return true;
     }
     bool dbg_reset = false;
+    char args[sizeof old->args] = "";              /* the arguments outlive a rebuild of the file */
     if (same) {                                    /* changed on disk: analysed again */
+        snprintf(args, sizeof args, "%s", old->args);
         if (dbg_mine(old)) {                       /* its debuggee / breakpoints are of the old file */
             dbg_reset = dbg_state() != DBG_NONE || dbg_bp_list(NULL, 0) > 0;
             if (dbg_state() != DBG_NONE) dbg_kill();
@@ -2276,6 +2793,7 @@ bool dis_open(DisView **pv, const char *path, char *err, size_t esz) {
     if (!v) { snprintf(err, esz, "out of memory"); return false; }
     if (!da_analyze(&v->d, path, err, esz)) { free(v); return false; }
     snprintf(v->path, sizeof v->path, "%s", path);
+    snprintf(v->args, sizeof v->args, "%s", args);
     v->mtime = (long long)st.st_mtime;
     v->fsize = (long long)st.st_size;
     v->dfn   = -1;
@@ -2301,6 +2819,7 @@ void dis_free(DisView *v) {
     free(v->ord);
     free(v->vis);
     da_lines_free(v->dl);
+    free(v->dref);
     free(v->ds);
     free(v->xi);
     free(v);
@@ -2341,6 +2860,109 @@ static int piece(WINDOW *win, int y, int x, int w, attr_t a, const char *s) {
     x = put_clip(win, y, x, s, w);
     wattrset(win, A_NORMAL);
     return x;
+}
+
+/* ─── Column blocks (data screens) ─────────────────────────────── */
+
+/* display width of s (UTF-8) */
+static int str_cols(const char *s) {
+    int w = 0;
+    for (size_t n = strlen(s), i = 0; i < n; ) {
+        uint32_t cp;
+        int k = utf8_decode(s + i, n - i, &cp);
+        if (k < 1) k = 1;
+        int cw = utf8_cp_width(cp);
+        w += cw > 0 ? cw : 0;
+        i += (size_t)k;
+    }
+    return w;
+}
+
+/* One row of column blocks, drawn cell by cell (blk_cell, in column
+ * order): column 0 from x 0, then from column `first` on, each one as
+ * "│ text " (cw[c] columns of text); columns 1 .. first-1 are skipped.
+ * The last column gets what remains of the row. A text longer than its
+ * cell ends with "…". */
+typedef struct {
+    WINDOW    *win;
+    int        y, w, n, first, c;
+    const int *cw;
+    int        pos;                /* where the next separator goes        */
+    int        x0, x, lim;         /* the current cell (x0 -1: not shown)  */
+    attr_t     sep;
+    bool      *cut;                /* set when the last column is cut      */
+} Blk;
+
+static void blk_text(Blk *b, attr_t a, const char *s) {
+    if (b->x0 < 0 || b->x >= b->lim || !s || !*s) return;
+    wattrset(b->win, a);
+    if (b->x + str_cols(s) <= b->lim) b->x = put_clip(b->win, b->y, b->x, s, b->lim);
+    else {
+        put_clip(b->win, b->y, b->x, s, b->lim - 1);
+        mvwaddstr(b->win, b->y, b->lim - 1, "…");
+        b->x = b->lim;
+        if (b->cut && b->c == b->n) *b->cut = true;
+    }
+    wattrset(b->win, A_NORMAL);
+}
+
+static void blk_cell(Blk *b, attr_t a, const char *s) {
+    int c = b->c++;
+    b->x0 = -1;
+    if (c >= b->n || (c > 0 && c < b->first)) return;
+    if (c == 0) { b->x0 = b->x = 0; b->lim = b->cw[0] < b->w ? b->cw[0] : b->w; b->pos = b->cw[0]; }
+    else {
+        if (b->pos >= b->w) return;
+        wattrset(b->win, b->sep);
+        mvwaddstr(b->win, b->y, b->pos, "│");
+        wattrset(b->win, A_NORMAL);
+        b->x0 = b->x = b->pos + 2;
+        int end = c == b->n - 1 ? b->w : b->pos + 2 + b->cw[c];
+        b->lim = end < b->w ? end : b->w;
+        b->pos += b->cw[c] + 3;
+    }
+    blk_text(b, a, s);
+}
+
+/* more text in the current cell, from column `pad` of the cell, or `gap`
+ * columns after what is there when it goes past */
+static void blk_more(Blk *b, int pad, int gap, attr_t a, const char *s) {
+    if (b->x0 < 0) return;
+    b->x = b->x0 + pad > b->x + gap ? b->x0 + pad : b->x + gap;
+    blk_text(b, a, s);
+}
+
+/* true: some column after `first` does not show whole in w (the last
+ * one only counts here when it does not start on screen; Blk.cut tells
+ * when its text is cut) */
+static bool blk_more_right(const int *cw, int n, int first, int w) {
+    int pos = cw[0];
+    for (int c = first; c < n; c++) {
+        if (c == n - 1) return pos + 2 >= w;
+        if (pos + cw[c] + 3 > w) return true;
+        pos += cw[c] + 3;
+    }
+    return false;
+}
+
+/* the header row of column blocks: the names, « / » when columns are
+ * hidden on the left / right (not ◀ ▶: emoji, two cells wide in some
+ * consoles, Wine's among them) */
+static void blk_header(WINDOW *win, int y, int w, const int *cw, const char *const *name, int n, int first,
+                       bool more) {
+    Blk b = { win, y, w, n, first, 0, cw, 0, 0, 0, 0, COLOR_PAIR(COLOR_PAIR_INACTIVE_BORDER) | A_DIM, NULL };
+    for (int c = 0; c < n; c++) blk_cell(&b, COLOR_PAIR(COLOR_PAIR_COMMENT) | A_BOLD, name[c]);
+    wattrset(win, COLOR_PAIR(COLOR_PAIR_KEYWORD) | A_BOLD);
+    if (first > 1 && cw[0] < w) mvwaddstr(win, y, cw[0], "«");
+    if (more && w > 1) mvwaddstr(win, y, w - 1, "»");
+    wattrset(win, A_NORMAL);
+}
+
+/* Left / Right on a screen of column blocks; false: another key */
+static bool blk_key(int key, int *first, int n, bool more) {
+    if (key == KEY_LEFT)  { if (*first > 1) (*first)--; return true; }
+    if (key == KEY_RIGHT) { if (more && *first < n - 1) (*first)++; return true; }
+    return false;
 }
 
 static attr_t origin_attr(int kind) {
@@ -2384,10 +3006,11 @@ static void draw_fn_row(const DisView *v, WINDOW *win, int y, int w, uint32_t fi
 
 /* the prompt replaces the bottom bar while a filter / address is typed */
 static void draw_prompt(const DisView *v, WINDOW *win, int y, int w) {
-    bool flt = v->in_mode == IN_FILTER, con = v->in_mode == IN_CONSOLE, brk = v->in_mode == IN_BREAK;
+    bool flt = v->in_mode == IN_FILTER, con = v->in_mode == IN_CONSOLE, brk = v->in_mode == IN_BREAK, arg = v->in_mode == IN_ARGS;
     attr_t st = COLOR_PAIR(COLOR_PAIR_STATUS);
     bar(win, y, w, COLOR_PAIR_STATUS, 0, "");
-    int x = piece(win, y, 0, w, st | A_BOLD, con ? " Console (stdin): " : flt ? " Filter (name): " : brk ? " Breakpoint: " : " Go to address (hex): ");
+    int x = piece(win, y, 0, w, st | A_BOLD, con ? " Console (stdin): " : flt ? " Filter (name): " : brk ? " Breakpoint: "
+                                           : arg ? " Arguments: " : " Go to address (hex): ");
     int room = w - x - 1;                                   /* one cell for the cursor */
     size_t n = strlen(v->in_buf);
     const char *s = v->in_buf;                              /* ASCII only: bytes = cells */
@@ -2400,6 +3023,8 @@ static void draw_prompt(const DisView *v, WINDOW *win, int y, int w) {
                                           : "   Enter: send the line  ·  ^D: end of input  ·  ^C: interrupt  ·  "
                                             "F5 F6 F7: run  ·  Shift-F5: kill  ·  ↑↓ PgUp PgDn: move  ·  Esc: leave")
                           : brk ? "   main, 0x1149, main+0x10, libc.so.6+0x2a1c0, . (this line)  [hw]  [if rax == 3 | hits >= 2]  ·  -x removes, -* all  ·  !x on/off  ·  Esc: cancel"
+                          : arg ? (v->msg[0] ? v->msg : "   Enter: keep for the next F5 F6 F7 launches  ·  \"a b\" 'c d': one argument  ·  "
+                                                        "empty: none  ·  Esc: cancel  ·  ^U: clear")
                           : flt ? "   Enter: keep  ·  Esc: cancel  ·  ^U: clear  ·  ↑↓: move"
                                 : "   Enter: go  ·  Esc: cancel  ·  ^U: clear");
 }
@@ -2546,6 +3171,7 @@ static void draw_dl_row(const DisView *v, WINDOW *win, int y, int w, size_t i, b
      * of the data pointed to); otherwise the name of the target */
     uint64_t t;
     u = 0;
+    bool named = false;                         /* cmt ends with the name of the call's target */
     char dec[96];
     if (num_note(v, l, dec, sizeof dec)) u += (size_t)snprintf(cmt + u, sizeof cmt - u, "; %s", dec);
     if (ai >= 0 && d->ins[ai].target && !(d->ins[ai].flags & (DI_CALL | DI_JUMP | DI_COND))) {
@@ -2553,9 +3179,21 @@ static void draw_dl_row(const DisView *v, WINDOW *win, int y, int w, size_t i, b
         nm[0] = '\0';
         da_format(d, (size_t)ai, m2, sizeof m2, o2, sizeof o2, nm, sizeof nm);
         if (nm[0]) u += (size_t)snprintf(cmt + u, sizeof cmt - u, "%s%s", u ? "  " : "; ", nm);
+    } else if (!line_ref(l, &t) && v->dref && (t = v->dref[i])) {   /* an address in the operands */
+        nm[0] = '\0';
+        if (!da_string_at(d, t, nm, sizeof nm) && !da_name_for(d, t, nm, sizeof nm)) ref_place(v, t, nm, sizeof nm);
+        if (nm[0]) u += (size_t)snprintf(cmt + u, sizeof cmt - u, "%s%s", u ? "  " : "; ", nm);
     } else if ((line_ref(l, &t) || (d->elf.fmt == ELF_FMT_PE && d->elf.bits == 32 && abs_ref(l, &t))) &&
-               da_name_for(d, t, nm, sizeof nm))
+               da_name_for(d, t, nm, sizeof nm)) {
         u += (size_t)snprintf(cmt + u, sizeof cmt - u, "%s%s", u ? "  " : "; ", nm);
+        named = true;
+    }
+    if (!strncmp(mnem_base(l->mnem), "call", 4) && u < sizeof cmt) {   /* what it is given: printf("%d\n", ?) */
+        char args[300];
+        call_args_text(v, i, args, sizeof args);
+        if (args[0] && u < sizeof cmt)
+            u += (size_t)snprintf(cmt + u, sizeof cmt - u, "%s%s", named ? "" : u ? "  ?" : "; ?", args);
+    }
     if (u >= sizeof cmt) u = sizeof cmt - 1;
     long fs = i ? da_func_at(d, l->addr) : -1;
     if (fs >= 0 && u < sizeof cmt)
@@ -2823,6 +3461,42 @@ static void draw_bps(const DisView *v, WINDOW *win, int x0, int y0, int y1, int 
 
 /* title bar, function header (h >= 4), lines, bottom bar (h >= 3); the
  * register panel on the right while the debuggee of this file lives */
+/* The choice of Enter (v->pick_*): a box under the line of the selection
+ * (above it when there is no room), rows y0 .. y1 of the lines */
+static void draw_pick(DisView *v, WINDOW *win, int row, int y0, int y1, int w) {
+    int n = v->npick, lw = 0;
+    char e[8][180];
+    for (int k = 0; k < n; k++) {
+        snprintf(e[k], sizeof e[k], " %d  %s ", k + 1, v->pick_s[k]);
+        int c = str_cols(e[k]);
+        if (c > lw) lw = c;
+    }
+    int bw = lw + 2, x = 8;
+    if (bw > w - 2) bw = w - 2;
+    if (x + bw > w) x = w - bw > 0 ? w - bw : 0;
+    if (bw < 8) { v->npick = 0; return; }
+    int y = row + 1;                                 /* the box: n rows + its two borders */
+    if (y + n + 2 > y1) y = row - n - 2;
+    if (y < y0 - 1) y = y0 - 1;
+    attr_t box = COLOR_PAIR(COLOR_PAIR_KEYWORD) | A_BOLD, hs = COLOR_PAIR(COLOR_PAIR_SELECTION) | A_BOLD;
+    wattrset(win, box);
+    mvwaddch(win, y, x, ACS_ULCORNER); mvwhline(win, y, x + 1, ACS_HLINE, bw - 2); mvwaddch(win, y, x + bw - 1, ACS_URCORNER);
+    mvwaddstr(win, y, x + 2, " go to ");
+    for (int k = 0; k < n; k++) {
+        int ry = y + 1 + k;
+        wattrset(win, box);
+        mvwaddch(win, ry, x, ACS_VLINE); mvwaddch(win, ry, x + bw - 1, ACS_VLINE);
+        wattrset(win, k == v->pick_sel ? hs : COLOR_PAIR(COLOR_PAIR_NORMAL));
+        mvwhline(win, ry, x + 1, ' ', bw - 2);
+        put_clip(win, ry, x + 1, e[k], x + bw - 1);
+    }
+    wattrset(win, box);
+    mvwaddch(win, y + n + 1, x, ACS_LLCORNER); mvwhline(win, y + n + 1, x + 1, ACS_HLINE, bw - 2);
+    mvwaddch(win, y + n + 1, x + bw - 1, ACS_LRCORNER);
+    wattrset(win, A_NORMAL);
+    v->pick_y = y + 1; v->pick_x = x + 1; v->pick_w = bw - 2;
+}
+
 static void render_disasm(DisView *v, WINDOW *win, int h, int w) {
     const Disasm *d = &v->d;
     int rows = list_rows(h), y0 = h >= 4 ? 2 : 1;
@@ -2867,6 +3541,7 @@ static void render_disasm(DisView *v, WINDOW *win, int h, int w) {
         if (v->bp_panel) draw_bps(v, win, v->dpanel, 1, h - 1, full);
         else draw_regs(v, win, v->dpanel, 1, h - 1, full);
     }
+    if (v->npick) draw_pick(v, win, y0 + (int)(v->dsel - v->dtop), y0, y0 + rows, full);
     w = full;
 
     if (h < 3) return;
@@ -2876,9 +3551,11 @@ static void render_disasm(DisView *v, WINDOW *win, int h, int w) {
     snprintf(line, sizeof line, " %zu/%zu%s  ·  ", v->ndl ? v->dsel + 1 : 0, v->ndl, off);
     bar(win, h - 1, w, COLOR_PAIR_LINENUM, 0, "");
     int x = piece(win, h - 1, 0, w, COLOR_PAIR(COLOR_PAIR_LINENUM), line);
-    if (v->msg[0]) piece(win, h - 1, x, w, COLOR_PAIR(v->msg_pair) | A_BOLD, v->msg);
+    if (v->npick) piece(win, h - 1, x, w, COLOR_PAIR(COLOR_PAIR_LINENUM),
+                        "↑/↓: choose  ·  Enter/click: go there  ·  1-9: that one  ·  Esc: cancel");
+    else if (v->msg[0]) piece(win, h - 1, x, w, COLOR_PAIR(v->msg_pair) | A_BOLD, v->msg);
     else piece(win, h - 1, x, w, COLOR_PAIR(COLOR_PAIR_LINENUM),
-               "b: breakpoint  ·  B: by name, condition  ·  e: on/off  ·  h: hardware  ·  L: list  ·  n: next  ·  F5: run / continue  ·  F6: step this thread (from main)  ·  F7: step over  ·  p: pause  ·  K / Shift-F5: kill  ·  i: console  ·  "
+               "b: breakpoint  ·  B: by name, condition  ·  e: on/off  ·  h: hardware  ·  L: list  ·  n: next  ·  a: arguments  ·  F5: run / continue  ·  F6: step this thread (from main)  ·  F7: step over  ·  p: pause  ·  K / Shift-F5: kill  ·  i: console  ·  "
                "Enter/click: follow the address  ·  Backspace: back  ·  :: go to address  ·  d: data  ·  "
                "Esc: back to the list  ·  Tab: data  ·  F9: close");
 }
@@ -2896,44 +3573,55 @@ static void draw_bottom(const DisView *v, WINDOW *win, int h, int w, const char 
     else           piece(win, h - 1, x, w, COLOR_PAIR(COLOR_PAIR_LINENUM), keys);
 }
 
-static void draw_ds_row(const DisView *v, WINDOW *win, int y, int w, size_t i, bool sel) {
+/* the columns of the section list: SECTION (stays), ADDRESS, SIZE, RWX, TYPE, CONTENTS */
+enum { DS_COLS = 6 };
+
+static void draw_ds_row(const DisView *v, WINDOW *win, int y, int w, size_t i, bool sel, const int *cw, bool *cut) {
     const DataSec *s = &v->ds[i];
     attr_t hs = COLOR_PAIR(COLOR_PAIR_SELECTION) | A_BOLD;
     if (sel) { wattrset(win, hs); mvwhline(win, y, 0, ' ', w); wattrset(win, A_NORMAL); }
-    char a[24], sz[24], hsz[16];
+    char a[24], sz[24], hsz[16], nm[72];
     snprintf(a, sizeof a, "0x%0*llx", v->aw, (unsigned long long)s->addr);
     human_size(s->size, hsz, sizeof hsz);
     snprintf(sz, sizeof sz, "%10s", hsz);
-    char nm[72], ty[16];
-    snprintf(nm, sizeof nm, "   %-20.60s ", s->name);
-    snprintf(ty, sizeof ty, "%-10.10s", s->type ? s->type : "?");
-    int x = piece(win, y, 0, w, sel ? hs : COLOR_PAIR(COLOR_PAIR_KEYWORD) | A_BOLD, nm);
-    x = piece(win, y, x, w, sel ? hs : COLOR_PAIR(COLOR_PAIR_LINENUM), a) + 2;
-    x = piece(win, y, x, w, sel ? hs : COLOR_PAIR(COLOR_PAIR_NORMAL), sz) + 2;
-    x = piece(win, y, x, w, sel ? hs : COLOR_PAIR(s->perm[1] == 'w' ? COLOR_PAIR_STRING : COLOR_PAIR_NORMAL), s->perm) + 2;
-    x = piece(win, y, x, w, sel ? hs : COLOR_PAIR(COLOR_PAIR_COMMENT), ty) + 2;
+    snprintf(nm, sizeof nm, "   %.60s", s->name);
+    Blk b = { win, y, w, DS_COLS, v->dscol, 0, cw, 0, 0, 0, 0,
+              sel ? hs : COLOR_PAIR(COLOR_PAIR_INACTIVE_BORDER) | A_DIM, cut };
+    blk_cell(&b, sel ? hs : COLOR_PAIR(COLOR_PAIR_KEYWORD) | A_BOLD, nm);
+    blk_cell(&b, sel ? hs : COLOR_PAIR(COLOR_PAIR_LINENUM), a);
+    blk_cell(&b, sel ? hs : COLOR_PAIR(COLOR_PAIR_NORMAL), sz);
+    blk_cell(&b, sel ? hs : COLOR_PAIR(s->perm[1] == 'w' ? COLOR_PAIR_STRING : COLOR_PAIR_NORMAL), s->perm);
+    blk_cell(&b, sel ? hs : COLOR_PAIR(COLOR_PAIR_COMMENT), s->type ? s->type : "?");
     const char *desc = s->bad ? "its bytes lie outside the file" : s->desc;
-    piece(win, y, x, w, sel ? hs : COLOR_PAIR(s->bad ? COLOR_PAIR_NUMBER : COLOR_PAIR_COMMENT), desc);
+    blk_cell(&b, sel ? hs : COLOR_PAIR(s->bad ? COLOR_PAIR_NUMBER : COLOR_PAIR_COMMENT), desc);
 }
 
 static void render_data(DisView *v, WINDOW *win, int h, int w) {
     int rows = list_rows(h), y0 = h >= 4 ? 2 : 1;
-    char line[512];
-    if (h >= 4) {
-        snprintf(line, sizeof line, "   %-20s %-*s  %10s  %-3s  %-10s  %s", "SECTION", v->aw + 2, "ADDRESS", "SIZE",
-                 "RWX", "TYPE", "CONTENTS");
-        piece(win, 1, 0, w, COLOR_PAIR(COLOR_PAIR_COMMENT) | A_BOLD, line);
+    int nw = 7;                                       /* "SECTION" */
+    for (size_t i = 0; i < v->nds; i++) {
+        int n = str_cols(v->ds[i].name);
+        if (n > nw) nw = n > 24 ? 24 : n;
     }
+    const int cw[DS_COLS] = { 4 + nw, v->aw + 2, 10, 3, 10, 0 };
+    static const char *const name[DS_COLS] = { "   SECTION", "ADDRESS", "      SIZE", "RWX", "TYPE", "CONTENTS" };
+    if (v->dscol < 1) v->dscol = 1;
+    bool cut = false;
     keep_in_view(&v->dssel, &v->dstop, v->nds, rows);
     for (int r = 0; r < rows && v->dstop + (size_t)r < v->nds; r++)
-        draw_ds_row(v, win, y0 + r, w, v->dstop + (size_t)r, v->dstop + (size_t)r == v->dssel);
+        draw_ds_row(v, win, y0 + r, w, v->dstop + (size_t)r, v->dstop + (size_t)r == v->dssel, cw, &cut);
+    v->ds_more = blk_more_right(cw, DS_COLS, v->dscol, w) || (cut && v->dscol < DS_COLS - 1);
+    if (h >= 4) blk_header(win, 1, w, cw, name, DS_COLS, v->dscol, v->ds_more);
     if (rows > 0 && !v->nds)
         piece(win, y0, 0, w, COLOR_PAIR(COLOR_PAIR_COMMENT),
               v->ds || !v->d.elf.nsec ? "   No data section in this file" : "   Section list unavailable (out of memory)");
     char pos[64];
     snprintf(pos, sizeof pos, " %zu/%zu  ·  ", v->nds ? v->dssel + 1 : 0, v->nds);
-    draw_bottom(v, win, h, w, pos, "Enter/click: contents  ·  :: go to address  ·  Backspace: back  ·  "
-                                   "d/Esc: leave  ·  Tab: info  ·  F9: close");
+    bool cols = v->dscol > 1 || v->ds_more;
+    draw_bottom(v, win, h, w, pos, cols ? "Enter/click: contents  ·  ←/→: columns  ·  :: go to address  ·  Backspace: back  ·  "
+                                          "d/Esc: leave  ·  Tab: info  ·  F9: close"
+                                        : "Enter/click: contents  ·  :: go to address  ·  Backspace: back  ·  "
+                                          "d/Esc: leave  ·  Tab: info  ·  F9: close");
 }
 
 /* s[0 .. n) as a quoted C string, escaped, cut to the room in out */
@@ -2974,7 +3662,7 @@ static void ptr_text(const DisView *v, uint64_t slot, uint64_t t, char *out, siz
         else         snprintf(out, sz, "%s  (import, filled by the loader)", im->name);
         return;
     }
-    if (elf_va_exec(ef, t)) {
+    if (elf_va_code(ef, t)) {
         snprintf(out, sz, "→ 0x%llx  %s", (unsigned long long)t, da_name_for(d, t, nb, sizeof nb) ? nb : "(code)");
         return;
     }
@@ -3035,20 +3723,34 @@ static void data_dec(const DisView *v, const DataItem *it, const uint8_t *p, siz
     }
 }
 
+/* The columns of a section's rows: ADDRESS (with the link mark, stays),
+ * SYMBOL (when one of the rows starts a symbol), BYTES, VALUE (ASCII,
+ * string, target; the decimal value of a hex row after its ASCII). */
+static int dump_cols(const DisView *v, int *cw, const char **name) {
+    int n = 0;
+    cw[n] = 3 + v->aw + 3;    name[n++] = "   ADDRESS";
+    if (v->xsymw) { cw[n] = v->xsymw; name[n++] = "SYMBOL"; }
+    cw[n] = (int)DATA_HEX * 3;     name[n++] = "BYTES";
+    cw[n] = 0;                name[n++] = "VALUE";
+    return n;
+}
+
+/* the dump shows the names of its columns under its title */
+static int dump_hdr(int h) { return h >= 5; }
+
 /* one row of a section: link mark, address, symbol starting there,
- * bytes (hex, w >= 80), then the text (ASCII, string, target) */
-static void draw_x_row(const DisView *v, WINDOW *win, int y, int w, size_t i, bool sel) {
+ * bytes, then the text (ASCII, string, target) */
+static void draw_x_row(const DisView *v, WINDOW *win, int y, int w, size_t i, bool sel, const int *cw, int ncol,
+                       bool *cut) {
     const ElfFile *ef = &v->d.elf;
     const DataItem *it = &v->xi[i];
     attr_t hs = COLOR_PAIR(COLOR_PAIR_SELECTION) | A_BOLD;
     if (sel) { wattrset(win, hs); mvwhline(win, y, 0, ' ', w); wattrset(win, A_NORMAL); }
     uint64_t t;
     bool link = item_link(v, it, &t);
-    char a[24], lab[40] = "", hex[DATA_HEX * 3 + 8] = "", txt[400] = "", dec[128] = "";
+    char a[24], hex[DATA_HEX * 3 + 8] = "", txt[400] = "", dec[128] = "";
     snprintf(a, sizeof a, "0x%0*llx", v->aw, (unsigned long long)it->addr);
-    int lw = w >= 130 ? 28 : w >= 100 ? 18 : 0;
-    const ElfSymbol *sy = lw ? elf_symbol_at(ef, it->addr) : NULL;
-    if (lw) snprintf(lab, sizeof lab, "%-*.*s", lw, lw, sy && sy->name ? sy->name : "");
+    const ElfSymbol *sy = v->xsymw ? elf_symbol_at(ef, it->addr) : NULL;
     size_t avail = 0;
     const uint8_t *p = it->kind == DT_ZERO && it->addr >= v->ds[v->xsec].addr + v->ds[v->xsec].filesz
                      ? NULL : elf_va_ptr(ef, it->addr, &avail);
@@ -3056,7 +3758,8 @@ static void draw_x_row(const DisView *v, WINDOW *win, int y, int w, size_t i, bo
     size_t u = 0, show = nb < DATA_HEX ? nb : DATA_HEX;
     if (it->kind == DT_ZERO) show = 0;
     for (size_t k = 0; k < show; k++) u += (size_t)snprintf(hex + u, sizeof hex - u, "%02x ", p[k]);
-    if (it->kind == DT_STR && nb > DATA_HEX && u >= 3) { hex[u - 1] = '\0'; snprintf(hex + u - 1, sizeof hex - u + 1, "…"); }
+    if (u) hex[u - 1] = '\0';
+    if (it->kind == DT_STR && nb > DATA_HEX && u >= 3) snprintf(hex + u - 1, sizeof hex - u + 1, "…");
     attr_t ta = COLOR_PAIR(COLOR_PAIR_NORMAL);
     switch (it->kind) {
         case DT_STR: {
@@ -3084,24 +3787,18 @@ static void draw_x_row(const DisView *v, WINDOW *win, int y, int w, size_t i, bo
             break;
         }
     }
-    int x = piece(win, y, 0, w, sel ? hs : COLOR_PAIR(COLOR_PAIR_KEYWORD) | A_BOLD, link ? " → " : "   ");
-    x = piece(win, y, x, w, sel ? hs : COLOR_PAIR(COLOR_PAIR_LINENUM), a) + 2;
-    if (lw) x = piece(win, y, x, w, sel ? hs : COLOR_PAIR(COLOR_PAIR_KEYWORD), lab) + 1;
-    if (w >= 80) {
-        int bx = x;
-        piece(win, y, x, w, sel ? hs : COLOR_PAIR(COLOR_PAIR_COMMENT), hex);
-        x = bx + (int)DATA_HEX * 3 + 1;
-    }
-    int tx = x;
-    x = piece(win, y, x, w, sel ? hs : ta, txt);
-    if (dec[0]) {                                /* "; 456": after the ASCII column */
-        x = tx + (int)DATA_HEX + 2 > x ? tx + (int)DATA_HEX + 2 : x + 2;
-        piece(win, y, x, w, sel ? hs : COLOR_PAIR(COLOR_PAIR_NUMBER), dec);
-    }
+    Blk b = { win, y, w, ncol, v->xcol, 0, cw, 0, 0, 0, 0,
+              sel ? hs : COLOR_PAIR(COLOR_PAIR_INACTIVE_BORDER) | A_DIM, cut };
+    blk_cell(&b, sel ? hs : COLOR_PAIR(COLOR_PAIR_KEYWORD) | A_BOLD, link ? " → " : "   ");
+    blk_more(&b, 3, 0, sel ? hs : COLOR_PAIR(COLOR_PAIR_LINENUM), a);
+    if (v->xsymw) blk_cell(&b, sel ? hs : COLOR_PAIR(COLOR_PAIR_KEYWORD), sy && sy->name ? sy->name : "");
+    blk_cell(&b, sel ? hs : COLOR_PAIR(COLOR_PAIR_COMMENT), hex);
+    blk_cell(&b, sel ? hs : ta, txt);
+    if (dec[0]) blk_more(&b, (int)DATA_HEX + 2, 2, sel ? hs : COLOR_PAIR(COLOR_PAIR_NUMBER), dec);   /* "; 456" */
 }
 
 static void render_dump(DisView *v, WINDOW *win, int h, int w) {
-    int rows = list_rows(h), y0 = h >= 4 ? 2 : 1;
+    int hd = dump_hdr(h), rows = list_rows(h) - hd, y0 = (h >= 4 ? 2 : 1) + hd;
     if (v->xsec < 0 || (size_t)v->xsec >= v->nds) return;
     const DataSec *s = &v->ds[v->xsec];
     char line[512], hsz[16];
@@ -3112,13 +3809,24 @@ static void render_dump(DisView *v, WINDOW *win, int h, int w) {
                  v->nxi, v->xtrunc ? "  ·  cut (too big)" : "", s->desc[0] ? "  ·  " : "", s->desc);
         piece(win, 1, 0, w, COLOR_PAIR(COLOR_PAIR_KEYWORD) | A_BOLD, line);
     }
+    int cw[4];
+    const char *name[4];
+    int n = dump_cols(v, cw, name);
+    if (v->xcol < 1) v->xcol = 1;
+    if (v->xcol > n - 1) v->xcol = n - 1;                 /* another section, no SYMBOL column */
+    bool cut = false;
     keep_in_view(&v->xsel, &v->xtop, v->nxi, rows);
     for (int r = 0; r < rows && v->xtop + (size_t)r < v->nxi; r++)
-        draw_x_row(v, win, y0 + r, w, v->xtop + (size_t)r, v->xtop + (size_t)r == v->xsel);
+        draw_x_row(v, win, y0 + r, w, v->xtop + (size_t)r, v->xtop + (size_t)r == v->xsel, cw, n, &cut);
+    v->x_more = blk_more_right(cw, n, v->xcol, w) || (cut && v->xcol < n - 1);
+    if (hd) blk_header(win, 2, w, cw, name, n, v->xcol, v->x_more);
     char pos[64];
     snprintf(pos, sizeof pos, " %zu/%zu  ·  ", v->nxi ? v->xsel + 1 : 0, v->nxi);
-    draw_bottom(v, win, h, w, pos, "→ Enter/click: follow  ·  :: go to address  ·  Backspace: back  ·  "
-                                   "Esc: sections  ·  d: leave  ·  F9: close");
+    bool cols = v->xcol > 1 || v->x_more;
+    draw_bottom(v, win, h, w, pos, cols ? "→ Enter/click: follow  ·  ←/→: columns  ·  :: go to address  ·  Backspace: back  ·  "
+                                          "Esc: sections  ·  d: leave  ·  F9: close"
+                                        : "→ Enter/click: follow  ·  :: go to address  ·  Backspace: back  ·  "
+                                          "Esc: sections  ·  d: leave  ·  F9: close");
 }
 
 void dis_render(DisView *v, WINDOW *win, int h, int w) {
@@ -3239,13 +3947,26 @@ static bool console_key(DisView *v, int key, int win_h) {
 
 static bool input_key(DisView *v, int key, int win_h) {
     if (v->in_mode == IN_CONSOLE) return console_key(v, key, win_h);
+    if (v->in_mode == IN_ARGS) v->msg[0] = '\0';     /* the error of the last Enter */
     size_t n = strlen(v->in_buf);
     switch (key) {
         case 27:
             cancel_input(v);
             return true;
         case '\n': case '\r': case KEY_ENTER:
-            if (v->in_mode == IN_BREAK) {
+            if (v->in_mode == IN_ARGS) {
+                char abuf[sizeof v->args], *av[sizeof v->args / 2 + 2], e[120];
+                int ac = split_args(v->in_buf, abuf, av, (int)(sizeof av / sizeof *av) - 1, e, sizeof e);
+                if (ac < 0) {                        /* the prompt stays, to fix it */
+                    snprintf(v->msg, sizeof v->msg, "   %s: fix it, or Esc to keep the old arguments", e);
+                    return true;
+                }
+                v->in_mode = IN_NONE;
+                snprintf(v->args, sizeof v->args, "%s", v->in_buf);
+                if (!ac) list_msg(v, COLOR_PAIR_STRING, "no arguments for the next launches");
+                else list_msg(v, COLOR_PAIR_STRING, "%d argument%s for the next F5 F6 F7 launches%s: %.180s", ac, ac == 1 ? "" : "s",
+                              dbg_mine(v) ? " (the running program keeps its own)" : "", v->args);
+            } else if (v->in_mode == IN_BREAK) {
                 char line[sizeof v->in_buf];
                 snprintf(line, sizeof line, "%s", v->in_buf);
                 v->in_mode = IN_NONE;
@@ -3272,14 +3993,15 @@ static bool input_key(DisView *v, int key, int win_h) {
             break;
         default:
             if (key >= 32 && key < 127) {
-                if (n + 1 < sizeof v->in_buf) { v->in_buf[n] = (char)key; v->in_buf[n + 1] = '\0'; }
+                size_t cap = v->in_mode == IN_FILTER ? sizeof v->filter : sizeof v->in_buf;
+                if (n + 1 < cap) { v->in_buf[n] = (char)key; v->in_buf[n + 1] = '\0'; }
                 break;
             }
             if (v->in_mode == IN_FILTER) list_nav(v, key, win_h, false);
             return true;                       /* anything else is swallowed */
     }
     if (v->in_mode == IN_FILTER) {             /* the filter applies as it is typed */
-        snprintf(v->filter, sizeof v->filter, "%s", v->in_buf);
+        snprintf(v->filter, sizeof v->filter, "%.*s", (int)sizeof v->filter - 1, v->in_buf);
         list_filter(v, sel_fn(v));
     }
     return true;
@@ -3315,10 +4037,31 @@ static bool funcs_key(DisView *v, int key, int win_h) {
     return list_nav(v, key, win_h, true);
 }
 
+/* the choice of Enter on a line that leads to several places */
+static void pick_go(DisView *v) {
+    uint64_t a = v->pick_t[v->pick_sel];
+    v->npick = 0;
+    follow(v, a);
+}
+
+static bool pick_key(DisView *v, int key) {
+    if (key == KEY_UP || key == 'k')        { if (v->pick_sel > 0) v->pick_sel--; }
+    else if (key == KEY_DOWN || key == 'j') { if (v->pick_sel + 1 < v->npick) v->pick_sel++; }
+    else if (key >= '1' && key < '1' + v->npick) { v->pick_sel = key - '1'; pick_go(v); }
+    else if (key == '\n' || key == '\r' || key == KEY_ENTER) pick_go(v);
+    else v->npick = 0;                               /* Esc, any other key: no choice */
+    return true;
+}
+
 static bool disasm_key(DisView *v, int key, int win_h) {
     if (key == 27) { v->screen = SCR_FUNCS; return true; }   /* back to the list */
     if (key == 'b') { dbg_key_bp(v); return true; }
     if (key == 'B') { v->in_mode = IN_BREAK; v->in_buf[0] = '\0'; return true; }
+    if (key == 'a') {                                 /* arguments, prefilled with the last ones */
+        v->in_mode = IN_ARGS;
+        snprintf(v->in_buf, sizeof v->in_buf, "%s", v->args);
+        return true;
+    }
     if (key == 'e' || key == 'h') { dbg_key_bp_flag(v, key); return true; }
     if (key == 'L') { dbg_key_bp_panel(v); return true; }
     if (key == 'n') { dbg_key_bp_next(v); return true; }
@@ -3327,11 +4070,10 @@ static bool disasm_key(DisView *v, int key, int win_h) {
     if (key == 'K' || key == KEY_F(17)) { dbg_key_kill(v); return true; }
     if (key == KEY_F(5) || key == KEY_F(6) || key == KEY_F(7)) { dbg_key_run(v, key, win_h); return true; }
     if (key == '\n' || key == '\r' || key == KEY_ENTER) {    /* follow the address of the line */
-        uint64_t t;
-        if (v->dsel < v->ndl && v->dl[v->dsel].len &&
-            (line_ref(&v->dl[v->dsel], &t) ||
-             (v->d.elf.fmt == ELF_FMT_PE && v->d.elf.bits == 32 && abs_ref(&v->dl[v->dsel], &t)))) follow(v, t);
-        else list_msg(v, COLOR_PAIR_NUMBER, "no address to follow on this line");
+        int n = line_targets(v, v->dsel, v->pick_t, v->pick_s, (int)(sizeof v->pick_t / sizeof *v->pick_t));
+        if (!n) list_msg(v, COLOR_PAIR_NUMBER, "no address to follow on this line");
+        else if (n == 1) follow(v, v->pick_t[0]);
+        else { v->npick = n; v->pick_sel = 0; }     /* several: the choice */
         return true;
     }
     int rows = list_rows(win_h);
@@ -3343,6 +4085,7 @@ static bool disasm_key(DisView *v, int key, int win_h) {
 static bool data_key(DisView *v, int key, int win_h) {
     if (key == 27) { v->screen = v->data_back; return true; }
     if (key == '\n' || key == '\r' || key == KEY_ENTER) { data_open(v, (long)v->dssel); return true; }
+    if (blk_key(key, &v->dscol, DS_COLS, v->ds_more)) return true;
     int rows = list_rows(win_h);
     if (!nav_key(key, rows, &v->dssel, v->nds, true)) return false;
     keep_in_view(&v->dssel, &v->dstop, v->nds, rows);
@@ -3357,7 +4100,10 @@ static bool dump_key(DisView *v, int key, int win_h) {
         else list_msg(v, COLOR_PAIR_NUMBER, "no address to follow on this row");
         return true;
     }
-    int rows = list_rows(win_h);
+    int cw[4];
+    const char *name[4];
+    if (blk_key(key, &v->xcol, dump_cols(v, cw, name), v->x_more)) return true;
+    int rows = list_rows(win_h) - dump_hdr(win_h);
     if (!nav_key(key, rows, &v->xsel, v->nxi, true)) return false;
     keep_in_view(&v->xsel, &v->xtop, v->nxi, rows);
     return true;
@@ -3384,6 +4130,8 @@ bool dis_key(DisView *v, int key, int win_h) {
     dis_ui_poll();                                   /* a stop not collected yet */
     if (v->in_mode != IN_NONE) return input_key(v, key, win_h);
     v->msg[0] = '\0';
+    if (v->npick && v->screen == SCR_DISASM) return pick_key(v, key);
+    v->npick = 0;
     switch (key) {
         case '\t':   /* info -> list -> disassembly -> data -> dump -> info (the
                        * disassembly / dump once a function / section is open) */
@@ -3425,7 +4173,17 @@ bool dis_mouse(DisView *v, int y, int x, unsigned long bstate, int win_h) {
     if (bstate & BUTTON5_PRESSED) { for (int i = 0; i < 3; i++) dis_key(v, KEY_DOWN, win_h); return true; }
 #endif
     if (!(bstate & (BUTTON1_PRESSED | BUTTON1_CLICKED)) || v->in_mode != IN_NONE) return false;
-    int y0 = win_h >= 4 ? 2 : 1, rows = list_rows(win_h), r = y - y0;
+    if (v->npick && v->screen == SCR_DISASM) {      /* the choice: a click on one, or elsewhere: none */
+        if (y == win_h - 1) return false;           /* the bar: its hints (↑/↓, Esc) */
+        if (y >= v->pick_y && y < v->pick_y + v->npick && x >= v->pick_x && x < v->pick_x + v->pick_w) {
+            v->pick_sel = y - v->pick_y;
+            v->msg[0] = '\0';
+            pick_go(v);
+        } else v->npick = 0;
+        return true;
+    }
+    int hd = v->screen == SCR_DUMP ? dump_hdr(win_h) : 0;
+    int y0 = (win_h >= 4 ? 2 : 1) + hd, rows = list_rows(win_h) - hd, r = y - y0;
     if (v->screen == SCR_INFO || r < 0 || r >= rows) return false;
     if (v->screen == SCR_DISASM && v->dpanel && x >= v->dpanel) {   /* the panel: type into the console */
         v->msg[0] = '\0';
@@ -3484,7 +4242,7 @@ void dis_status(const DisView *v, char *out, size_t sz) {
         char nb[160] = "", lk[200] = "";
         uint64_t t;
         if (item_link(v, it, &t))
-            snprintf(lk, sizeof lk, "  ·  Enter: %s 0x%llx", elf_va_exec(ef, t) ? "code" : "data", (unsigned long long)t);
+            snprintf(lk, sizeof lk, "  ·  Enter: %s 0x%llx", elf_va_code(ef, t) ? "code" : "data", (unsigned long long)t);
         const char *nm = da_name_for(&v->d, it->addr, nb, sizeof nb);
         snprintf(out, sz, " [DISASM]  %.60s+0x%llx  0x%llx%s%.80s  ·  %s, %u byte%s%s  ·  row %zu/%zu ",
                  d->name, (unsigned long long)(it->addr - d->addr), (unsigned long long)it->addr,

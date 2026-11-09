@@ -12,6 +12,8 @@ A high-performance, versatile toolkit designed to supercharge the terminal exper
 Vanilla_CLI/
 ├── Makefile
 ├── install.sh
+├── CHANGELOG.md           -- F9 and debugger changes, by session
+├── tests/                 -- Test suite (Linux tree only)
 ├── *.c / *.h              -- Abyss, lsc, lsc-config source files
 ├── cmd/
 │   ├── wipe               -- Clear a file's contents
@@ -138,6 +140,22 @@ will pass to the compiler.
 make clean && make
 ```
 
+### Self-contained Linux executable
+
+```bash
+static/build.sh ~/abyss-build/out        # -> ~/abyss-build/out/abyss
+```
+
+One file, no run-time dependency: linked statically (musl, ncursesw, capstone), with
+the i386 loader of the F9 debugger and the terminfo entries of xterm, xterm-256color,
+linux, vt100, screen, tmux, alacritty and kitty built in. Copy it anywhere and run it.
+A terminfo database on the system is still used first; a terminal found nowhere is
+shown as xterm-256color, with a message. Build needs `gcc`, `make`, `curl`, `tic` /
+`infocmp` and `~/abyss32` (see `static/build.sh`); the sources of musl, ncurses and
+capstone are downloaded into `OUT/dl` and checked by SHA-256. Run time writes only to the
+loader cache, `$XDG_CACHE_HOME/abyss` (or `~/.cache/abyss`), and only when an i386
+program is debugged on a system without a 32-bit loader.
+
 ### Manual Installation
 
 ```bash
@@ -171,7 +189,40 @@ abyss main.c
 | `F4` | Smart highlight panel |
 | `F6` | Table view (CSV, JSON, SQL, SQLite...) |
 | `F8` | Memory editor (scan and change a running program's variables) |
-| `F9` | Static analysis and debugger of an ELF x86-64 binary |
+| `F9` | Static analysis of an ELF (x86-64, x86) or PE (x64, x86) .exe / .dll binary, debugger (Linux ELF) |
+
+### Indentation
+
+Indentation is 2 spaces. `Tab` inserts spaces up to the next multiple of 2,
+`Enter` keeps the indentation of the line (2 more after `{`, or after a Python
+line that opens a block).
+Inside the leading spaces of a line the cursor moves as if they were tabs: `←` /
+`→` jump 2 spaces, `Backspace` / `Del` erase 2. Past the first non-blank
+character every key works one character at a time again.
+
+### Mouse
+
+The mouse works in every view:
+
+- **Text**: a click places the cursor, a drag selects (then `Ctrl + X`,
+  `Ctrl + C`...). A click in the other pane of a split gives it the focus.
+- **Wheel**: scrolls the pane, list or panel under the pointer, even when another
+  one has the focus.
+- **Buttons**: the shortcuts written in the title bar, in the bottom bars and in the
+  output panel header (`F2:Hex`, `Esc: cancel`, `a: arguments`...) are buttons: a
+  click does what the key does.
+- **Lists** (file tree, F8 processes and results, F9 functions, build-flags
+  menu): a click selects a row, a second click on it opens it (`Enter`); in the
+  build-flags menu a click ticks the option.
+- **Table view**: a click selects a cell, a second click edits it; a click on a
+  sheet tab switches sheet, on a header selects the column.
+- **Hex view**: a click on a byte, in the hex or the ASCII column, moves there.
+- **F9**: a click on a line with an address follows it (same as `Enter`); a click
+  on the console panel types into it.
+
+Since Abyss takes the mouse, the terminal's own selection (to copy text outside
+Abyss) needs `Shift` held while dragging, in most terminals (xterm, GNOME
+Terminal, Konsole, kitty, Windows Terminal...).
 
 ### File tree (F1)
 
@@ -320,7 +371,7 @@ second.
 | `f` | Save the address and freeze it (its value is written back ten times a second) |
 | `Tab` | Switch between results and saved addresses |
 | `x` | Hex dump around the selected address (changed bytes highlighted) |
-| `g` | Go to an address (hex) in the dump |
+| `g` | Go to an address (hex) in the dump (the field opens empty) |
 | `p` | Back to the process list |
 | `F8` | Close the memory editor |
 
@@ -349,12 +400,35 @@ first one hits the cap.
 ### Static analysis (F9)
 
 `F9` opens an analysis of the file behind the current buffer, in the current
-pane, when it is an ELF64 x86-64 binary (executable, PIE, shared object or
-`.o`). The analysis only reads the binary: it never runs, emulates or
-modifies it (the debugger, below, runs it only when asked to).
-Anything else gets a message in the status bar (not an ELF file, 32-bit or
-another architecture, truncated or malformed file). The file on disk is
-analysed, not unsaved changes in the buffer.
+pane, when it is an ELF binary, x86-64 or 32-bit x86 (executable, PIE, shared
+object or `.o`), or a Windows PE binary, x64 or 32-bit x86 (`.exe`, `.dll`), on
+Linux and on Windows alike. 32-bit x86 PE32 files are opened too, with their imports, exports,
+base relocations, TLS callbacks and load config (their COFF symbols are not
+read yet; the Windows debugger runs them through WOW64). The analysis only reads the
+binary: it never runs, emulates or modifies it (the debugger, below, runs it
+only when asked to).
+Anything else gets a message in the status bar (not an executable, another
+architecture, MS-DOS executable, truncated or malformed file). The
+file on disk is analysed, not unsaved changes in the buffer.
+
+For a PE file the information screen shows the subsystem, image base, entry
+point, the imports grouped by DLL (delay-loaded and bound ones too), the
+exports (code, data, forwarders such as `HeapAlloc -> NTDLL.RtlAllocateHeap`),
+whether a .NET assembly is IL only or mixed-mode, the PDB path, TLS
+callbacks, an overlay appended after the sections, and the
+Windows protections (ASLR / high entropy, DEP, CFG, `/GS` cookie, signature,
+writable + executable sections). Functions come from the exports, the COFF
+symbols MinGW leaves in unstripped binaries (`main`, your own functions),
+the `.pdata` unwind table and the code itself; import thunks are named after
+their import (`CreateFileW`), and a `call [IAT slot]` is commented
+`KERNEL32.dll!CreateFileW`. Addresses the base relocations patch that point
+into code are function candidates, kept only when their code decodes
+cleanly (switch tables read by `jmp [reg*4 + table]` excepted). In an IL-only
+.NET assembly only the native entry stub is disassembled: no function is
+guessed in the CIL bytecode. In a stripped binary `main` is found after the
+CRT start-up fetches argc / argv (MSVC with the dynamic UCRT, MinGW, x64).
+Not handled yet: ARM64, MSVC switch tables (relative to the image base in
+x64; in x86 their cases are not followed), the CIL code of .NET assemblies.
 
 The first screen sums the file up: type, architecture, entry point (and
 `main`), linking and libraries, protections (PIE, NX, RELRO, stack canary,
@@ -392,18 +466,50 @@ list.
 
 `Enter` (or a click) on a line with an address (a call or jump target, a
 `[rip + X]` operand) follows it: to the disassembly of the function holding
-it, or to its row in a data section. `Backspace` goes back along the links
-followed. `:` jumps to a hex address from the disassembly and data screens
+it, or to its row in a data section (`.rodata`, `.rdata`, `.data`, `.bss`...). In
+32-bit code the address of the data is often not written as is; it is found too:
+an immediate or an absolute operand (`mov dword ptr [esp], 0x404058`,
+`[0x804a020]`, `[eax*4 + 0x8049f00]`), and `[ebx + X]` / `[reg + X]` after the
+get-pc thunk (`call __x86.get_pc_thunk.bx`, `call $+5; pop`), the register being
+followed through `add`, `mov`, a spill to `[ebp - X]` and its reload. Those lines
+show the string or the name they point to in the comment. What is code and what is
+data follows the sections when the file has them: an old linker puts `.rodata` in the
+executable segment of `.text`, its strings are data all the same. Constants are not taken
+as addresses in a shared library or a PIE (where they cannot be one), nor below
+`0x10000`. `Backspace` goes back along the links
+followed.
+
+A `call` also shows what it is given, read from the lines just before it, like C:
+`call 0x401040  ; printf@plt("%d %s %d\n", ?, "literal")`. The arguments are the
+registers on x86-64 (`rdi`, `rsi`, `rdx`, `rcx`, `r8`, `r9`; on Windows `rcx`, `rdx`,
+`r8`, `r9`) and the `push` / `mov dword ptr [esp + X]` in 32-bit code, followed back
+through a copy (`lea eax, [...]` then `mov [esp], eax`) and through a local of the frame
+(`mov eax, [ebp - 8]`: the last `mov [ebp - 8], ...` before it in the function, unless
+the address of that local is taken). Each one is a string, `&name`
+(the address of some data), a function name, a name alone (the value read from it,
+`name[…]` when indexed), or `?` (not an address, or not known: a number, a register set
+elsewhere). `Enter` (or a click) on a line that leads to several places, such as a call
+and the strings it is given, opens a small list: the function first, then each
+argument; `↑` / `↓` and `Enter`, its number, or a click choose; `Esc` closes it. `:` jumps to a hex address from the disassembly and data screens
 too.
 
 `d` lists the data sections (name, address, size, permissions, type and what
 the section usually holds); `Enter` shows the contents of one, cut into rows:
 a string, an address (with the name of what it points to; `Enter` follows it),
 a run of zero bytes, or 16 bytes of hex. `d` again goes back to where you
-were. `Tab` cycles the screens: information, list, disassembly, data
+were.
+
+Both data screens are drawn in column blocks, like the table view: the list as
+SECTION, ADDRESS, SIZE, RWX, TYPE, CONTENTS; the contents as ADDRESS, SYMBOL (when a
+row starts one), BYTES, VALUE. When the window is too narrow, the first column stays
+and `←` / `→` scroll the others one whole column at a time; `«` / `»` in the header
+row say that columns are hidden on that side, and a text cut short ends with `…`. `Tab` cycles the screens: information, list, disassembly, data
 sections, contents.
 
 #### Debugger (Linux)
+
+On a Windows `.exe` / `.dll` the keys below only say that the debugger runs
+Linux ELF programs; the analysis works as usual.
 
 The disassembly screen is also a debugger of the binary (ptrace, one program
 at a time, run under Abyss and killed with it):
@@ -411,19 +517,73 @@ at a time, run under Abyss and killed with it):
 | Key | Action |
 |-----|--------|
 | `b` | Set / remove a breakpoint on the selected line (`•` in the margin) |
+| `B` | Breakpoint by name: `main`, `main+0x10`, `0x1149`, `.` (selected line), `libc.so.6+0x2a1c0`; add `hw` for a debug register, `if rax == 0x10` for a condition; `-WHERE` removes, `-*` removes all, `!WHERE` turns on / off |
+| `e` | Turn the breakpoint of the selected line on / off (`○` when off) |
+| `h` | Debug register (DR0-DR3, `◆`) instead of an `int3`; Linux only |
+| `L` | List of the breakpoints: passes, condition, state |
+| `n` | Go to the next breakpoint |
 | `F5` | Run up to the next breakpoint, or continue |
 | `F6` | Step one instruction; with no program running, start it and stop at the first line of `main` |
 | `F7` | Step over (a `call` runs to the line after it); starts at `main` like `F6` |
 | `p` | Pause the running program |
 | `K` / `Shift + F5` | Kill it |
 | `i` / click on the panel | Type into its console |
+| `a` | Arguments of the program: the prompt shows the last ones; `Enter` keeps them for every later launch by `F5`, `F6` or `F7`, until the file is closed (an empty line: no argument) |
+
+The arguments are split like a shell does, nothing expanded (no `$VAR`, no `*`):
+blanks separate them, `'...'` keeps everything as typed, `"..."` keeps the blanks
+(`\"` for a quote inside), and a `\` outside quotes keeps the next character. On
+Windows a `\` is a path separator and stays as typed (`C:\tmp\x.txt`,
+`\\srv\share`); only `\"` stands for a quote. An unclosed quote is refused at `Enter`,
+with the prompt kept. The program gets them as `argv[1]`... (`argv[0]` is its path).
 
 While the program is stopped, its line (`▶`) is highlighted and a panel on the
 right shows the registers (`rip rsp rbp rax rbx rcx rdx rsi rdi rflags`, the
 changed ones highlighted, `rflags` decoded, where `rip` is). A stop on a
 signal says why, with the faulting address for a segmentation fault.
-Breakpoints work with PIE binaries (ASLR is taken into account), can be set
-while the program runs, and are kept from one run to the next.
+A 32-bit ELF program runs too (`eip esp...` registers, 32-bit disassembly).
+When its loader `/lib/ld-linux.so.2` is not installed, the Linux `abyss` runs it
+with the i386 loader it carries: `ld-linux.so.2`, `libc.so.6`, `libm.so.6`,
+`libdl.so.2`, `libpthread.so.0` and `librt.so.1`, taken at build time from
+`~/abyss32/` (`make ABYSS32=DIR` for another directory; without those files the
+build warns and leaves the loader out). The executable alone is enough: the
+first such launch writes them to `$XDG_CACHE_HOME/abyss/i32-<hash>/`
+(`~/.cache/abyss/...` by default, directory 0700), each file is checked by its
+SHA-256 at every launch and written again when it differs. A cache that cannot
+be written refuses the launch and says where. The program gets the same arguments,
+environment, working directory and console as with the system loader; only
+`/proc/self/exe` and the auxiliary vector point at the loader, and a PIE is
+placed next to the libraries. A library the program needs and nobody has
+(`LD_LIBRARY_PATH` is searched first), or another error of the loader is told
+when `F5` is pressed, before anything runs. Nothing of this is in the Windows build.
+
+Breakpoints are stored as an offset in their module and placed again from the
+load base of each run (PIE, ASLR). They can be set while the program runs and
+are kept from one run to the next; their pass counter restarts with each run.
+An `int3` is in memory only while the program runs: neither the disassembly
+nor the F8 view ever shows it, and the file on disk is never written. An
+address that is not mapped, not code or in a shared mapping is refused; a byte
+the program rewrites itself is left alone and reported. A condition is
+`<register> <op> <number>` (`==` `!=` `<` `<=` `>` `>=`, unsigned) or
+`hits <op> <number>`; a pass where it is false only counts. A pass is an
+arrival on the breakpoint, by running or by `F6` landing on it (reported as a
+step); leaving it never counts, so `hits` means the same run or stepped, as in
+gdb.
+
+Every thread of the program is followed and they all stop together, on Linux
+and on Windows. The registers are those of the thread that stopped, which the
+status line names when it is not the first one. `F6` moves that thread alone:
+the others stay stopped (on Windows they are suspended for the step); `F5`, and
+`F7` over a `call`, start them all. A breakpoint works in every thread, and so
+does a debug register on Linux.
+
+Limits: child processes are not followed (one that reaches a breakpoint written
+at the time of its `fork` dies of `SIGTRAP`, its parent lives on). A step that
+blocks on another thread waits until `p`. A process whose first thread has
+exited cannot be attached to. A module loaded by `dlopen` is resolved at the
+next stop. On Windows, breakpoints are limited to the program itself (no other
+module, no debug register); a 32-bit program runs through WOW64, with its 32-bit
+registers and disassembly as on Linux.
 
 At the first run, a breakpoint is set on every call to an input function of
 the C library in the program's own code (`scanf`, `fgets`, `getchar`,
@@ -441,6 +601,114 @@ also come back at the next stop).
 The view needs [capstone](https://www.capstone-engine.org/) (`pacman -S
 capstone`, `apt install libcapstone-dev`), found through `pkg-config` at build
 time. Without it the module is left out of the build and `F9` says so.
+
+#### F9 keys
+
+| Screen | Key | Action |
+|--------|-----|--------|
+| All | `Tab` | Next screen: information, functions, disassembly, data sections, contents |
+| All | `F9` / `Esc` | Close the view (`Esc` first leaves the disassembly or a data section) |
+| All | Arrows / `j` `k`, `PgUp` / `PgDn` / `Space`, `g` / `G` | Scroll or move |
+| All | `d` | Data sections, and back |
+| Functions, disassembly, data | `:` | Go to a hex address |
+| Functions | `s` | Sort: address, name, size, callers |
+| Functions | `/` | Filter on the name |
+| Functions | `Enter` | Disassembly of the function |
+| Disassembly, data | `Enter` / click | Follow the address of the line (a choice when there are several: a call and its arguments) |
+| Disassembly, data | `Backspace` | Back along the links followed |
+| Data sections, data | `←` / `→` | Scroll the columns (window too narrow) |
+| Disassembly | `b` `B` `e` `h` `L` `n` | Breakpoints, see the debugger table |
+| Disassembly | `F5` `F6` `F7` `p` `K` `i` | Run, step, pause, kill, type: see the debugger table |
+| Disassembly | `a` | Arguments of the program for the next launches |
+
+#### Features by session
+
+The F9 module and the debugger were extended in the sessions below, detailed in
+[CHANGELOG.md](CHANGELOG.md).
+
+| Session | Feature |
+|---------|---------|
+| 1 | ELF32 i386 loader; `arch` and `bits` of a file |
+| 2 | 32-bit decoding |
+| 3 | x86-32 function discovery: PIC registers, `main`, prologues |
+| 4 | x86-32 discovery from relocations, GOT base, PLT without sections |
+| 5 | PE: checked headers, PE32 opened |
+| 6 | PE: imports, exports, base relocations, `.NET` |
+| 7 | PE: `.pdata`, load config, SafeSEH, CFG, TLS, protections |
+| 8 | Breakpoints: by name, conditions, debug registers, relocated at each run; 32-bit ELF programs in the debugger |
+| 9 | Threads followed, ESC overflow fixed, ELF32 and PE32 discovery fixes |
+| 10 | Test suite gathered in `tests/`, open results explained |
+| 11 | 32-bit dynamic ELF programs debugged without an i386 system loader (loader embedded in the Linux executable) |
+| 12 | Hygiene: 0 warnings, the PE32 worst case bounded in time |
+| 13 | Self-contained static Linux executable (musl) |
+| 14 | Self-contained Windows executable (MinGW-w64, UCRT) |
+| 15 | Windows debugger tested under Wine: other threads held during a step, exact pass counts |
+| 16 | Windows debugger: 32-bit programs through WOW64 |
+| 18 | Program arguments (`a`), more data addresses followed in 32-bit code; for the editor: 2-space soft indentation, the mouse in every view |
+
+#### Known limits
+
+Debugger:
+
+- `fork` is not followed: a child that reaches a breakpoint written at the time of
+  its `fork` dies of `SIGTRAP`; its parent lives on.
+- `F6` moves the current thread alone, on Linux and on Windows: a step that blocks on
+  another thread (a lock, a wait) waits for `p`; on Windows the other threads stay
+  suspended until then.
+- Attaching is refused once the first thread is a zombie, and can wait when it falls
+  during its exit. After a detach with a zombie first thread, the real parent is only
+  told when Abyss ends.
+- Signals of every thread stop the program (`SIGURG` in Go programs).
+- The automatic console only watches the first thread's input.
+- A module loaded by `dlopen` is resolved at the next stop.
+- Windows: no module other than the program, no debug register, the program has its
+  own console window (the console panel and the memory maps are not done there).
+- Windows, 32-bit programs (WOW64): a break-in (`p`, attach) that stops in the 32-bit
+  `DbgBreakPoint` of a process whose 32-bit `ntdll` load was never reported (Wine) is
+  shown as a breakpoint stop.
+
+Analysis:
+
+- x86 switch tables are not followed, in ELF32 or PE32; neither are MSVC x64 tables.
+- ELF32: functions with no direct reference are not found. In the data view, addresses
+  are read on 8-byte boundaries. `__stack_chk_fail_local` does not count as a canary.
+- PE32: COFF symbols and the debug directory are not read.
+- PE32 residues: 3 case labels taken as functions, about 4% of weak `push r; call`
+  prologues unverified, one TLS callback pointing into an instruction gives a shifted
+  start.
+- PE64: one `.cold` part of the entry remains (`lib_mysqludf_sys_64`).
+- ARM64, ARM and the CIL code of `.NET` assemblies are not analysed.
+- A crafted PE32 is bounded in instructions (1,048,576 per analysis) and so in time:
+  an 11 MB `.text` built to hit the worst case takes 0.45 s (22 s before session 12).
+
+#### Never tested
+
+Each item below lacks a sample or a platform on the development machine. It may work:
+nothing shows that it does.
+
+- **Real Windows.** Nothing has run on a real Windows. `abyss.exe` is cross-built on
+  the development machine (MinGW-w64) and tested under Wine 11.21 and against a
+  simulated Win32 API (`dbg_win.c`, the console). Never seen for real: the WOW64
+  codes `0x4000001F` / `0x4000001E` and the two loader breakpoints of a WOW64 launch
+  (Wine raises the native codes and one loader breakpoint), ASLR (Wine maps every
+  image at its ImageBase), attaching to a PE32 (Wine kills the target at the
+  break-in), the module list of a WOW64 process, `SuspendThread` on busy threads on
+  several cores, and the real console host (`conhost`, Windows Terminal): Wine's
+  console ignores resizes and shows VT sequences as text.
+- **Debugger:** a kernel
+  without 32-bit support (simulated: `execve` made to fail with `ENOEXEC`); a real
+  `dlopen`; real self-modifying code (simulated by writing to
+  `/proc/pid/mem`); a real shared mapping (synthetic tables only).
+- **ELF32:** `push [ebx+main@GOT]` of a glibc PIE, GOTOFF / GOTPC / PLT32 in
+  `.rel.dyn`, GLOB_DAT or `R_386_32` on a defined function, PIE with `.plt.sec` and no
+  sections, lld IBT PLT, i386 RELA symbol relocations, C++ vtables.
+- **PE:** real delay-load and bound imports (mutations only), PE32 from MinGW, PE32
+  with COFF symbols, CFG table in a PE32, real cyclic or deep `.pdata` chains, real
+  unsorted SafeSEH. FORCE_INTEGRITY and APPCONTAINER are only seen absent, NO_ISOLATION
+  on a single file. PE32 TLS callbacks: a single file (`template_x86_windows.dll` of
+  cve-2017-8464).
+
+The test suite is in `tests/` in the Linux tree: see `tests/README.md`.
 
 ---
 

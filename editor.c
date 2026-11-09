@@ -59,6 +59,12 @@ static void handle_key_build_menu(int key);
 static void build_menu_open(void);
 static void build_and_run(void);
 static void full_redraw(bool force);
+#ifdef BUTTON5_PRESSED
+#  define MOUSE_WHEEL_DOWN BUTTON5_PRESSED
+#else
+#  define MOUSE_WHEEL_DOWN 0
+#endif
+static bool finfo_focus = false;    /* F3 panel: Up / Down scroll it (also set by a click) */
 
 /* Deferred Smart Highlight rescan: on buffers larger than HL_DEFER_BYTES the
  * scan is postponed until the keyboard goes idle instead of running on every
@@ -628,14 +634,6 @@ static bool console_key(int key) {
         case KEY_DOWN:  out_scroll_by(1);                   return true;
         case KEY_PPAGE: out_scroll_by(-(out_text_rows - 1)); return true;
         case KEY_NPAGE: out_scroll_by(out_text_rows - 1);   return true;
-        case KEY_MOUSE: {
-            MEVENT ev;
-            if (getmouse(&ev) == OK) {
-                if (ev.bstate & BUTTON4_PRESSED) out_scroll_by(-3);
-                else if (ev.bstate & BUTTON5_PRESSED) out_scroll_by(3);
-            }
-            return true;
-        }
         case 'b' & 0x1f: case 'q' & 0x1f:
             return false;
         default:
@@ -671,6 +669,10 @@ static int build_menu_rows(int count) {
 }
 
 /* The dropdown itself: anchored at the bottom, just above the status bar. */
+/* the ^B^B menu at its last draw, for the mouse: first screen row, height,
+ * rows of options (they start one row below the top border) */
+static int g_bm_y = -1, g_bm_h, g_bm_rows;
+
 static void render_build_menu(void) {
     Pane *ap = E.panes[E.active];
     int count = 0;
@@ -684,6 +686,7 @@ static void render_build_menu(void) {
     int mw = cols;
     int my = rows - 1 - mh;
     if (my < 1) { my = 1; mh = rows - 2; if (mh < 4) return; list_h = mh - 4; }
+    g_bm_y = my; g_bm_h = mh; g_bm_rows = list_h;
 
     WINDOW *mwin = newwin(mh, mw, my, 0);
     wbkgd(mwin, ' ' | COLOR_PAIR(COLOR_PAIR_NORMAL));
@@ -1473,19 +1476,6 @@ static void dis_toggle(Pane *ap) {
 static bool dis_pane_key(Pane *p, int key) {
     if (key == KEY_F(9)) { dis_toggle(p); return true; }
     if (!p->dis_mode || key == KEY_F(8)) return false;
-    if (key == KEY_MOUSE) {                 /* click on a row / address, wheel */
-        MEVENT ev;
-        if (getmouse(&ev) == OK && p->win) {
-            int by, bx, mh, mw;
-            getbegyx(p->win, by, bx);
-            getmaxyx(p->win, mh, mw);
-            int y = ev.y - by, x = ev.x - bx;
-            if (y >= 0 && y < mh && x >= 0 && x < mw &&
-                dis_mouse(p->dis, y, x, (unsigned long)ev.bstate, p->win_h))
-                force_full_dirty();
-        }
-        return true;
-    }
     if (key == ('q' & 0x1f)) { E.running = false; return true; }
     if (key == ('a' & 0x1f)) { E.show_shortcuts = !E.show_shortcuts; return true; }
     if (key == ('e' & 0x1f)) { editor_focus_next(); return true; }
@@ -1509,8 +1499,6 @@ static void handle_key_normal(int key) {
         return;
     }
 
-    
-    static bool finfo_focus = false;
     if (key == KEY_F(3)) {
         if (E.finfo) {
             if (!E.finfo->visible) {
@@ -1664,15 +1652,6 @@ static void handle_key_normal(int key) {
                 snprintf(E_notify, sizeof E_notify, "Not found: %.200s", dv->search);
             return;
         }
-        if (key == KEY_MOUSE) {
-            MEVENT ev;
-            if (getmouse(&ev) == OK) {
-                int step = (ev.bstate & BUTTON4_PRESSED) ? KEY_UP
-                         : (ev.bstate & BUTTON5_PRESSED) ? KEY_DOWN : 0;
-                for (int i = 0; step && i < 3; i++) doc_handle_key(dv, step, ap->win_h);
-            }
-            return;
-        }
         doc_handle_key(dv, key, ap->win_h);
         return;
     }
@@ -1748,15 +1727,6 @@ static void handle_key_normal(int key) {
                 pane_table_enter(ap);
                 return;
             }
-            if (key == KEY_MOUSE) {
-                MEVENT ev;
-                if (getmouse(&ev) == OK) {
-                    int step = (ev.bstate & BUTTON4_PRESSED) ? KEY_UP
-                             : (ev.bstate & BUTTON5_PRESSED) ? KEY_DOWN : 0;
-                    for (int i = 0; step && i < 3; i++) tbl_handle_key(tv, step, ap->win_h);
-                }
-                return;
-            }
             tbl_handle_key(tv, key, ap->win_h);
             return;
         }
@@ -1824,7 +1794,11 @@ static void handle_key_normal(int key) {
             else                         pane_delete_forward(ap);
             break;
         case '\n': case '\r':                    pane_insert_char(ap, '\n'); break;
-        case '\t':                               pane_insert_str(ap, "    ", 4); break;
+        case '\t': {                     /* spaces up to the next INDENT_W stop */
+            size_t n = INDENT_W - ap->cursor_col % INDENT_W;
+            pane_insert_str(ap, "        ", n);
+            break;
+        }
 
         case 'o' & 0x1f: {
             char sug[4400];
@@ -1904,33 +1878,6 @@ static void handle_key_normal(int key) {
             if (!ap->sel_active) { ap->sel_active = true; ap->sel_anchor = ap->cursor; }
             pane_move_cursor(ap,  1, 0); break;
 
-        case KEY_MOUSE: {
-            MEVENT ev;
-            if (getmouse(&ev) == OK) {
-                if (ev.bstate & BUTTON4_PRESSED) {
-                    if (E.tree_focus && E.tree && E.tree->visible) {
-                        if (E.tree->selected > 0) E.tree->selected--;
-                    } else if (E.hl_focus && E.hl && E.hl->visible) {
-                        if (E.hl->scroll > 0) E.hl->scroll--;
-                    } else if (E.finfo && E.finfo->visible) {
-                        if (E.finfo->scroll_row > 0) E.finfo->scroll_row--;
-                    } else {
-                        pane_move_cursor(ap, -3, 0);
-                    }
-                } else if (ev.bstate & BUTTON5_PRESSED) {
-                    if (E.tree_focus && E.tree && E.tree->visible) {
-                        if (E.tree->selected + 1 < E.tree->count) E.tree->selected++;
-                    } else if (E.hl_focus && E.hl && E.hl->visible) {
-                        E.hl->scroll++;
-                    } else if (E.finfo && E.finfo->visible) {
-                        E.finfo->scroll_row++;
-                    } else {
-                        pane_move_cursor(ap, 3, 0);
-                    }
-                }
-            }
-            break;
-        }
 
         case 27:
             ap->sel_active = false;
@@ -2157,6 +2104,240 @@ static int key_read(WINDOW *w) {
 #  define key_read(w) wgetch(w)
 #endif
 
+/* ─── Mouse ────────────────────────────────────────────────────── */
+
+/* The key a hint names: "F5", "Shift-F5", "^S", "Esc", "Tab", "Enter",
+ * "Space", "Backspace", "PgUp" / "PgDn", "Home" / "End", "'x'" or one
+ * character; 0: none. */
+static int hint_key(const char *s, size_t n) {
+    while (n && *s == ' ') { s++; n--; }
+    while (n && s[n - 1] == ' ') n--;
+    if (!n) return 0;
+    if (n > 2 && (unsigned char)s[0] <= 6 && s[1] == ' ') { s += 2; n -= 2; }   /* a mark before the key: "→ Enter" */
+    if (n == 3 && s[0] == '\'' && s[2] == '\'') return (unsigned char)s[1];
+    if (n == 1 && s[0] == '\x03') return KEY_LEFT;
+    if (n == 1 && s[0] == '\x04') return KEY_RIGHT;
+    if (n == 1 && s[0] == '\x05') return KEY_UP;
+    if (n == 1 && s[0] == '\x06') return KEY_DOWN;
+    if (n == 1) return s[0] > 32 && s[0] < 127 ? (unsigned char)s[0] : 0;
+    if (n == 2 && s[0] == '^' && ((s[1] >= '@' && s[1] <= '_') || (s[1] >= 'a' && s[1] <= 'z'))) return s[1] & 0x1f;
+    int shift = 0;
+    if (n > 6 && !strncmp(s, "Shift-", 6)) { shift = 12; s += 6; n -= 6; }
+    if ((n == 2 || n == 3) && s[0] == 'F' && isdigit((unsigned char)s[1]) && (n == 2 || isdigit((unsigned char)s[2]))) {
+        int k = s[1] - '0';
+        if (n == 3) k = k * 10 + (s[2] - '0');
+        return k >= 1 && k <= 12 ? KEY_F(k + shift) : 0;
+    }
+    if (shift) return 0;
+    static const struct { const char *name; int key; } names[] = {
+        { "Esc", 27 }, { "Tab", '\t' }, { "Enter", '\n' }, { "Space", ' ' }, { "Backspace", KEY_BACKSPACE },
+        { "PgUp", KEY_PPAGE }, { "PgDn", KEY_NPAGE }, { "Home", KEY_HOME }, { "End", KEY_END } };
+    for (size_t i = 0; i < sizeof names / sizeof *names; i++)
+        if (strlen(names[i].name) == n && !strncmp(s, names[i].name, n)) return names[i].key;
+    return 0;
+}
+
+/* The key of the hint under the screen cell (y, x), read back from the
+ * screen: a hint is "KEY: what" or "KEY:What", hints are apart by a '·',
+ * a '│' or two spaces, and "A / B: what" or "A/B:What" give the
+ * alternative clicked, else the first one that names a key (← → ↑ ↓ are
+ * the arrows; a mark and a blank before a key are skipped: "→ Enter"). printable: a key that types a character
+ * is taken too (on a row that is only hints, not where a file name or a
+ * command line shows). 0: none there. */
+static int hint_at(int y, int x, bool printable) {
+    int cols = getmaxx(curscr);
+    if (y < 0 || y >= getmaxy(curscr) || x < 0 || x >= cols) return 0;
+    char row[1024];
+    int n = cols < (int)sizeof row - 1 ? cols : (int)sizeof row - 1;
+    for (int i = 0; i < n; i++) {                    /* one byte per cell, other characters as marks */
+        cchar_t cc;
+        wchar_t wc[CCHARW_MAX + 1] = { 0 };
+        attr_t at; short cp;
+        row[i] = ' ';
+        if (mvwin_wch(curscr, y, i, &cc) == ERR || getcchar(&cc, wc, &at, &cp, NULL) == ERR) continue;
+        row[i] = wc[0] == 0xB7 || wc[0] == 0x2502 ? '\x01' : wc[0] == 0x2190 ? '\x03' : wc[0] == 0x2192 ? '\x04'
+               : wc[0] == 0x2191 ? '\x05' : wc[0] == 0x2193 ? '\x06'
+               : wc[0] >= 32 && wc[0] < 127 ? (char)wc[0] : wc[0] ? '\x02' : ' ';
+    }
+    row[n] = '\0';
+    if (x >= n || row[x] == '\x01' || (row[x] == ' ' && (x == 0 || row[x - 1] == ' ' || row[x + 1] == ' '))) return 0;
+    int l = x, r = x;
+    while (l > 0 && row[l - 1] != '\x01' && !(row[l - 1] == ' ' && l >= 2 && row[l - 2] == ' ')) l--;
+    while (r < n && row[r] != '\x01' && !(row[r] == ' ' && row[r + 1] == ' ')) r++;
+    while (l < r && row[l] == ' ') l++;
+    const char *s = row + l;
+    size_t len = (size_t)(r - l);
+    size_t c;                                        /* the colon after the key */
+    if (len >= 2 && s[0] == ':' && s[1] == ':') c = 1;
+    else if (len >= 4 && s[0] == '\'' && s[2] == '\'' && s[3] == ':') c = 3;
+    else { const char *q = memchr(s, ':', len); if (!q || q == s) return 0; c = (size_t)(q - s); }
+    int first = 0;                                   /* the alternatives, A / B: the one clicked, */
+    for (size_t a = 0; a < c; ) {                    /* else the first that names a key */
+        size_t b = a;
+        while (b < c && s[b] != '/') b++;
+        int k = c == 1 && s[0] == ':' ? ':' : hint_key(s + a, b - a);
+        if (k && !(printable || k < 32 || k > 126)) k = 0;
+        if (k && (size_t)(x - l) >= a && (size_t)(x - l) < b) return k;
+        if (k && !first) first = k;
+        a = b + 1;
+    }
+    return first;
+}
+
+static bool mouse_in(WINDOW *w, int y, int x, int *wy, int *wx) {
+    if (!w || !wenclose(w, y, x)) return false;
+    int by, bx;
+    getbegyx(w, by, bx);
+    *wy = y - by; *wx = x - bx;
+    return true;
+}
+
+/* the key goes in as if typed: the main loop reads it next */
+static void mouse_key(int k) { if (k) ungetch(k); }
+
+static void focus_pane(int i) {
+    E.active = i;
+    E.tree_focus = E.hl_focus = finfo_focus = E.out_focus = false;
+}
+
+/* the wheel over pane p (focused or not): what Up / Down x3 do in its view */
+static void pane_wheel(Pane *p, int dir, int wy, int wx, unsigned long b) {
+    int key = dir < 0 ? KEY_UP : KEY_DOWN;
+    if (p->dis_mode && p->dis)            dis_mouse(p->dis, wy, wx, b, p->win_h);
+    else if (p->mem_mode)                 mem_ui_mouse(wy, wx, b, p->win_h);
+    else if (p->img_mode)                 ;
+    else if (p->doc_mode && p->doc)       for (int i = 0; i < 3; i++) doc_handle_key(p->doc, key, p->win_h);
+    else if (p->table_mode && p->table && p->table->menu.open)   /* the f dropdown, over the grid */
+        for (int i = 0; i < 3; i++) tbl_filter_menu_key(p->table, key, p->win_h);
+    else if (p->table_mode && p->table)   for (int i = 0; i < 3; i++) tbl_handle_key(p->table, key, p->win_h);
+    else if (p->hex_mode && p->hex)       for (int i = 0; i < 3; i++) hex_handle_key(p->hex, key, p->win_h);
+    else if (!p->doc_mode && !p->table_mode && !p->hex_mode) pane_move_cursor(p, 3 * dir, 0);
+}
+
+/* A mouse event (KEY_MOUSE), by what lies under it: the wheel scrolls the
+ * view or panel under the pointer, focused or not; a click gives it the
+ * focus and acts on what it hits (text: the cursor, held and released
+ * elsewhere: a selection; a row of the tree / F8 / F9 / table: selects it,
+ * a second click on the selected one is Enter; a key named on a hint bar:
+ * that key). Dialogs keep the keyboard only. */
+static void mouse_event(void) {
+    MEVENT ev;
+    if (getmouse(&ev) != OK) return;
+    static int press_pane = -1;                      /* text pane of the last press */
+    unsigned long b = (unsigned long)ev.bstate;
+    int dir = b & BUTTON4_PRESSED ? -1 : (b & MOUSE_WHEEL_DOWN) ? 1 : 0;
+    bool click = b & BUTTON1_PRESSED, release = b & BUTTON1_RELEASED;
+    int y = ev.y, x = ev.x, wy, wx;
+
+    if (release) {                                   /* end of a drag in the text */
+        int i = press_pane;
+        press_pane = -1;
+        if (i < 0 || i >= E.npanes || E.mode != MODE_NORMAL) return;
+        Pane *p = E.panes[i];
+        if (p->dis_mode || p->mem_mode || p->img_mode || p->doc_mode || p->table_mode || p->hex_mode || !p->win) return;
+        int by, bx;
+        getbegyx(p->win, by, bx);
+        wy = y - by; wx = x - bx;                    /* past the edges: the nearest cell */
+        if (wy < 0) wy = 0;
+        if (wy >= p->win_h) wy = p->win_h - 1;
+        if (wx < 0) wx = 0;
+        if (wx >= p->win_w) wx = p->win_w - 1;
+        size_t at = p->cursor;
+        pane_click(p, wy, wx, true);
+        if (p->cursor == at) p->sel_active = false;  /* released where pressed: a click */
+        return;
+    }
+    if (!dir && !click) return;
+    E_notify[0] = '\0';                             /* as a key does (not the release after it) */
+
+    if (E.mode == MODE_BUILD_MENU) {
+        if (g_bm_y < 0 || y < g_bm_y || y >= g_bm_y + g_bm_h) return;
+        int count = 0;
+        build_flag_table(E.panes[E.active]->lang, &count);
+        if (dir) {
+            E.build_sel += dir;
+            if (E.build_sel >= count) E.build_sel = count - 1;
+            if (E.build_sel < 0) E.build_sel = 0;
+        } else if (y == g_bm_y + g_bm_h - 1) mouse_key(hint_at(y, x, true));
+        else if (y > g_bm_y && y <= g_bm_y + g_bm_rows) {
+            int i = E.build_scroll + (y - g_bm_y - 1);
+            if (i < count) { E.build_sel = i; mouse_key(' '); }   /* a click ticks it */
+        }
+        return;
+    }
+    if (E.mode != MODE_NORMAL) return;
+
+    if (mouse_in(E.title_win, y, x, &wy, &wx)) {    /* its hints: ^A, the shortcuts */
+        if (click) mouse_key(hint_at(y, x, E.show_shortcuts));
+        return;
+    }
+    if (E.out_visible && mouse_in(E.out_win, y, x, &wy, &wx)) {
+        if (dir) out_scroll_by(3 * dir);
+        else if (wy == 0) mouse_key(hint_at(y, x, false));      /* the header: what keys do */
+        else if (run_active()) { focus_pane(E.active); E.out_focus = true; }
+        return;
+    }
+    if (E.tree && E.tree->visible && mouse_in(E.tree->win, y, x, &wy, &wx)) {
+        FileTree *ft = E.tree;
+        if (dir) {
+            for (int i = 0; i < 3; i++) {
+                if (dir < 0 && ft->selected > 0) ft->selected--;
+                if (dir > 0 && ft->selected + 1 < ft->count) ft->selected++;
+            }
+            return;
+        }
+        bool had = E.tree_focus;
+        focus_pane(E.active);
+        E.tree_focus = true;
+        size_t idx = ft->scroll + (size_t)(wy - 2);
+        if (wy < 2 || idx >= ft->count) return;    /* the folder, the field */
+        if (had && idx == ft->selected) {            /* second click: open it */
+            char open_path[4096] = "";
+            ft_handle_key(ft, '\n', open_path, sizeof open_path);
+            if (open_path[0]) tree_open_path(open_path);
+        } else ft->selected = idx;
+        return;
+    }
+    if (E.hl && E.hl->visible && mouse_in(E.hl->win, y, x, &wy, &wx)) {
+        if (dir < 0) { E.hl->scroll -= 3; if (E.hl->scroll < 0) E.hl->scroll = 0; }
+        else if (dir > 0) E.hl->scroll += 3;
+        else { focus_pane(E.active); E.hl_focus = true; }
+        return;
+    }
+    if (E.finfo && E.finfo->visible && mouse_in(E.finfo->win, y, x, &wy, &wx)) {
+        if (dir < 0) { E.finfo->scroll_row -= 3; if (E.finfo->scroll_row < 0) E.finfo->scroll_row = 0; }
+        else if (dir > 0) E.finfo->scroll_row += 3;
+        else { focus_pane(E.active); finfo_focus = true; }
+        return;
+    }
+    for (int i = 0; i < E.npanes; i++) {
+        Pane *p = E.panes[i];
+        if (!mouse_in(p->win, y, x, &wy, &wx)) continue;
+        if (dir) { pane_wheel(p, dir, wy, wx, b); return; }
+        bool was = E.active == i && !E.tree_focus && !E.hl_focus && !finfo_focus && !E.out_focus;
+        focus_pane(i);
+        if (p->dis_mode && p->dis) {
+            if (!dis_mouse(p->dis, wy, wx, b, p->win_h) && wy == p->win_h - 1) mouse_key(hint_at(y, x, true));
+        } else if (p->mem_mode) {
+            if (!mem_ui_mouse(wy, wx, b, p->win_h) && wy == p->win_h - 1) mouse_key(hint_at(y, x, true));
+        } else if (p->img_mode || p->doc_mode) {
+            ;                                        /* the focus only */
+        } else if (p->table_mode && p->table && p->table->menu.open) {
+            ;                                        /* the f dropdown: keyboard */
+        } else if (p->table_mode && p->table) {
+            int r = tbl_click(p->table, wy, wx, p->win_h, p->win_w);
+            if (r == 2 && was) mouse_key('\n');                         /* edit the cell */
+            else if (!r && wy == p->win_h - 1) mouse_key(hint_at(y, x, true));   /* its legend */
+        } else if (p->hex_mode && p->hex) {
+            hex_click(p->hex, wy, wx);
+        } else {
+            pane_click(p, wy, wx, false);
+            press_pane = i;
+        }
+        return;
+    }
+}
+
 void editor_run(const char *initial_file) {
     #ifdef _WIN32
     win_init_utf8();
@@ -2169,7 +2350,10 @@ void editor_run(const char *initial_file) {
     raw(); noecho();
     keypad(stdscr, TRUE);
     set_escdelay(25);
-    mouseinterval(0);                       /* F9: a press is a click, no wait */
+    mouseinterval(0);                       /* a press is a click, no wait */
+    /* the mouse in every view (see mouse_event); the terminal's own
+     * selection then takes Shift + drag */
+    mousemask(BUTTON1_PRESSED | BUTTON1_RELEASED | BUTTON4_PRESSED | MOUSE_WHEEL_DOWN, NULL);
     curs_set(0);
 
     colors_init();
@@ -2248,13 +2432,6 @@ void editor_run(const char *initial_file) {
 	#ifdef _WIN32
     		if (tmo < 0) tmo = 100;   /* pas de SIGWINCH sous Windows : on sonde la taille toutes les 100 ms */
 	#endif
-        {   /* mouse reporting only while F9 shows: elsewhere the terminal
-             * keeps its own selection (copy with the mouse) */
-            static mmask_t mouse_on;
-            mmask_t want = E.panes[E.active]->dis_mode
-                ? (mmask_t)(BUTTON1_PRESSED | BUTTON4_PRESSED | BUTTON5_PRESSED) : 0;
-            if (want != mouse_on) { mousemask(want, NULL); mouse_on = want; }
-        }
         if (tmo >= 0) wtimeout(kw, tmo);
         int key = key_read(kw);
         if (tmo >= 0) wtimeout(kw, -1);
@@ -2288,6 +2465,12 @@ void editor_run(const char *initial_file) {
         }
         if (key == 0 || key == ERR || key == 0x16) continue;
 
+        if (key == KEY_MOUSE && !in_paste) {       /* every view, see mouse_event */
+            mouse_event();                          /* (it clears E_notify on a press only) */
+            force_full_dirty();
+            full_redraw(false);
+            continue;
+        }
         E_notify[0] = '\0';
 
         if (key == KEY_RESIZE) {

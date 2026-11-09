@@ -1,4 +1,8 @@
-/* ELF64 x86-64 loader (read-only), see elfload.h.
+/* ELF64 x86-64 / ELF32 i386 loader (read-only), see elfload.h.
+ *
+ * Both classes go through the same code: the entry sizes and the field
+ * offsets come from the class (ElfFile.bits), 32-bit fields are read
+ * with r32 and zero-extended. The ELF64 path is unchanged.
  *
  * Rule followed everywhere below: no byte of the file is read before the
  * offset AND the length of what is read have been checked against the
@@ -16,6 +20,7 @@
 #define ET_EXEC  2
 #define ET_DYN   3
 #define ET_CORE  4
+#define EM_386     3
 #define EM_X86_64 62
 
 #define PT_LOAD    1
@@ -37,15 +42,21 @@
 #define DT_NULL          0
 #define DT_NEEDED        1
 #define DT_PLTRELSZ      2
+#define DT_PLTGOT        3
 #define DT_HASH          4
 #define DT_STRTAB        5
 #define DT_SYMTAB        6
 #define DT_RELA          7
 #define DT_RELASZ        8
+#define DT_RELAENT       9
 #define DT_STRSZ        10
 #define DT_INIT         12
 #define DT_FINI         13
 #define DT_SONAME       14
+#define DT_REL          17
+#define DT_RELSZ        18
+#define DT_RELENT       19
+#define DT_PLTREL       20
 #define DT_JMPREL       23
 #define DT_INIT_ARRAY   25
 #define DT_FINI_ARRAY   26
@@ -66,6 +77,11 @@
 #define R_X86_64_GLOB_DAT  6
 #define R_X86_64_JUMP_SLOT 7
 #define R_X86_64_RELATIVE  8
+/* i386: the same numbers */
+#define R_386_32           1
+#define R_386_GLOB_DAT     6
+#define R_386_JMP_SLOT     7
+#define R_386_RELATIVE     8
 
 #define STT_OBJECT 1
 #define STT_FUNC   2
@@ -87,6 +103,14 @@
 static uint16_t r16(const uint8_t *p) { return (uint16_t)(p[0] | p[1] << 8); }
 static uint32_t r32(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
 static uint64_t r64(const uint8_t *p) { return (uint64_t)r32(p) | (uint64_t)r32(p + 4) << 32; }
+
+/* class: ELF32 (bits 32) or ELF64 (anything else, PE included) */
+static bool     is32(const ElfFile *ef) { return ef->bits == 32; }
+static unsigned wsz(const ElfFile *ef)  { return is32(ef) ? 4u : 8u; }
+/* an address / size / offset field of the file's class, zero-extended */
+static uint64_t rw(const ElfFile *ef, const uint8_t *p) { return is32(ef) ? r32(p) : r64(p); }
+/* entry sizes */
+static unsigned sym_ent(const ElfFile *ef) { return is32(ef) ? 16u : 24u; }
 
 static bool in_file(const ElfFile *ef, uint64_t off, uint64_t len) {
     return off <= ef->size && len <= ef->size - off;
@@ -195,6 +219,15 @@ bool elf_va_exec(const ElfFile *ef, uint64_t va) {
     return m && (m->flags & PF_X);
 }
 
+/* code at va: an executable segment and, when a section holds va, an
+ * executable section (an old ld puts .rodata in the r-x segment of .text:
+ * its strings are data) */
+bool elf_va_code(const ElfFile *ef, uint64_t va) {
+    if (!elf_va_exec(ef, va)) return false;
+    const ElfSection *s = elf_section_at(ef, va);
+    return !s || (s->flags & SHF_EXECINSTR);
+}
+
 static const ElfReloc *rel_at(const ElfFile *ef, uint64_t va) {
     int lo = 0, hi = ef->nrel - 1;
     while (lo <= hi) {
@@ -210,8 +243,8 @@ bool elf_read_ptr(const ElfFile *ef, uint64_t va, uint64_t *out) {
     if (r) { *out = r->addend; return true; }
     size_t avail = 0;
     const uint8_t *p = elf_va_ptr(ef, va, &avail);
-    if (!p || avail < 8) return false;
-    *out = r64(p);
+    if (!p || avail < wsz(ef)) return false;
+    *out = rw(ef, p);
     return true;
 }
 
@@ -361,6 +394,14 @@ void elf_sec_flags_str(uint64_t f, char out[8]) {
     out[n] = '\0';
 }
 
+const char *elf_arch_name(uint8_t arch) {
+    switch (arch) {
+        case ELF_ARCH_X86_64: return "x86-64";
+        case ELF_ARCH_X86_32: return "x86-32";
+        default:              return "unknown";
+    }
+}
+
 bool elf_is_elf(const uint8_t *buf, size_t len) {
     return len >= 16 && buf[0] == 0x7f && buf[1] == 'E' && buf[2] == 'L' && buf[3] == 'F';
 }
@@ -379,18 +420,26 @@ static bool push_symbol(ElfFile *ef, int *cap, const ElfSymbol *s) {
     return true;
 }
 
-/* one symbol table: `count` entries of 24 bytes at file offset `off`,
- * names in [str_off, str_off + str_size) */
+/* one symbol table: `count` entries of 24 bytes (ELF32: 16) at file
+ * offset `off`, names in [str_off, str_off + str_size) */
 static void read_symtab(ElfFile *ef, int *cap, uint64_t off, uint64_t count,
                         uint64_t str_off, uint64_t str_size, bool dynamic) {
     if (count > MAX_SYMS) { warn(ef, "symbol table too large (%llu entries): truncated", (unsigned long long)count); count = MAX_SYMS; }
-    if (!table_ok(ef, off, count, 24)) { warn(ef, "symbol table outside the file: ignored"); return; }
+    const unsigned ent = sym_ent(ef);
+    if (!table_ok(ef, off, count, ent)) { warn(ef, "symbol table outside the file: ignored"); return; }
     for (uint64_t i = 1; i < count; i++) {
-        const uint8_t *p = ef->data + off + i * 24;
+        const uint8_t *p = ef->data + off + i * ent;
         uint32_t name  = r32(p);
-        uint8_t  info  = p[4];
-        uint16_t shndx = r16(p + 6);
-        uint64_t value = r64(p + 8), size = r64(p + 16);
+        uint8_t  info;
+        uint16_t shndx;
+        uint64_t value, size;
+        if (is32(ef)) {                                /* Elf32_Sym */
+            value = r32(p + 4); size = r32(p + 8);
+            info  = p[12];      shndx = r16(p + 14);
+        } else {                                       /* Elf64_Sym */
+            info  = p[4];       shndx = r16(p + 6);
+            value = r64(p + 8); size = r64(p + 16);
+        }
         uint8_t  type  = info & 0xf, bind = info >> 4;
         if (type == STT_SECTION || type == STT_FILE) continue;
         if (shndx == SHN_UNDEF) continue;              /* imports come from relocations */
@@ -423,8 +472,9 @@ static void read_symtab(ElfFile *ef, int *cap, uint64_t off, uint64_t count,
 static void parse_sections(ElfFile *ef, uint64_t shoff, uint32_t shnum, uint16_t shentsize,
                            uint32_t shstrndx) {
     if (shoff == 0 || shnum == 0) return;
-    if (shentsize != 64) { warn(ef, "section headers: entry size %u (expected 64): ignored", shentsize); return; }
-    if (shnum > MAX_SHNUM || !table_ok(ef, shoff, shnum, 64)) {
+    const unsigned ent = is32(ef) ? 40u : 64u;
+    if (shentsize != ent) { warn(ef, "section headers: entry size %u (expected %u): ignored", shentsize, ent); return; }
+    if (shnum > MAX_SHNUM || !table_ok(ef, shoff, shnum, ent)) {
         warn(ef, "section header table outside the file: ignored");
         return;
     }
@@ -432,16 +482,26 @@ static void parse_sections(ElfFile *ef, uint64_t shoff, uint32_t shnum, uint16_t
     if (!ef->sec) return;
     ef->nsec = (int)shnum;
     for (uint32_t i = 0; i < shnum; i++) {
-        const uint8_t *p = ef->data + shoff + (uint64_t)i * 64;
+        const uint8_t *p = ef->data + shoff + (uint64_t)i * ent;
         ElfSection *s = &ef->sec[i];
         s->type    = r32(p + 4);
-        s->flags   = r64(p + 8);
-        s->addr    = r64(p + 16);
-        s->off     = r64(p + 24);
-        s->size    = r64(p + 32);
-        s->link    = r32(p + 40);
-        s->info    = r32(p + 44);
-        s->entsize = r64(p + 56);
+        if (is32(ef)) {                            /* Elf32_Shdr */
+            s->flags   = r32(p + 8);
+            s->addr    = r32(p + 12);
+            s->off     = r32(p + 16);
+            s->size    = r32(p + 20);
+            s->link    = r32(p + 24);
+            s->info    = r32(p + 28);
+            s->entsize = r32(p + 36);
+        } else {                                   /* Elf64_Shdr */
+            s->flags   = r64(p + 8);
+            s->addr    = r64(p + 16);
+            s->off     = r64(p + 24);
+            s->size    = r64(p + 32);
+            s->link    = r32(p + 40);
+            s->info    = r32(p + 44);
+            s->entsize = r64(p + 56);
+        }
         if (s->type != SHT_NOBITS && s->type != 0 && !in_file(ef, s->off, s->size)) {
             s->bad = true;
             warn(ef, "section %u: contents outside the file: ignored", i);
@@ -452,7 +512,7 @@ static void parse_sections(ElfFile *ef, uint64_t shoff, uint32_t shnum, uint16_t
         const ElfSection *st = &ef->sec[shstrndx];
         for (uint32_t i = 0; i < shnum; i++) {
             size_t nl = 0;
-            const char *s = str_at(ef, st->off, st->size, r32(ef->data + shoff + (uint64_t)i * 64), &nl);
+            const char *s = str_at(ef, st->off, st->size, r32(ef->data + shoff + (uint64_t)i * ent), &nl);
             if (s) clean_copy(ef->sec[i].name, sizeof ef->sec[i].name, s, nl);
         }
     } else if (shstrndx != 0) {
@@ -480,6 +540,10 @@ typedef struct {
     uint64_t versym, verneed, verneednum;
     uint64_t init, fini, initarr, initarrsz, finiarr, finiarrsz, prearr, prearrsz;
     uint64_t flags1, relr, relrsz;
+    /* ELF32 only (i386 uses REL tables; JMPREL is REL unless DT_PLTREL
+     * says RELA) */
+    uint64_t rel, relsz, relent, relaent, pltrel, pltgot;
+    bool     has_relent, has_relaent, has_pltrel;
     uint64_t needed[MAX_NEEDED]; int nneeded;
     int64_t  soname;
     bool     present;
@@ -496,12 +560,24 @@ static void parse_dynamic(ElfFile *ef, DynInfo *d) {
         if (s->type != PT_DYNAMIC) continue;
         if (!in_file(ef, s->off, s->filesz)) { warn(ef, "DYNAMIC segment outside the file: ignored"); return; }
         d->present = true;
-        uint64_t n = s->filesz / 16;
+        const unsigned ent = is32(ef) ? 8u : 16u;  /* Elf32_Dyn / Elf64_Dyn */
+        uint64_t n = s->filesz / ent;
         for (uint64_t k = 0; k < n; k++) {
-            const uint8_t *p = ef->data + s->off + k * 16;
-            int64_t  tag = (int64_t)r64(p);
-            uint64_t val = r64(p + 8);
+            const uint8_t *p = ef->data + s->off + k * ent;
+            int64_t  tag = is32(ef) ? (int64_t)r32(p) : (int64_t)r64(p);
+            uint64_t val = rw(ef, p + ent / 2);
             if (tag == DT_NULL) break;
+            if (is32(ef)) {
+                switch (tag) {
+                    case DT_REL:     d->rel = val; break;
+                    case DT_RELSZ:   d->relsz = val; break;
+                    case DT_RELENT:  d->relent = val; d->has_relent = true; break;
+                    case DT_RELAENT: d->relaent = val; d->has_relaent = true; break;
+                    case DT_PLTREL:  d->pltrel = val; d->has_pltrel = true; break;
+                    case DT_PLTGOT:  d->pltgot = val; break;
+                    default: break;
+                }
+            }
             switch (tag) {
                 case DT_NEEDED: if (d->nneeded < MAX_NEEDED) d->needed[d->nneeded++] = val; break;
                 case DT_STRTAB: d->strtab = val; break;
@@ -556,7 +632,7 @@ static uint64_t dynsym_count(const ElfFile *ef, const DynInfo *d) {
     if (!d->gnuhash || !elf_va_to_off(ef, d->gnuhash, &off) || !in_file(ef, off, 16)) return 0;
     uint32_t nbuckets = r32(ef->data + off), symoff = r32(ef->data + off + 4);
     uint32_t bloom    = r32(ef->data + off + 8);
-    uint64_t buckets  = off + 16 + (uint64_t)bloom * 8;
+    uint64_t buckets  = off + 16 + (uint64_t)bloom * wsz(ef);   /* bloom words: class-sized */
     if (!table_ok(ef, buckets, nbuckets, 4)) return 0;
     uint32_t maxsym = 0;
     for (uint32_t i = 0; i < nbuckets; i++) {
@@ -608,11 +684,12 @@ static void sym_version(const ElfFile *ef, const DynInfo *d, uint64_t idx, char 
 
 static void add_import(ElfFile *ef, int *cap, const DynInfo *d, uint64_t symidx,
                        uint64_t got, uint32_t rtype) {
-    if (!d->have_sym || symidx > (UINT64_MAX - d->sym_off) / 24) return;
-    uint64_t so = d->sym_off + symidx * 24;
-    if (!in_file(ef, so, 24)) return;
+    const unsigned ent = sym_ent(ef);
+    if (!d->have_sym || symidx > (UINT64_MAX - d->sym_off) / ent) return;
+    uint64_t so = d->sym_off + symidx * ent;
+    if (!in_file(ef, so, ent)) return;
     const uint8_t *p = ef->data + so;
-    if (r16(p + 6) != SHN_UNDEF) return;               /* defined here: not an import */
+    if (r16(p + (is32(ef) ? 14 : 6)) != SHN_UNDEF) return;   /* defined here: not an import */
     size_t nl = 0;
     const char *s = dyn_str(ef, d, r32(p), &nl);
     if (!s || !nl) return;
@@ -662,28 +739,57 @@ static void read_relocs(ElfFile *ef, const DynInfo *d, uint64_t va, uint64_t siz
     }
 }
 
+/* ELF32 i386 tables: REL (8-byte entries, the addend is the word stored
+ * at r_offset) or RELA (12 bytes); r_info = sym << 8 | type */
+static void read_relocs32(ElfFile *ef, const DynInfo *d, uint64_t va, uint64_t size,
+                          bool rela, int *icap, int *rcap) {
+    uint64_t off;
+    if (!va || !size) return;
+    if (!elf_va_to_off(ef, va, &off)) { warn(ef, "relocation table at 0x%llx is not in the file", (unsigned long long)va); return; }
+    const unsigned ent = rela ? 12u : 8u;
+    uint64_t n = size / ent;
+    if (n > MAX_RELOCS) n = MAX_RELOCS;
+    if (!table_ok(ef, off, n, ent)) { warn(ef, "relocation table runs past the end of the file: ignored"); return; }
+    for (uint64_t i = 0; i < n; i++) {
+        const uint8_t *p = ef->data + off + i * ent;
+        uint64_t r_off = r32(p);
+        uint32_t info  = r32(p + 4);
+        uint32_t type  = info & 0xff, sym = info >> 8;
+        if (type == R_386_RELATIVE) {
+            if (rela) add_reloc(ef, rcap, r_off, r32(p + 8));
+            else {                                     /* implicit addend */
+                size_t avail = 0;
+                const uint8_t *w = elf_va_ptr(ef, r_off, &avail);
+                if (w && avail >= 4) add_reloc(ef, rcap, r_off, r32(w));
+            }
+        } else if (sym && (type == R_386_JMP_SLOT || type == R_386_GLOB_DAT || type == R_386_32))
+            add_import(ef, icap, d, sym, r_off, type);
+    }
+}
+
 /* DT_RELR (packed relative relocations): the value is the one stored in
  * the file, kept so code pointers in data can be found like RELA ones */
 static void relr_apply(ElfFile *ef, int *rcap, uint64_t va) {
     size_t avail = 0;
     const uint8_t *p = elf_va_ptr(ef, va, &avail);
-    if (p && avail >= 8) add_reloc(ef, rcap, va, r64(p));
+    if (p && avail >= wsz(ef)) add_reloc(ef, rcap, va, rw(ef, p));
 }
 
 static void read_relr(ElfFile *ef, uint64_t va, uint64_t size, int *rcap) {
     uint64_t off;
     if (!va || !size) return;
     if (!elf_va_to_off(ef, va, &off)) { warn(ef, "RELR table at 0x%llx is not in the file", (unsigned long long)va); return; }
-    uint64_t n = size / 8;
+    const unsigned w = wsz(ef);                    /* entry = word: 8, ELF32 4 */
+    uint64_t n = size / w;
     if (n > MAX_RELOCS) n = MAX_RELOCS;
-    if (!table_ok(ef, off, n, 8)) { warn(ef, "RELR table runs past the end of the file: ignored"); return; }
+    if (!table_ok(ef, off, n, w)) { warn(ef, "RELR table runs past the end of the file: ignored"); return; }
     uint64_t base = 0;
     for (uint64_t i = 0; i < n && ef->nrel < (int)MAX_RELOCS; i++) {
-        uint64_t e = r64(ef->data + off + i * 8);
-        if (!(e & 1)) { relr_apply(ef, rcap, e); base = e + 8; continue; }
+        uint64_t e = rw(ef, ef->data + off + i * w);
+        if (!(e & 1)) { relr_apply(ef, rcap, e); base = e + w; continue; }
         for (int b = 0; (e >>= 1) != 0; b++)
-            if (e & 1) relr_apply(ef, rcap, base + (uint64_t)b * 8);
-        base += 63 * 8;
+            if (e & 1) relr_apply(ef, rcap, base + (uint64_t)b * w);
+        base += (uint64_t)(w * 8 - 1) * w;
     }
 }
 
@@ -710,8 +816,38 @@ static void map_plt(ElfFile *ef) {
     }
 }
 
+/* i386 PLT stubs: `jmp [abs32]` (ff 25, non-PIC executables) or
+ * `jmp [ebx+disp32]` (ff a3, PIC: ebx = the GOT base, DT_PLTGOT /
+ * .got.plt), optionally `bnd`-prefixed, in .plt, .plt.sec and .plt.got */
+static void map_plt32(ElfFile *ef, uint64_t gotbase) {
+    static const char *names[] = { ".plt", ".plt.sec", ".plt.got" };
+    if (!gotbase) {
+        const ElfSection *g = elf_section_named(ef, ".got.plt");
+        if (g && !g->bad) gotbase = g->addr;
+    }
+    for (int n = 0; n < 3; n++) {
+        const ElfSection *s = elf_section_named(ef, names[n]);
+        if (!s || s->bad || s->type == SHT_NOBITS || !in_file(ef, s->off, s->size)) continue;
+        uint64_t ent = s->entsize >= 8 ? s->entsize : 16;   /* ld gives .plt entsize 4 */
+        const uint8_t *p = ef->data + s->off;
+        for (uint64_t i = 0; i + 6 <= s->size; i++) {
+            uint64_t k = i;
+            if (p[k] == 0xf2) { if (i + 7 > s->size) break; k++; }
+            if (p[k] != 0xff || (p[k + 1] != 0x25 && p[k + 1] != 0xa3)) continue;
+            uint32_t disp = r32(p + k + 2);
+            uint64_t got;
+            if (p[k + 1] == 0x25) got = disp;
+            else if (gotbase) got = (gotbase + disp) & 0xffffffffu;
+            else { i = k + 5; continue; }
+            ElfImport *im = (ElfImport *)elf_import_got(ef, got);
+            if (im && !im->plt) im->plt = s->addr + (i / ent) * ent;
+            i = k + 5;
+        }
+    }
+}
+
 static void add_ctor(ElfFile *ef, uint64_t va) {
-    if (!va || va == UINT64_MAX || ef->nctors >= MAX_CTORS || !elf_va_exec(ef, va)) return;
+    if (!va || va == UINT64_MAX || (is32(ef) && va == UINT32_MAX) || ef->nctors >= MAX_CTORS || !elf_va_exec(ef, va)) return;
     for (int i = 0; i < ef->nctors; i++) if (ef->ctors[i] == va) return;
     uint64_t *n = realloc(ef->ctors, (size_t)(ef->nctors + 1) * sizeof *n);
     if (!n) return;
@@ -721,9 +857,10 @@ static void add_ctor(ElfFile *ef, uint64_t va) {
 
 static void read_ptr_array(ElfFile *ef, uint64_t va, uint64_t size) {
     if (!va) return;
-    for (uint64_t i = 0; i < size / 8 && i < MAX_CTORS; i++) {
+    const unsigned w = wsz(ef);
+    for (uint64_t i = 0; i < size / w && i < MAX_CTORS; i++) {
         uint64_t v;
-        if (!elf_read_ptr(ef, va + i * 8, &v)) break;
+        if (!elf_read_ptr(ef, va + i * w, &v)) break;
         add_ctor(ef, v);
     }
 }
@@ -753,18 +890,18 @@ void elf_free(ElfFile *ef) {
     for (int i = 0; i < ef->nimp; i++) free(ef->imp[i].name);
     for (int i = 0; i < ef->nneeded; i++) free(ef->needed[i]);
     free(ef->sym); free(ef->imp); free(ef->rel); free(ef->needed);
-    free(ef->seg); free(ef->sec); free(ef->map); free(ef->ctors);
+    free(ef->seg); free(ef->sec); free(ef->map); free(ef->ctors); free(ef->fstart);
     free(ef->data);
     memset(ef, 0, sizeof *ef);
 }
 
 bool elf_parse(ElfFile *ef, const uint8_t *buf, size_t len, char *err, size_t esz) {
     memset(ef, 0, sizeof *ef);
-    if (len < 64)                 { set_err(err, esz, "File too small for an ELF header (%zu bytes)", len); return false; }
+    const bool c32 = elf_is_elf(buf, len) && buf[4] == 1;      /* ELF32 header: 52 bytes */
+    if (len < (c32 ? 52u : 64u))  { set_err(err, esz, "File too small for an ELF header (%zu bytes)", len); return false; }
     if (len > ELF_MAX_FILE)       { set_err(err, esz, "File too large for the analysis (%zu MB)", len >> 20); return false; }
     if (!elf_is_elf(buf, len))    { set_err(err, esz, "Not an ELF file (no \\x7fELF magic)"); return false; }
-    if (buf[4] == 1)              { set_err(err, esz, "32-bit ELF: only ELF64 x86-64 is supported for now"); return false; }
-    if (buf[4] != 2)              { set_err(err, esz, "Malformed ELF: invalid class %u", buf[4]); return false; }
+    if (buf[4] != 1 && buf[4] != 2) { set_err(err, esz, "Malformed ELF: invalid class %u", buf[4]); return false; }
     if (buf[5] == 2)              { set_err(err, esz, "Big-endian ELF: not supported"); return false; }
     if (buf[5] != 1)              { set_err(err, esz, "Malformed ELF: invalid data encoding %u", buf[5]); return false; }
     if (buf[6] != 1)              { set_err(err, esz, "Malformed ELF: invalid version %u", buf[6]); return false; }
@@ -775,19 +912,45 @@ bool elf_parse(ElfFile *ef, const uint8_t *buf, size_t len, char *err, size_t es
     ef->size = len;
 
     const uint8_t *h = ef->data;
+    ef->bits    = c32 ? 32 : 64;
     ef->type    = r16(h + 16);
     ef->machine = r16(h + 18);
     ef->osabi   = h[7];
-    ef->entry   = r64(h + 24);
-    uint64_t phoff = r64(h + 32), shoff = r64(h + 40);
-    uint16_t ehsize = r16(h + 52), phentsize = r16(h + 54), shentsize = r16(h + 58);
-    uint32_t phnum = r16(h + 56), shnum = r16(h + 60), shstrndx = r16(h + 62);
-
-    if (ef->machine != EM_X86_64) {
-        set_err(err, esz, "Machine %s (%u): only x86-64 is supported for now", elf_machine_name(ef->machine), ef->machine);
-        goto fail;
+    uint64_t phoff, shoff;
+    uint16_t ehsize, phentsize, shentsize;
+    uint32_t phnum, shnum, shstrndx;
+    if (c32) {                                     /* Elf32_Ehdr */
+        ef->entry = r32(h + 24);
+        phoff  = r32(h + 28); shoff = r32(h + 32);
+        ehsize = r16(h + 40); phentsize = r16(h + 42); shentsize = r16(h + 46);
+        phnum  = r16(h + 44); shnum = r16(h + 48); shstrndx = r16(h + 50);
+    } else {                                       /* Elf64_Ehdr */
+        ef->entry = r64(h + 24);
+        phoff  = r64(h + 32); shoff = r64(h + 40);
+        ehsize = r16(h + 52); phentsize = r16(h + 54); shentsize = r16(h + 58);
+        phnum  = r16(h + 56); shnum = r16(h + 60); shstrndx = r16(h + 62);
     }
-    if (ehsize < 64) { set_err(err, esz, "Malformed ELF: header size %u < 64", ehsize); goto fail; }
+    const unsigned ehmin = c32 ? 52u : 64u, phent = c32 ? 32u : 56u, shent = c32 ? 40u : 64u;
+
+    if (c32) {
+        if (ef->machine == EM_X86_64) {
+            set_err(err, esz, "32-bit ELF for x86-64 (x32 ABI): not supported");
+            goto fail;
+        }
+        if (ef->machine != EM_386) {
+            set_err(err, esz, "32-bit ELF for %s (machine %u): only x86 (i386) is supported in 32 bits",
+                    elf_machine_name(ef->machine), ef->machine);
+            goto fail;
+        }
+        ef->arch = ELF_ARCH_X86_32;
+    } else {
+        if (ef->machine != EM_X86_64) {
+            set_err(err, esz, "Machine %s (%u): only x86-64 is supported for now", elf_machine_name(ef->machine), ef->machine);
+            goto fail;
+        }
+        ef->arch = ELF_ARCH_X86_64;
+    }
+    if (ehsize < ehmin) { set_err(err, esz, "Malformed ELF: header size %u < %u", ehsize, ehmin); goto fail; }
     if (ef->type != ET_REL && ef->type != ET_EXEC && ef->type != ET_DYN) {
         set_err(err, esz, "ELF type %s: only executables, shared objects and object files are analysed", elf_type_name(ef->type));
         goto fail;
@@ -795,11 +958,11 @@ bool elf_parse(ElfFile *ef, const uint8_t *buf, size_t len, char *err, size_t es
 
     /* extended numbering: the real counts live in section header 0 */
     if ((shnum == 0 && shoff) || shstrndx == SHN_XINDEX || phnum == PN_XNUM) {
-        if (shentsize == 64 && table_ok(ef, shoff, 1, 64)) {
-            const uint8_t *s0 = ef->data + shoff;
-            if (shnum == 0)             shnum    = (uint32_t)r64(s0 + 32);
-            if (shstrndx == SHN_XINDEX) shstrndx = r32(s0 + 40);
-            if (phnum == PN_XNUM)       phnum    = r32(s0 + 44);
+        if (shentsize == shent && table_ok(ef, shoff, 1, shent)) {
+            const uint8_t *s0 = ef->data + shoff;  /* sh_size, sh_link, sh_info */
+            if (shnum == 0)             shnum    = c32 ? r32(s0 + 20) : (uint32_t)r64(s0 + 32);
+            if (shstrndx == SHN_XINDEX) shstrndx = r32(s0 + (c32 ? 24 : 40));
+            if (phnum == PN_XNUM)       phnum    = r32(s0 + (c32 ? 28 : 44));
         } else if (phnum == PN_XNUM) {
             set_err(err, esz, "Malformed ELF: extended segment count without a readable section 0");
             goto fail;
@@ -808,8 +971,8 @@ bool elf_parse(ElfFile *ef, const uint8_t *buf, size_t len, char *err, size_t es
 
     /* program headers: required to be sound */
     if (phnum) {
-        if (phentsize != 56) { set_err(err, esz, "Malformed ELF: program header size %u (expected 56)", phentsize); goto fail; }
-        if (phnum > MAX_PHNUM || !table_ok(ef, phoff, phnum, 56)) {
+        if (phentsize != phent) { set_err(err, esz, "Malformed ELF: program header size %u (expected %u)", phentsize, phent); goto fail; }
+        if (phnum > MAX_PHNUM || !table_ok(ef, phoff, phnum, phent)) {
             set_err(err, esz, "Malformed ELF: program header table (offset 0x%llx, %u entries) outside the file",
                     (unsigned long long)phoff, phnum);
             goto fail;
@@ -818,15 +981,24 @@ bool elf_parse(ElfFile *ef, const uint8_t *buf, size_t len, char *err, size_t es
         if (!ef->seg) { set_err(err, esz, "Out of memory"); goto fail; }
         ef->nseg = (int)phnum;
         for (uint32_t i = 0; i < phnum; i++) {
-            const uint8_t *p = ef->data + phoff + (uint64_t)i * 56;
+            const uint8_t *p = ef->data + phoff + (uint64_t)i * phent;
             ElfSegment *s = &ef->seg[i];
             s->type   = r32(p);
-            s->flags  = r32(p + 4);
-            s->off    = r64(p + 8);
-            s->vaddr  = r64(p + 16);
-            s->filesz = r64(p + 32);
-            s->memsz  = r64(p + 40);
-            s->align  = r64(p + 48);
+            if (c32) {                             /* Elf32_Phdr: p_flags after p_memsz */
+                s->off    = r32(p + 4);
+                s->vaddr  = r32(p + 8);
+                s->filesz = r32(p + 16);
+                s->memsz  = r32(p + 20);
+                s->flags  = r32(p + 24);
+                s->align  = r32(p + 28);
+            } else {                               /* Elf64_Phdr */
+                s->flags  = r32(p + 4);
+                s->off    = r64(p + 8);
+                s->vaddr  = r64(p + 16);
+                s->filesz = r64(p + 32);
+                s->memsz  = r64(p + 40);
+                s->align  = r64(p + 48);
+            }
             if (s->type != PT_LOAD) continue;
             if (s->filesz > s->memsz) {
                 set_err(err, esz, "Malformed ELF: segment %u has file size > memory size", i);
@@ -837,7 +1009,7 @@ bool elf_parse(ElfFile *ef, const uint8_t *buf, size_t len, char *err, size_t es
                         i, (unsigned long long)s->off, (unsigned long long)s->filesz);
                 goto fail;
             }
-            if (s->memsz > UINT64_MAX - s->vaddr) {
+            if (s->memsz > (c32 ? (uint64_t)UINT32_MAX + 1 : UINT64_MAX) - s->vaddr) {
                 set_err(err, esz, "Malformed ELF: segment %u wraps around the address space", i);
                 goto fail;
             }
@@ -889,8 +1061,18 @@ bool elf_parse(ElfFile *ef, const uint8_t *buf, size_t len, char *err, size_t es
             if (s) clean_copy(ef->soname, sizeof ef->soname, s, nl);
         }
         int icap = 0, rcap = 0;
-        read_relocs(ef, d, d->rela, d->relasz, &icap, &rcap);
-        read_relocs(ef, d, d->jmprel, d->pltrelsz, &icap, &rcap);
+        if (c32) {
+            if (d->has_relent && d->relent != 8) warn(ef, "DT_RELENT %llu (expected 8): REL table ignored", (unsigned long long)d->relent);
+            else read_relocs32(ef, d, d->rel, d->relsz, false, &icap, &rcap);
+            if (d->has_relaent && d->relaent != 12) warn(ef, "DT_RELAENT %llu (expected 12): RELA table ignored", (unsigned long long)d->relaent);
+            else read_relocs32(ef, d, d->rela, d->relasz, true, &icap, &rcap);
+            if (d->has_pltrel && d->pltrel != DT_REL && d->pltrel != DT_RELA)
+                warn(ef, "DT_PLTREL %llu is neither REL nor RELA: PLT relocations ignored", (unsigned long long)d->pltrel);
+            else read_relocs32(ef, d, d->jmprel, d->pltrelsz, d->has_pltrel && d->pltrel == DT_RELA, &icap, &rcap);
+        } else {
+            read_relocs(ef, d, d->rela, d->relasz, &icap, &rcap);
+            read_relocs(ef, d, d->jmprel, d->pltrelsz, &icap, &rcap);
+        }
         read_relr(ef, d->relr, d->relrsz, &rcap);
     }
     if (ef->nimp) qsort(ef->imp, (size_t)ef->nimp, sizeof *ef->imp, cmp_imp);
@@ -902,13 +1084,13 @@ bool elf_parse(ElfFile *ef, const uint8_t *buf, size_t len, char *err, size_t es
     for (int i = 0; i < ef->nsec; i++) {
         const ElfSection *s = &ef->sec[i];
         if ((s->type != SHT_SYMTAB && s->type != SHT_DYNSYM) || s->bad) continue;
-        if (s->entsize && s->entsize != 24) { warn(ef, "section %d: symbol size %llu: ignored", i, (unsigned long long)s->entsize); continue; }
+        if (s->entsize && s->entsize != sym_ent(ef)) { warn(ef, "section %d: symbol size %llu: ignored", i, (unsigned long long)s->entsize); continue; }
         if (s->link >= (uint32_t)ef->nsec || ef->sec[s->link].bad || ef->sec[s->link].type != SHT_STRTAB) {
             warn(ef, "section %d: symbol names (section %u) invalid: ignored", i, s->link);
             continue;
         }
         const ElfSection *st = &ef->sec[s->link];
-        read_symtab(ef, &scap, s->off, s->size / 24, st->off, st->size, s->type == SHT_DYNSYM);
+        read_symtab(ef, &scap, s->off, s->size / sym_ent(ef), st->off, st->size, s->type == SHT_DYNSYM);
         if (s->type == SHT_SYMTAB) have_symtab = true; else have_dynsym = true;
     }
     if (!have_dynsym && d->present && d->have_sym && d->have_str) {   /* no sections: via the hash table */
@@ -918,7 +1100,8 @@ bool elf_parse(ElfFile *ef, const uint8_t *buf, size_t len, char *err, size_t es
     ef->stripped = !have_symtab;
     if (ef->nsym) qsort(ef->sym, (size_t)ef->nsym, sizeof *ef->sym, cmp_sym);
 
-    map_plt(ef);
+    if (c32) map_plt32(ef, d->pltgot);
+    else     map_plt(ef);
 
     /* constructors / destructors */
     if (d->present) {
@@ -963,7 +1146,14 @@ bool elf_load(ElfFile *ef, const char *path, char *err, size_t esz) {
     size_t got = fread(buf, 1, (size_t)sz, f);
     fclose(f);
     if (got != (size_t)sz) { free(buf); set_err(err, esz, "Read error on %s", path); return false; }
-    bool ok = elf_parse(ef, buf, (size_t)sz, err, esz);
+    bool ok = pe_is_pe(buf, (size_t)sz) || ((size_t)sz >= 2 && buf[0] == 'M' && buf[1] == 'Z')
+            ? pe_parse(ef, buf, (size_t)sz, err, esz)
+            : elf_parse(ef, buf, (size_t)sz, err, esz);
     free(buf);
     return ok;
+}
+
+const char *elf_kind_name(const ElfFile *ef) {
+    if (ef->fmt == ELF_FMT_PE) return ef->pe.dll ? "PE DLL" : "PE EXE";
+    return elf_type_name(ef->type);
 }

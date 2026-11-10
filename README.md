@@ -462,7 +462,11 @@ points to, the start of another function. A line marked `!` is one the
 recursive analysis did not decode (bytes hidden in code, or code it did not
 reach, e.g. the cases of a switch whose table it does not follow). Arrows /
 `j` `k`, `PgUp` / `PgDn` / `Space` and `g` / `G` move; `Esc` goes back to the
-list.
+list. When the window is too narrow for the lines, `←` / `→` (or `Shift` + `←` /
+`→`) shift them 8 columns at a time, all but their margin (breakpoint, `!`, `▶`,
+address), which stays; `→` stops once the longest line shown is whole. `Home`
+brings them back to column 0 (unshifted, it goes to the first line); while they
+are shifted both bars say so (`shifted +16 cols`).
 
 `Enter` (or a click) on a line with an address (a call or jump target, a
 `[rip + X]` operand) follows it: to the disassembly of the function holding
@@ -528,6 +532,7 @@ at a time, run under Abyss and killed with it):
 | `p` | Pause the running program |
 | `K` / `Shift + F5` | Kill it |
 | `i` / click on the panel | Type into its console |
+| `r` | Change a register of the stopped program: `↑` / `↓` (or a click) choose it in the panel (`▸`), `e` / `Enter` types its new value in hex (`0x` optional), `Enter` writes it, `Esc` cancels; `Esc` / `r` end the choice |
 | `a` | Arguments of the program: the prompt shows the last ones; `Enter` keeps them for every later launch by `F5`, `F6` or `F7`, until the file is closed (an empty line: no argument) |
 
 The arguments are split like a shell does, nothing expanded (no `$VAR`, no `*`):
@@ -541,6 +546,13 @@ While the program is stopped, its line (`▶`) is highlighted and a panel on the
 right shows the registers (`rip rsp rbp rax rbx rcx rdx rsi rdi rflags`, the
 changed ones highlighted, `rflags` decoded, where `rip` is). A stop on a
 signal says why, with the faulting address for a segmentation fault.
+`r` lets the keys choose one of them (outside it, `e` stays the breakpoint's on /
+off): the value typed is written into the thread that stopped and read back, the
+bar says `rax = 0x1f (was 0x0)`. A new `rip` brings its line (`▶`) into view, in
+its function; `F5` / `F6` / `F7` go on from there. In a 32-bit program a value
+above 32 bits is refused with the prompt kept. The trap flag of `rflags` stays the
+debugger's. On Linux, moving `rip` while the program was stopped inside a system
+call keeps the kernel from restarting that call (as gdb does).
 A 32-bit ELF program runs too (`eip esp...` registers, 32-bit disassembly).
 When its loader `/lib/ld-linux.so.2` is not installed, the Linux `abyss` runs it
 with the i386 loader it carries: `ld-linux.so.2`, `libc.so.6`, `libm.so.6`,
@@ -617,8 +629,10 @@ time. Without it the module is left out of the build and `F9` says so.
 | Disassembly, data | `Enter` / click | Follow the address of the line (a choice when there are several: a call and its arguments) |
 | Disassembly, data | `Backspace` | Back along the links followed |
 | Data sections, data | `←` / `→` | Scroll the columns (window too narrow) |
+| Disassembly | `←` / `→`, `Shift` + `←` / `→` | Shift the lines 8 columns, the margin stays (window too narrow) |
+| Disassembly | `Home` | Lines back to column 0 (unshifted: the first line) |
 | Disassembly | `b` `B` `e` `h` `L` `n` | Breakpoints, see the debugger table |
-| Disassembly | `F5` `F6` `F7` `p` `K` `i` | Run, step, pause, kill, type: see the debugger table |
+| Disassembly | `F5` `F6` `F7` `p` `K` `i` `r` | Run, step, pause, kill, type, change a register: see the debugger table |
 | Disassembly | `a` | Arguments of the program for the next launches |
 
 #### Features by session
@@ -645,6 +659,8 @@ The F9 module and the debugger were extended in the sessions below, detailed in
 | 15 | Windows debugger tested under Wine: other threads held during a step, exact pass counts |
 | 16 | Windows debugger: 32-bit programs through WOW64 |
 | 18 | Program arguments (`a`), more data addresses followed in 32-bit code; for the editor: 2-space soft indentation, the mouse in every view |
+| 19 | Disassembly lines shifted sideways in a narrow window (`←` / `→`, `Home`) |
+| 20 | Registers of the stopped program written from the panel (`r`, `e`), Linux and Windows |
 
 #### Known limits
 
@@ -831,3 +847,36 @@ An interactive ncurses editor for `~/.colorrc`.
 | `redem` | Emergency reset for WiFi drivers. Restarts stuck or crashing wireless interfaces. |
 
 ---
+
+## Monitoring
+
+### `monitoring`
+
+A dashboard built with the `Rich` library displaying real-time system diagnostics:
+
+- CPU and GPU usage, frequencies, RAM, disk I/O
+- Top processes by resource usage
+- Active network interfaces, mounted network drives, packet counters
+- Python version and installed package count
+
+### `wifi_monitoring`
+
+Focused network monitor tracking wireless interface state and traffic in real time.
+
+---
+
+## Terminal Games
+
+### `blackjack`
+
+Classic CLI Blackjack with full dealer AI and a betting system. Player and dealer cards displayed in the terminal.
+
+### `minesweeper`
+
+Customizable Minesweeper with adjustable grid dimensions.
+
+```bash
+minesweeper <width> <height>
+# Example:
+minesweeper 4 4
+```

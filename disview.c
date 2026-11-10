@@ -18,7 +18,9 @@
  *    separator line, of its part laid out elsewhere (.cold) when the
  *    analysis found one. The lines are decoded once, when the function
  *    is opened; a line the recursive analysis did not decode is marked
- *    '!'. Esc goes back to the list.
+ *    '!'. Left / Right (Shift too) shift the lines sideways after their
+ *    margin (breakpoint, '!', rip, address), Home back to 0. Esc goes back
+ *    to the list.
  *
  * The binary is read by elfload.c (copied in memory) and analysed by
  * disasm.c: nothing here maps or writes it. Only the debugger keys of
@@ -71,7 +73,7 @@ typedef struct {
 
 #define DIS_HIST 64
 enum { SORT_ADDR, SORT_NAME, SORT_SIZE, SORT_CALLERS, SORT_COUNT };
-enum { IN_NONE, IN_FILTER, IN_GOTO, IN_CONSOLE, IN_BREAK, IN_ARGS };   /* DisView.in_mode */
+enum { IN_NONE, IN_FILTER, IN_GOTO, IN_CONSOLE, IN_BREAK, IN_ARGS, IN_REG };   /* DisView.in_mode */
 
 struct DisView {
     Disasm    d;
@@ -119,6 +121,12 @@ struct DisView {
     bool      dclip;               /* size runs past its section / mapping */
     size_t    doff;                /* lines the analysis did not decode   */
     size_t    dsel, dtop;
+    /* the lines scroll sideways after their margin (breakpoint, !, ▶,
+     * address), which stays: dhx columns of them are hidden on the left
+     * (Left / Right, Home: 0); dh_more: a line drawn last has some hidden
+     * on the right */
+    int       dhx;
+    bool      dh_more;
 
     /* debugger, when the debuggee runs this file: dbg_seen is the last
      * stop shown here (g_dbg_gen), drip the file address of rip while it
@@ -139,6 +147,10 @@ struct DisView {
      * columns of each register at the last draw (row 0: not drawn), clickable */
     int       sarg_y0[2], sarg_y1[2];
     int       reg_y[18], reg_x0[18], reg_x1[18];
+    /* r: the keys choose a register of the panel (rsel, index of reg_val)
+     * while rsel_on; e / Enter types its new value (in_mode IN_REG) */
+    bool      rsel_on;
+    int       rsel;
     bool      peek_on;
     int       peek_k;
     uint64_t  peek_a;
@@ -170,6 +182,9 @@ struct DisView {
 #define DIS_GUESS_MAX  (64u << 10)
 /* instruction bytes shown before "…" (wide windows only) */
 #define DIS_BYTES      10
+/* columns of a Left / Right on the disassembly, and the most it shifts */
+#define DIS_HSTEP      8
+#define DIS_HX_MAX     2048
 
 /* ─── Drawing helpers ──────────────────────────────────────────── */
 
@@ -966,6 +981,7 @@ static void cancel_input(DisView *v) {
         list_filter(v, sel_fn(v));
     }
     v->in_mode = IN_NONE;
+    v->rsel_on = false;
 }
 
 /* ─── Disassembly of one function ──────────────────────────────── */
@@ -1055,6 +1071,7 @@ static bool disasm_open(DisView *v, long f) {
         for (size_t i = 0; i < ndl; i++)
             if (dl[i].len && (dl[i].bad || da_insn_at(d, dl[i].addr) < 0)) v->doff++;
     v->dsel = v->dtop = 0;
+    v->dhx = 0;
     v->screen = SCR_DISASM;
     return true;
 }
@@ -2401,6 +2418,23 @@ static void value_go(DisView *v, int k, const char *lbl, uint64_t val) {
                  lbl, (unsigned long long)val);
 }
 
+/* file address fa on the disassembly screen: the function holding it
+ * opened, its line selected and brought into view among `rows`. false: in
+ * no function, or no line holds it */
+static bool show_addr(DisView *v, uint64_t fa, int rows) {
+    long f = da_func_containing(&v->d, fa);
+    if (f < 0) return false;
+    if (!disasm_open(v, f)) return false;
+    long p = vis_pos(v, f);
+    if (p >= 0) v->sel = (size_t)p;
+    size_t li = dl_line_of(v, fa);
+    if (li == SIZE_MAX) return false;
+    v->dsel = li;
+    size_t r = rows > 0 ? (size_t)rows : 1;
+    if (li < v->dtop || li >= v->dtop + r) v->dtop = land_top(li);
+    return true;
+}
+
 /* Shows the last stop of the debuggee in v, once per stop: the function
  * holding rip on the disassembly screen, its line selected (and brought
  * into view among `rows`), and the reason in the bar. Waits while a
@@ -2442,25 +2476,150 @@ static void dbg_show_stop(DisView *v, int rows) {
         else
             list_msg(v, COLOR_PAIR_STRING, "%s  ·  %.100s 0x%llx", st, nm ? nm : "file address", (unsigned long long)fa);
     }
-    long f = da_func_containing(&v->d, fa);
-    if (f < 0) return;
-    if (!disasm_open(v, f)) return;
-    long p = vis_pos(v, f);
-    if (p >= 0) v->sel = (size_t)p;
-    size_t li = dl_line_of(v, fa);
-    if (li == SIZE_MAX) return;
-    v->dsel = li;
-    size_t r = rows > 0 ? (size_t)rows : 1;
-    if (li < v->dtop || li >= v->dtop + r) v->dtop = land_top(li);
+    show_addr(v, fa, rows);
 }
 
 static void dbg_sync(DisView *v, int rows) {
     if (!dbg_mine(v) || v->dbg_seen == g_dbg_gen || v->in_mode == IN_FILTER || v->in_mode == IN_GOTO || v->in_mode == IN_BREAK ||
-        v->in_mode == IN_ARGS) return;
+        v->in_mode == IN_ARGS || v->in_mode == IN_REG) return;
     v->dbg_seen = g_dbg_gen;
     dbg_show_stop(v, rows);
     char news[160];                                  /* could not be placed, overwritten: said over the stop */
     if (dbg_bp_take_news(news, sizeof news)) list_msg(v, COLOR_PAIR_KEYWORD, "%s", news);
+}
+
+/* ─── r: the registers of the panel, written ───────────────────────
+ * r gives the keys to the registers of the panel (the stopped program's):
+ * ↑ / ↓ choose one (a click too), e / Enter types its new value in hex
+ * (0x optional), Enter writes it (dbg_set_regs), Esc cancels; Esc / r end
+ * the choice, any other key ends it and acts as usual. A new rip brings its
+ * line into view (▶ follows g_regs). */
+
+/* the panel shows the registers of the stopped program */
+static bool reg_sel_ok(const DisView *v) {
+    return dbg_mine(v) && dbg_state() == DBG_STOPPED && g_regs_ok && v->dpanel && !v->bp_panel;
+}
+
+static void reg_sel_enter(DisView *v) {
+    if (!dbg_mine(v) || dbg_state() != DBG_STOPPED || !g_regs_ok) {
+        list_msg(v, COLOR_PAIR_NUMBER, "r: the registers can be changed while the program is stopped (F5 / F6 / F7)");
+        return;
+    }
+    if (!v->dpanel) {
+        list_msg(v, COLOR_PAIR_NUMBER, "r: the register panel needs a pane of 72 columns or more");
+        return;
+    }
+    v->bp_panel = false;                             /* L: it listed the breakpoints */
+    if (v->rsel < 0 || v->rsel >= 18 || !v->reg_y[v->rsel]) v->rsel = 0;
+    v->rsel_on = true;
+}
+
+/* the next register shown in direction d (rip first, then the panel's order) */
+static void reg_step(DisView *v, int d) {
+    for (int i = v->rsel + d; i >= 0 && i < 18; i += d)
+        if (v->reg_y[i]) { v->rsel = i; return; }
+}
+
+/* a key while a register is chosen: true when taken; any other key ends the
+ * choice and is handled as usual (false) */
+static bool reg_sel_key(DisView *v, int key) {
+    if (!reg_sel_ok(v)) { v->rsel_on = false; return false; }
+    switch (key) {
+        case KEY_UP:   case 'k': reg_step(v, -1); return true;
+        case KEY_DOWN: case 'j': reg_step(v, 1);  return true;
+        case KEY_HOME: case 'g': v->rsel = 0;     return true;
+        case KEY_END:  case 'G': v->rsel = 17; if (!v->reg_y[17]) reg_step(v, -1); return true;
+        case 'e': case '\n': case '\r': case KEY_ENTER:
+            v->in_mode = IN_REG;
+            v->in_buf[0] = '\0';
+            return true;
+        case 27: case 'r':
+            v->rsel_on = false;
+            return true;
+    }
+    v->rsel_on = false;
+    return false;
+}
+
+/* Enter: the value typed goes into register rsel. A bad value, or one the
+ * system refuses, keeps the prompt open with why. */
+static void reg_write(DisView *v, int win_h) {
+    int i = v->rsel;
+    const char *nm = reg_name(i);
+    uint64_t val;
+    v->msg_pair = COLOR_PAIR_KEYWORD;
+    if (!parse_hex(v->in_buf, &val)) {
+        snprintf(v->msg, sizeof v->msg, "   \"%.40s\" is not a hex value (1f, 0x1f): fix it, or Esc to keep %s", v->in_buf, nm);
+        return;
+    }
+    if (dbg_bits() == 32 && val > 0xffffffffu) {
+        snprintf(v->msg, sizeof v->msg, "   %s has 32 bits: 0x%llx does not fit, or Esc to keep it", nm, (unsigned long long)val);
+        return;
+    }
+    if (!reg_sel_ok(v)) {
+        v->in_mode = IN_NONE;
+        v->rsel_on = false;
+        list_msg(v, COLOR_PAIR_KEYWORD, "%s: not written, the program is not stopped any more", nm);
+        return;
+    }
+    DbgRegs r = g_regs;
+    uint64_t *f[18] = { &r.rip, &r.rsp, &r.rbp, &r.rax, &r.rbx, &r.rcx, &r.rdx, &r.rsi, &r.rdi, &r.rflags,
+                        &r.r8, &r.r9, &r.r10, &r.r11, &r.r12, &r.r13, &r.r14, &r.r15 };
+    uint64_t old = reg_val(&g_regs, i), old_rip = g_regs.rip;
+    *f[i] = val;
+    if (!dbg_set_regs(&r)) {
+        snprintf(v->msg, sizeof v->msg, "   %s: 0x%llx not written (refused by the system), still 0x%llx: another value, or Esc",
+                 nm, (unsigned long long)val, (unsigned long long)old);
+        return;
+    }
+    v->in_mode = IN_NONE;
+    DbgRegs now;
+    g_regs = dbg_get_regs(&now) ? now : r;           /* what the thread holds now */
+    uint64_t got = reg_val(&g_regs, i);
+    char note[200] = "";
+    if (got != val)
+        snprintf(note, sizeof note, "  ·  asked 0x%llx: the trap flag and reserved bits stay as they are", (unsigned long long)val);
+    else if (i == 0 && g_regs.rip != old_rip) {
+        uint64_t fa;
+        char nb[200];
+        const char *fn;
+        if (!dbg_to_file(g_regs.rip, &fa))
+            snprintf(note, sizeof note, "  ·  outside the file: no line to show");
+        else if (!show_addr(v, fa, list_rows(win_h)))
+            snprintf(note, sizeof note, "  ·  in no function of the file");
+        else
+            snprintf(note, sizeof note, "  ·  %.100s: F5 / F6 / F7 go on from this line",
+                     (fn = da_name_for(&v->d, fa, nb, sizeof nb)) ? fn : "file address");
+    }
+    list_msg(v, COLOR_PAIR_STRING, "%s = 0x%llx (was 0x%llx)%s", nm, (unsigned long long)got, (unsigned long long)old, note);
+}
+
+/* keys while the new value of a register is typed */
+static bool reg_edit_key(DisView *v, int key, int win_h) {
+    size_t n = strlen(v->in_buf);
+    switch (key) {
+        case 27:
+            v->in_mode = IN_NONE;
+            list_msg(v, COLOR_PAIR_COMMENT, "%s: not changed", reg_name(v->rsel));
+            return true;
+        case '\n': case '\r': case KEY_ENTER:
+            reg_write(v, win_h);
+            return true;
+        case KEY_BACKSPACE: case 127: case '\b':
+            if (n) v->in_buf[n - 1] = '\0';
+            break;
+        case 'u' & 0x1f:
+            v->in_buf[0] = '\0';
+            break;
+        default: {
+            int c = lower(key);
+            bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || c == 'x';
+            if (key < 127 && hex && n + 1 < 24) { v->in_buf[n] = (char)key; v->in_buf[n + 1] = '\0'; break; }
+            return true;                               /* anything else is swallowed */
+        }
+    }
+    v->msg[0] = '\0';                                  /* the error of the last Enter */
+    return true;
 }
 
 bool dis_ui_poll(void) {
@@ -3023,6 +3182,32 @@ static int piece(WINDOW *win, int y, int x, int w, attr_t a, const char *s) {
     return x;
 }
 
+/* The part of a disassembly line that scrolls sideways: s at its column
+ * vx, that part starting on screen at column xm and seen from its column
+ * hx (the cells before hx are not drawn, nor those past w: *cut is then
+ * set). Returns its column after s, cut or not. */
+static int hpiece(WINDOW *win, int y, int xm, int hx, int vx, int w, attr_t a, const char *s, bool *cut) {
+    if (xm >= w) return vx;                          /* no room after the margin */
+    bool past = false;
+    wattrset(win, a);
+    for (size_t n = strlen(s), i = 0; i < n; ) {
+        uint32_t cp;
+        int k = utf8_decode(s + i, n - i, &cp);
+        if (k < 1) k = 1;
+        int cw = utf8_cp_width(cp);
+        if (cw < 0) cw = 0;
+        if (vx >= hx && !past) {
+            int x = xm + vx - hx;
+            if (x >= w || x + cw > w) { past = true; if (cut) *cut = true; }
+            else mvwaddnstr(win, y, x, s + i, k);
+        }
+        vx += cw;
+        i += (size_t)k;
+    }
+    wattrset(win, A_NORMAL);
+    return vx;
+}
+
 /* ─── Column blocks (data screens) ─────────────────────────────── */
 
 /* display width of s (UTF-8) */
@@ -3168,9 +3353,16 @@ static void draw_fn_row(const DisView *v, WINDOW *win, int y, int w, uint32_t fi
 /* the prompt replaces the bottom bar while a filter / address is typed */
 static void draw_prompt(const DisView *v, WINDOW *win, int y, int w) {
     bool flt = v->in_mode == IN_FILTER, con = v->in_mode == IN_CONSOLE, brk = v->in_mode == IN_BREAK, arg = v->in_mode == IN_ARGS;
+    bool reg = v->in_mode == IN_REG;
     attr_t st = COLOR_PAIR(COLOR_PAIR_STATUS);
+    char rl[32] = "", rh[160] = "";
+    if (reg) {                                              /* the register's name, its value now */
+        snprintf(rl, sizeof rl, " New %s (hex): ", reg_name(v->rsel));
+        snprintf(rh, sizeof rh, "   now 0x%0*llx  ·  0x optional  ·  Enter: write  ·  Esc: cancel  ·  ^U: clear",
+                 dbg_bits() == 32 ? 8 : 16, (unsigned long long)reg_val(&g_regs, v->rsel));
+    }
     bar(win, y, w, COLOR_PAIR_STATUS, 0, "");
-    int x = piece(win, y, 0, w, st | A_BOLD, con ? " Console (stdin): " : flt ? " Filter (name): " : brk ? " Breakpoint: "
+    int x = piece(win, y, 0, w, st | A_BOLD, reg ? rl : con ? " Console (stdin): " : flt ? " Filter (name): " : brk ? " Breakpoint: "
                                            : arg ? " Arguments: " : " Go to address (hex): ");
     int room = w - x - 1;                                   /* one cell for the cursor */
     size_t n = strlen(v->in_buf);
@@ -3183,6 +3375,7 @@ static void draw_prompt(const DisView *v, WINDOW *win, int y, int w) {
                                             "↑↓ PgUp PgDn: move  ·  Esc: leave"
                                           : "   Enter: send the line  ·  ^D: end of input  ·  ^C: interrupt  ·  "
                                             "F5 F6 F7: run  ·  Shift-F5: kill  ·  ↑↓ PgUp PgDn: move  ·  Esc: leave")
+                          : reg ? (v->msg[0] ? v->msg : rh)
                           : brk ? "   main, 0x1149, main+0x10, libc.so.6+0x2a1c0, . (this line)  [hw]  [if rax == 3 | hits >= 2]  ·  -x removes, -* all  ·  !x on/off  ·  Esc: cancel"
                           : arg ? (v->msg[0] ? v->msg : "   Enter: keep for the next F5 F6 F7 launches  ·  \"a b\" 'c d': one argument  ·  "
                                                         "empty: none  ·  Esc: cancel  ·  ^U: clear")
@@ -3299,7 +3492,9 @@ static size_t num_note(const DisView *v, const DisLine *l, char *out, size_t sz)
     return o < sz ? o : sz - 1;
 }
 
-static void draw_dl_row(const DisView *v, WINDOW *win, int y, int w, size_t i, bool sel) {
+/* line i of the disassembly at row y, columns 0 .. w-1, shifted by
+ * v->dhx after its margin; *cut: set when some of it is hidden on the right */
+static void draw_dl_row(const DisView *v, WINDOW *win, int y, int w, size_t i, bool sel, bool *cut) {
     const Disasm *d = &v->d;
     const DisLine *l = &v->dl[i];
     /* the line of rip (stopped debuggee): green, over the selection */
@@ -3311,10 +3506,10 @@ static void draw_dl_row(const DisView *v, WINDOW *win, int y, int w, size_t i, b
     if (!l->len) {                           /* separator before the .cold part */
         const DisFunc *fn = &d->fn[v->dfn];
         char sep[400];
-        snprintf(sep, sizeof sep, "   ── %.160s.cold  ·  0x%llx-0x%llx  ·  %llu bytes  ·  laid out apart from the body ──",
+        snprintf(sep, sizeof sep, "── %.160s.cold  ·  0x%llx-0x%llx  ·  %llu bytes  ·  laid out apart from the body ──",
                  fn->name ? fn->name : "?", (unsigned long long)fn->cold,
                  (unsigned long long)(fn->cold + fn->cold_size), (unsigned long long)fn->cold_size);
-        piece(win, y, 0, w, sel ? hs : COLOR_PAIR(COLOR_PAIR_COMMENT) | A_BOLD, sep);
+        hpiece(win, y, w < 3 ? w : 3, v->dhx, 0, w, sel ? hs : COLOR_PAIR(COLOR_PAIR_COMMENT) | A_BOLD, sep, cut);
         return;
     }
     long ai = d->nins && !l->bad ? da_insn_at(d, l->addr) : -1;
@@ -3371,14 +3566,15 @@ static void draw_dl_row(const DisView *v, WINDOW *win, int y, int w, size_t i, b
     x = piece(win, y, x, w, sel ? hs : COLOR_PAIR(COLOR_PAIR_NUMBER) | A_BOLD, off ? "!" : " ");
     x = piece(win, y, x, w, sel ? hs : COLOR_PAIR(COLOR_PAIR_NUMBER) | A_BOLD, rip ? "▶" : " ");
     x = piece(win, y, x, w, sel ? hs : COLOR_PAIR(COLOR_PAIR_LINENUM), a) + 2;
+    /* from here the line scrolls sideways: vx counts its columns */
+    int hx = v->dhx, vx = 0;
     if (w >= 90) {
-        int bx = x;
-        piece(win, y, x, w, sel ? hs : COLOR_PAIR(COLOR_PAIR_COMMENT), by);
-        x = bx + DIS_BYTES * 3 + 1;
+        hpiece(win, y, x, hx, vx, w, sel ? hs : COLOR_PAIR(COLOR_PAIR_COMMENT), by, cut);
+        vx = DIS_BYTES * 3 + 1;
     }
-    x = piece(win, y, x, w, sel ? hs : mna, mn);
-    x = piece(win, y, x, w, sel ? hs : COLOR_PAIR(l->bad ? COLOR_PAIR_NUMBER : COLOR_PAIR_NORMAL), l->ops);
-    if (cmt[0]) piece(win, y, x + 2, w, sel ? hs : COLOR_PAIR(COLOR_PAIR_COMMENT), cmt);
+    vx = hpiece(win, y, x, hx, vx, w, sel ? hs : mna, mn, cut);
+    vx = hpiece(win, y, x, hx, vx, w, sel ? hs : COLOR_PAIR(l->bad ? COLOR_PAIR_NUMBER : COLOR_PAIR_NORMAL), l->ops, cut);
+    if (cmt[0]) hpiece(win, y, x, hx, vx + 2, w, sel ? hs : COLOR_PAIR(COLOR_PAIR_COMMENT), cmt, cut);
 }
 
 /* register panel of the debugger: right column of the disassembly, a
@@ -3554,6 +3750,21 @@ static int draw_reg_peek(DisView *v, WINDOW *win, int i, int x, int y, int y1, i
     return draw_peek(win, y, y1, x, w, val);
 }
 
+/* register i at (y, x): its name on namew columns, a space, then its value
+ * `val` with attribute a, or the text typed for it (r, e); the chosen one (r)
+ * marked ▸ in the column before x, its name reversed. Returns the next column. */
+static int draw_reg_cell(const DisView *v, WINDOW *win, int y, int x, int w, int i, int namew, const char *val, attr_t a) {
+    bool sel = v->rsel_on && v->rsel == i, ed = sel && v->in_mode == IN_REG;
+    char nm[16];
+    snprintf(nm, sizeof nm, "%-*s", namew, reg_name(i));
+    if (sel && x > 0) piece(win, y, x - 1, w, COLOR_PAIR(COLOR_PAIR_KEYWORD) | A_BOLD, "▸");
+    int xx = piece(win, y, x, w, COLOR_PAIR(COLOR_PAIR_TYPE) | (sel ? A_REVERSE : 0), nm);
+    xx = piece(win, y, xx, w, COLOR_PAIR(COLOR_PAIR_TYPE), " ");
+    if (!ed) return piece(win, y, xx, w, a, val);
+    xx = piece(win, y, xx, w, COLOR_PAIR(COLOR_PAIR_STRING) | A_BOLD, v->in_buf);
+    return piece(win, y, xx, w, COLOR_PAIR(COLOR_PAIR_STRING) | A_REVERSE, " ");
+}
+
 static void draw_regs(DisView *v, WINDOW *win, int x0, int y0, int y1, int w) {
     wattrset(win, COLOR_PAIR(COLOR_PAIR_INACTIVE_BORDER));
     for (int y = y0; y < y1; y++) mvwaddch(win, y, x0, ACS_VLINE);
@@ -3582,11 +3793,9 @@ static void draw_regs(DisView *v, WINDOW *win, int x0, int y0, int y1, int w) {
             bool chg = g_prev_ok && cur != reg_val(p, i);
             uint8_t t;
             attr_t ua = i != 9 && dbg_read_mem(cur, &t, 1) ? A_UNDERLINE : 0;   /* an address: clickable */
-            snprintf(line, sizeof line, "%-6s ", reg_name(i));
-            int xx = piece(win, y, x, w, COLOR_PAIR(COLOR_PAIR_TYPE), line);
             snprintf(line, sizeof line, "0x%0*llx", dig, (unsigned long long)cur);
             v->reg_y[i] = y; v->reg_x0[i] = x0 + 1; v->reg_x1[i] = w;
-            piece(win, y++, xx, w, (chg ? COLOR_PAIR(COLOR_PAIR_KEYWORD) | A_BOLD : COLOR_PAIR(COLOR_PAIR_NORMAL)) | ua, line);
+            draw_reg_cell(v, win, y++, x, w, i, 6, line, (chg ? COLOR_PAIR(COLOR_PAIR_KEYWORD) | A_BOLD : COLOR_PAIR(COLOR_PAIR_NORMAL)) | ua);
             if (i == 0 && y < y1) {                  /* where rip is */
                 char nb[200], where[120] = "";
                 uint64_t fa;
@@ -3630,11 +3839,9 @@ static void draw_regs(DisView *v, WINDOW *win, int x0, int y0, int y1, int w) {
                     uint64_t cur = reg_val(r, i);
                     uint8_t t;
                     attr_t ua = dbg_read_mem(cur, &t, 1) ? A_UNDERLINE : 0;
-                    snprintf(line, sizeof line, "%-3s ", reg_name(i));
-                    int xx = piece(win, y, cx, w, COLOR_PAIR(COLOR_PAIR_TYPE), line);
                     snprintf(line, sizeof line, "0x%016llx", (unsigned long long)cur);
-                    piece(win, y, xx, w, (g_prev_ok && cur != reg_val(p, i) ? COLOR_PAIR(COLOR_PAIR_KEYWORD) | A_BOLD
-                                                                           : COLOR_PAIR(COLOR_PAIR_NORMAL)) | ua, line);
+                    draw_reg_cell(v, win, y, cx, w, i, 3, line, (g_prev_ok && cur != reg_val(p, i) ? COLOR_PAIR(COLOR_PAIR_KEYWORD) | A_BOLD
+                                                                                                : COLOR_PAIR(COLOR_PAIR_NORMAL)) | ua);
                     v->reg_y[i] = y; v->reg_x0[i] = c ? cx : x0 + 1; v->reg_x1[i] = c ? w : cx + 23;
                     if (v->peek_on && v->peek_k == 2 + i) pk = i;
                 }
@@ -3752,6 +3959,10 @@ static void render_disasm(DisView *v, WINDOW *win, int h, int w) {
         v->dpanel = w - pw;
         w = v->dpanel;                               /* the lines stop before it */
     }
+    if (v->rsel_on && !reg_sel_ok(v)) {              /* resumed, panel gone: no register to choose */
+        v->rsel_on = false;
+        if (v->in_mode == IN_REG) v->in_mode = IN_NONE;
+    }
     if (h >= 4) {
         uint64_t end = v->dmain ? v->dl[v->dmain - 1].addr + v->dl[v->dmain - 1].len : v->dva;
         char extra[320] = "";
@@ -3775,8 +3986,9 @@ static void render_disasm(DisView *v, WINDOW *win, int h, int w) {
         piece(win, 1, 0, w, COLOR_PAIR(COLOR_PAIR_KEYWORD) | A_BOLD, line);
     }
     keep_in_view(&v->dsel, &v->dtop, v->ndl, rows);
+    v->dh_more = false;
     for (int r = 0; r < rows && v->dtop + (size_t)r < v->ndl; r++)
-        draw_dl_row(v, win, y0 + r, w, v->dtop + (size_t)r, v->dtop + (size_t)r == v->dsel);
+        draw_dl_row(v, win, y0 + r, w, v->dtop + (size_t)r, v->dtop + (size_t)r == v->dsel, &v->dh_more);
     if (v->dpanel) {
         if (v->bp_panel) draw_bps(v, win, v->dpanel, 1, h - 1, full);
         else draw_regs(v, win, v->dpanel, 1, h - 1, full);
@@ -3786,18 +3998,25 @@ static void render_disasm(DisView *v, WINDOW *win, int h, int w) {
 
     if (h < 3) return;
     if (v->in_mode != IN_NONE) { draw_prompt(v, win, h - 1, w); return; }
-    char off[64] = "";
+    char off[64] = "", hsh[48] = "";
     if (v->doff) snprintf(off, sizeof off, "  ·  %zu ! (not decoded by the analysis)", v->doff);
-    snprintf(line, sizeof line, " %zu/%zu%s  ·  ", v->ndl ? v->dsel + 1 : 0, v->ndl, off);
+    if (v->dhx > 0) snprintf(hsh, sizeof hsh, "  ·  shifted +%d cols", v->dhx);
+    snprintf(line, sizeof line, " %zu/%zu%s%s  ·  ", v->ndl ? v->dsel + 1 : 0, v->ndl, hsh, off);
     bar(win, h - 1, w, COLOR_PAIR_LINENUM, 0, "");
     int x = piece(win, h - 1, 0, w, COLOR_PAIR(COLOR_PAIR_LINENUM), line);
     if (v->npick) piece(win, h - 1, x, w, COLOR_PAIR(COLOR_PAIR_LINENUM),
                         "↑/↓: choose  ·  Enter/click: go there  ·  1-9: that one  ·  Esc: cancel");
     else if (v->msg[0]) piece(win, h - 1, x, w, COLOR_PAIR(v->msg_pair) | A_BOLD, v->msg);
-    else piece(win, h - 1, x, w, COLOR_PAIR(COLOR_PAIR_LINENUM),
-               "b: breakpoint  ·  B: by name, condition  ·  e: on/off  ·  h: hardware  ·  L: list  ·  n: next  ·  a: arguments  ·  F5: run / continue  ·  F6: step this thread (from main)  ·  F7: step over  ·  p: pause  ·  1 / 2: follow [esp+4] / [esp+8]  ·  K / Shift-F5: kill  ·  i: console  ·  "
+    else if (v->rsel_on) piece(win, h - 1, x, w, COLOR_PAIR(COLOR_PAIR_LINENUM),
+                               "registers: ↑/↓: choose  ·  e / Enter: new value (hex)  ·  Esc / r: done  ·  other keys: as usual");
+    else {
+        if (v->dhx > 0 || v->dh_more)                /* lines cut: the keys that shift them first */
+            x = piece(win, h - 1, x, w, COLOR_PAIR(COLOR_PAIR_LINENUM), "←/→: shift the lines  ·  Home: unshift  ·  ");
+        piece(win, h - 1, x, w, COLOR_PAIR(COLOR_PAIR_LINENUM),
+               "b: breakpoint  ·  B: by name, condition  ·  e: on/off  ·  h: hardware  ·  L: list  ·  n: next  ·  a: arguments  ·  F5: run / continue  ·  F6: step this thread (from main)  ·  F7: step over  ·  p: pause  ·  r: change a register  ·  1 / 2: follow [esp+4] / [esp+8]  ·  K / Shift-F5: kill  ·  i: console  ·  "
                "Enter/click: follow the address  ·  Backspace: back  ·  :: go to address  ·  d: data  ·  "
                "Esc: back to the list  ·  Tab: data  ·  F9: close");
+    }
 }
 
 /* ─── Data screens ─────────────────────────────────────────────── */
@@ -4139,6 +4358,19 @@ static bool list_nav(DisView *v, int key, int win_h, bool letters) {
     return true;
 }
 
+/* Left / Right (Shift too): the disassembly lines shift DIS_HSTEP columns,
+ * Right only while some text is hidden on the right; Home brings them back
+ * to column 0 (when shifted: else it is not used here). false: another key */
+static bool hscroll_key(DisView *v, int key) {
+    if (key == KEY_LEFT || key == KEY_SLEFT) { v->dhx = v->dhx > DIS_HSTEP ? v->dhx - DIS_HSTEP : 0; return true; }
+    if (key == KEY_RIGHT || key == KEY_SRIGHT) {
+        if (v->dh_more && v->dhx + DIS_HSTEP <= DIS_HX_MAX) v->dhx += DIS_HSTEP;
+        return true;
+    }
+    if (key == KEY_HOME && v->dhx) { v->dhx = 0; return true; }
+    return false;
+}
+
 /* keys while typing into the console of the debuggee: a line is sent
  * with Enter (the pty echoes it into the output); ^C / ^D go as they
  * are; F5 / F6 / F7 still drive the program */
@@ -4175,7 +4407,7 @@ static bool console_key(DisView *v, int key, int win_h) {
                 }
                 break;
             }
-            if (v->screen == SCR_DISASM) {           /* arrows, pages: the disassembly still moves */
+            if (v->screen == SCR_DISASM && !hscroll_key(v, key)) {   /* arrows, pages: the disassembly still moves */
                 int rows = list_rows(win_h);
                 if (nav_key(key, rows, &v->dsel, v->ndl, false)) keep_in_view(&v->dsel, &v->dtop, v->ndl, rows);
             }
@@ -4187,6 +4419,7 @@ static bool console_key(DisView *v, int key, int win_h) {
 
 static bool input_key(DisView *v, int key, int win_h) {
     if (v->in_mode == IN_CONSOLE) return console_key(v, key, win_h);
+    if (v->in_mode == IN_REG) return reg_edit_key(v, key, win_h);
     if (v->in_mode == IN_ARGS) v->msg[0] = '\0';     /* the error of the last Enter */
     size_t n = strlen(v->in_buf);
     switch (key) {
@@ -4307,6 +4540,7 @@ static bool disasm_key(DisView *v, int key, int win_h) {
     if (key == 'n') { dbg_key_bp_next(v); return true; }
     if (key == 'i') { dbg_key_console(v); return true; }
     if (key == 'p') { dbg_key_pause(v); return true; }
+    if (key == 'r') { reg_sel_enter(v); return true; }
     if (key == '1' || key == '2') { stack_arg_go(v, key - '1'); return true; }
     if (key == 'K' || key == KEY_F(17)) { dbg_key_kill(v); return true; }
     if (key == KEY_F(5) || key == KEY_F(6) || key == KEY_F(7)) { dbg_key_run(v, key, win_h); return true; }
@@ -4317,6 +4551,7 @@ static bool disasm_key(DisView *v, int key, int win_h) {
         else { v->npick = n; v->pick_sel = 0; }     /* several: the choice */
         return true;
     }
+    if (hscroll_key(v, key)) return true;
     int rows = list_rows(win_h);
     if (!nav_key(key, rows, &v->dsel, v->ndl, true)) return false;
     keep_in_view(&v->dsel, &v->dtop, v->ndl, rows);
@@ -4373,6 +4608,7 @@ bool dis_key(DisView *v, int key, int win_h) {
     v->msg[0] = '\0';
     if (v->npick && v->screen == SCR_DISASM) return pick_key(v, key);
     v->npick = 0;
+    if (v->rsel_on && v->screen == SCR_DISASM && reg_sel_key(v, key)) return true;
     switch (key) {
         case '\t':   /* info -> list -> disassembly -> data -> dump -> info (the
                        * disassembly / dump once a function / section is open) */
@@ -4429,7 +4665,8 @@ bool dis_mouse(DisView *v, int y, int x, unsigned long bstate, int win_h) {
         for (int i = 0; i < 18; i++)
             if (v->reg_y[i] && y == v->reg_y[i] && x >= v->reg_x0[i] && x < v->reg_x1[i]) {
                 v->msg[0] = '\0';
-                reg_go(v, i);
+                if (v->rsel_on && reg_sel_ok(v)) v->rsel = i;   /* r: a click chooses it */
+                else reg_go(v, i);
                 return true;
             }
     }
@@ -4465,19 +4702,21 @@ void dis_status(const DisView *v, char *out, size_t sz) {
     const ElfFile *ef = &v->d.elf;
     if (v->screen == SCR_DISASM && v->dfn >= 0 && (size_t)v->dfn < v->d.nfn) {
         const DisFunc *fn = &v->d.fn[v->dfn];
+        char hsh[48] = "";
+        if (v->dhx > 0) snprintf(hsh, sizeof hsh, "shifted +%d cols  ·  ", v->dhx);   /* first: a narrow bar cuts the end */
         if (!v->ndl) { snprintf(out, sz, " [DISASM]  %.120s  ·  no line ", fn->name ? fn->name : "?"); return; }
         size_t li = v->dsel < v->ndl ? v->dsel : v->ndl - 1;
         const DisLine *l = &v->dl[li];
         if (!l->len) {
-            snprintf(out, sz, " [DISASM]  %.120s.cold  0x%llx  ·  %llu bytes apart from the body  ·  line %zu/%zu ",
-                     fn->name ? fn->name : "?", (unsigned long long)fn->cold,
+            snprintf(out, sz, " [DISASM]  %s%.120s.cold  0x%llx  ·  %llu bytes apart from the body  ·  line %zu/%zu ",
+                     hsh, fn->name ? fn->name : "?", (unsigned long long)fn->cold,
                      (unsigned long long)fn->cold_size, li + 1, v->ndl);
             return;
         }
         bool cold = li > v->dmain;
         bool off = v->d.nins && (l->bad || da_insn_at(&v->d, l->addr) < 0);
-        snprintf(out, sz, " [DISASM]  %.120s%s+0x%llx  0x%llx  ·  %u byte%s%s  ·  line %zu/%zu ",
-                 fn->name ? fn->name : "?", cold ? ".cold" : "",
+        snprintf(out, sz, " [DISASM]  %s%.120s%s+0x%llx  0x%llx  ·  %u byte%s%s  ·  line %zu/%zu ",
+                 hsh, fn->name ? fn->name : "?", cold ? ".cold" : "",
                  (unsigned long long)(l->addr - (cold ? fn->cold : v->dva)), (unsigned long long)l->addr,
                  l->len, l->len == 1 ? "" : "s", l->bad ? "  ·  undecodable" : off ? "  ·  not decoded by the analysis" : "",
                  li + 1, v->ndl);

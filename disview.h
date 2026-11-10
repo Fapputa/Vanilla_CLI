@@ -6,7 +6,8 @@
  * segments, sections, functions found, loader warnings), with Tab the
  * function list (sort, name filter, jump to an address), and with Enter
  * on a function its disassembly (linear sweep of its bytes; Esc goes
- * back to the list).
+ * back to the list; Left / Right shift its lines after their margin when
+ * the window is too narrow, Home back to column 0).
  *
  * d (from any screen, and back): the data sections (allocated, not
  * executable: .rodata, .data, .bss, .got, .init_array...; without a
@@ -22,8 +23,11 @@
  * contents of its section. ':' goes to a typed address the same way,
  * Backspace back to the place left (64 places kept).
  *
- * Debugger (Linux x86-64, dbg.c), on the disassembly screen: b sets or
- * removes a breakpoint on the line (• in the margin), F5 runs the file
+ * Debugger (Linux: ELF64 and ELF32, dbg.c; Windows: PE32+, dbg_win.c), on
+ * the disassembly screen: b sets or removes a breakpoint on the line (• in
+ * the margin, ○ disabled, ◆ debug register), e turns it on / off, h makes it a
+ * hardware one, B types one (name, address, module+offset, condition), L
+ * lists them in the panel, n goes to the next one, F5 runs the file
  * (launched by dbg_launch, stopped at the first breakpoint) or continues,
  * F6 steps one instruction, F7 steps over (a call or rep instruction: runs
  * to the next line; anything else: one step). While the process is

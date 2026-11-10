@@ -204,6 +204,14 @@ long     dbg_console_write(const char *buf, size_t n);
 
 /* Registers of a stopped debuggee (values of the process). */
 bool     dbg_get_regs(DbgRegs *r);
+/* Writes them (thread of the last stop, as dbg_get_regs): take them with
+ * dbg_get_regs, change some, write them all back. The trap flag of rflags
+ * stays the debugger's (the thread's own is kept); the system may drop other
+ * flag bits. A 32-bit process: every value must fit in 32 bits and r8-r15 be
+ * 0, else false and nothing written. When rip changes, a system call the
+ * stop interrupted is not restarted on the resume (Linux: orig_rax -1, as gdb
+ * does). false: not stopped, refused, or the system refused. */
+bool     dbg_set_regs(const DbgRegs *r);
 /* 32 / 64: architecture of the debuggee (of dbg_bp_image's program before
  * the launch), 0 when unknown. */
 int      dbg_bits(void);

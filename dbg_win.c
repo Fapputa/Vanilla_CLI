@@ -5,8 +5,9 @@
  *
  * Done here: dbg_launch, dbg_attach, dbg_detach, dbg_kill, dbg_state,
  * dbg_status, dbg_pid, dbg_stop_reason, dbg_poll, dbg_ui_timeout,
- * dbg_cont, dbg_step, dbg_run_to, dbg_interrupt, dbg_get_regs, the
- * breakpoints, the load base (dbg_load_delta, dbg_to_rt, dbg_to_file).
+ * dbg_cont, dbg_step, dbg_run_to, dbg_interrupt, dbg_get_regs,
+ * dbg_set_regs, the breakpoints, the load base (dbg_load_delta, dbg_to_rt,
+ * dbg_to_file).
  * Not yet (they return false / -1, as dbg.c does on Windows): console,
  * mappings.
  *
@@ -68,7 +69,10 @@
  * whose one instruction blocks keeps the others held until dbg_interrupt or
  * a kill.
  * A SuspendThread that fails on a live thread refuses the resume (dbg_cont
- * / dbg_run_to say why, nothing stays held); a ResumeThread that fails
+ * / dbg_run_to say why, nothing stays held), except ERROR_ACCESS_DENIED on
+ * another thread than the stepping one (OpenThread or SuspendThread: a
+ * thread Abyss may not suspend): that one is left running, never resumed,
+ * told once, and the step goes on; a ResumeThread that fails
  * twice on a live thread is told (dbg_bp_take_news) and tried again at
  * every later end of a hold. dbg_step holds the other threads the same way
  * (it writes no int3, but another thread's int3 trap queued before the
@@ -224,6 +228,8 @@ static bool     g_wow64 = false;       /* a 32-bit (WOW64) debuggee: ctx_get / c
 typedef struct {
     DWORD  tid;
     HANDLE h;                          /* ours while it is held suspended, else NULL */
+    bool   unheld;                     /* this hold: ERROR_ACCESS_DENIED, left running (h NULL) */
+    bool   told;                       /* that denial was told (dbg_bp_take_news): once */
 } DbgThr;
 static DbgThr  *g_thr = NULL;
 static int      g_nthr = 0, g_cthr = 0;
@@ -405,6 +411,7 @@ static DbgThr *thr_add(DWORD tid) {
     t = &g_thr[g_nthr++];
     t->tid = tid;
     t->h = NULL;
+    t->unheld = t->told = false;
     return t;
 }
 
@@ -425,13 +432,14 @@ static bool thr_hold(DbgThr *t, DWORD *e) {
         return ended;
     }
     t->h = h;
+    t->unheld = false;                 /* held now: resumed at the end of the hold */
     return true;
 }
 
 /* Resumes thread t if held (a second try at once). false: ResumeThread
  * failed on a live thread, *e = the error: still held. */
 static bool thr_unhold(DbgThr *t, DWORD *e) {
-    if (!t->h) return true;
+    if (t->unheld || !t->h) return true;   /* never suspended by us: never resumed */
     for (int i = 0; i < 2; i++)
         if (ResumeThread(t->h) != (DWORD)-1) { close_h(&t->h); return true; }
     *e = GetLastError();
@@ -454,12 +462,29 @@ static void unhold_all(void) {
 }
 
 /* A step (over) of thread `tid` begins: every other known thread is held.
- * false: one could not be (err says which and why), none is held. */
+ * One whose OpenThread or SuspendThread fails with ERROR_ACCESS_DENIED (a
+ * thread Abyss may not suspend) is left running, marked unheld (no handle,
+ * so never resumed) and told once (dbg_bp_take_news): the step goes on, and
+ * that thread can pass a breakpoint while its int3 is out. false: another
+ * failure (err says which and why), none is held. */
 static bool hold_others(DWORD tid, char *err, size_t esz) {
     for (int i = 0; i < g_nthr; i++) {
+        DbgThr *t = &g_thr[i];
         DWORD e = 0;
-        if (g_thr[i].tid == tid || thr_hold(&g_thr[i], &e)) continue;
-        DWORD bad = g_thr[i].tid;
+        t->unheld = false;
+        if (t->tid == tid || thr_hold(t, &e)) continue;
+        if (e == ERROR_ACCESS_DENIED) {
+            t->unheld = true;
+            if (!t->told && !g_bp_news[0]) {
+                char msg[96];
+                win_error(e, msg, sizeof msg);
+                snprintf(g_bp_news, sizeof g_bp_news, "Thread %lu not held during steps (error %lu: %.40s): it can pass a "
+                         "breakpoint unseen", (unsigned long)t->tid, (unsigned long)e, msg);
+                t->told = true;
+            }
+            continue;
+        }
+        DWORD bad = t->tid;
         unhold_all();
         char msg[256];
         win_error(e, msg, sizeof msg);
@@ -531,8 +556,8 @@ static bool set_rip(DWORD tid, uint64_t rip) {
  * stub that aborts the caller): SuspendThread works on WOW64 threads too.
  * The thread must be frozen (stopped on a debug event, or suspended).
  * ctx_set reads the full context first and changes only the fields below.
- * Only set_tf and set_rip (ctx_get / ctx_set), dbg_get_regs and bp_hit
- * (ctx_get, regs_from_ctx: esp and the condition registers), dbg_run_to
+ * Only set_tf, set_rip and dbg_set_regs (ctx_get / ctx_set), dbg_get_regs
+ * and bp_hit (ctx_get, regs_from_ctx: esp and the condition registers), dbg_run_to
  * (ctx_get: esp) and the ip readers on_bp, stop_on, the EXIT_THREAD of a
  * stepping thread, the step count, start and hold_back_in (ctx_get, through
  * ip_wow64) use it, and only for a WOW64 debuggee (their g_wow64 branches);
@@ -1756,6 +1781,45 @@ bool dbg_get_regs(DbgRegs *r) {
     if (!get_ctx(g_cur_tid, &c, CONTEXT_FULL)) return false;
     regs_from(&c, r);
     return true;
+}
+
+/* The thread of the last stop (frozen on its debug event): its context read
+ * first (CONTEXT_FULL: segments, debug registers... go back as they were),
+ * the DbgRegs fields written over it, the trap flag kept as the thread has
+ * it. A WOW64 debuggee: the 32-bit context through ctx_set, which refuses a
+ * value above 32 bits or r8..r15 not 0. */
+bool dbg_set_regs(const DbgRegs *r) {
+    if (!r || dbg_state() != DBG_STOPPED) return false;
+    if (g_wow64) {
+        DbgCtx x;
+        if (!ctx_get(g_cur_tid, &x)) return false;
+        uint64_t tf = x.flags & DBG_TF;
+        x.ip = r->rip;  x.sp = r->rsp;  x.bp = r->rbp;
+        x.ax = r->rax;  x.bx = r->rbx;  x.cx = r->rcx;  x.dx = r->rdx;
+        x.si = r->rsi;  x.di = r->rdi;
+        x.flags = (r->rflags & ~(uint64_t)DBG_TF) | tf;
+        x.r8  = r->r8;  x.r9  = r->r9;  x.r10 = r->r10; x.r11 = r->r11;
+        x.r12 = r->r12; x.r13 = r->r13; x.r14 = r->r14; x.r15 = r->r15;
+        return ctx_set(g_cur_tid, &x);
+    }
+    bool own;
+    HANDLE h = thread_handle(g_cur_tid, &own);
+    if (!h) return false;
+    CONTEXT c;
+    memset(&c, 0, sizeof c);
+    c.ContextFlags = CONTEXT_FULL;
+    bool ok = GetThreadContext(h, &c) != 0;
+    if (ok) {
+        c.Rip = r->rip;  c.Rsp = r->rsp;  c.Rbp = r->rbp;
+        c.Rax = r->rax;  c.Rbx = r->rbx;  c.Rcx = r->rcx;  c.Rdx = r->rdx;
+        c.Rsi = r->rsi;  c.Rdi = r->rdi;
+        c.EFlags = ((DWORD)r->rflags & ~(DWORD)DBG_TF) | (c.EFlags & DBG_TF);
+        c.R8  = r->r8;   c.R9  = r->r9;   c.R10 = r->r10;  c.R11 = r->r11;
+        c.R12 = r->r12;  c.R13 = r->r13;  c.R14 = r->r14;  c.R15 = r->r15;
+        ok = SetThreadContext(h, &c) != 0;
+    }
+    if (own) CloseHandle(h);
+    return ok;
 }
 
 /* ---- breakpoints, run to ----------------------------------------------- */

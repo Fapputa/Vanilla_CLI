@@ -900,7 +900,7 @@ static void full_redraw(bool force) {
             "Search",
             "Open File",
             "Go to Line",
-            "Jump to Offset  (decimal: 1024  or hex: 0x400)",
+            "Jump to Offset  (decimal: 1024  hex: 0x400, 400h, 1F0, 0000400)",
             "Search ASCII",
             "",
             "Search table",
@@ -966,20 +966,58 @@ static void open_dialog(EditorMode m, const char *prefill) {
     E.dialog_cursor = strlen(E.dialog_buf);
 }
 
+/* The offset typed in the hex view's jump dialog. Hex: 0x400, $400, #400,
+ * 400h, any a-f digit (1F0) or a leading zero (0000400, as the offset
+ * column shows it, never octal); otherwise decimal (1024). Spaces around
+ * are ignored. False: not a number, or past 64 bits. */
+static bool parse_hex_offset(const char *s, unsigned long long *out) {
+    char d[40];
+    size_t n = 0;
+    while (*s == ' ' || *s == '\t') s++;
+    int base = 0;                                   /* 0: not decided yet */
+    if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) { s += 2; base = 16; }
+    else if (*s == '$' || *s == '#')                { s++;    base = 16; }
+    for (; *s; s++) {
+        if (n + 1 >= sizeof d) return false;
+        d[n++] = *s;
+    }
+    while (n && (d[n - 1] == ' ' || d[n - 1] == '\t')) n--;
+    if (n && !base && (d[n - 1] == 'h' || d[n - 1] == 'H')) { n--; base = 16; }
+    d[n] = '\0';
+    if (!n) return false;
+    bool letters = false;
+    for (size_t i = 0; i < n; i++) {
+        if (!isxdigit((unsigned char)d[i])) return false;
+        if (!isdigit((unsigned char)d[i])) letters = true;
+    }
+    if (!base) base = (letters || (d[0] == '0' && n > 1)) ? 16 : 10;
+    if (base == 10 && letters) return false;
+    errno = 0;
+    char *end;
+    unsigned long long v = strtoull(d, &end, base);
+    if (errno || *end) return false;
+    *out = v;
+    return true;
+}
+
 static void dialog_confirm(void) {
     Pane *ap = E.panes[E.active];
     switch (E.mode) {
 
         case MODE_HEX_JUMP: {
-            if (ap->hex && E.dialog_buf[0]) {
-                char *end;
-                long off = strtol(E.dialog_buf, &end, 0);
-                if (end != E.dialog_buf && off >= 0
-                        && (size_t)off < ap->hex->data_len) {
-                    ap->hex->cursor = (size_t)off;
-                    ap->hex->nibble = 0;
-                    hex_scroll_to_cursor(ap->hex, ap->win_h);
-                }
+            unsigned long long off;
+            if (!ap->hex || !E.dialog_buf[0]) {
+                /* nothing typed: just close */
+            } else if (!parse_hex_offset(E.dialog_buf, &off)) {
+                snprintf(E_notify, sizeof E_notify,
+                         "Not an offset: \"%.40s\" (1024, 0x400, 400h, 1F0)", E.dialog_buf);
+            } else if (off >= ap->hex->data_len) {
+                snprintf(E_notify, sizeof E_notify, "Offset 0x%llX past the end (%zu bytes, last 0x%zX)",
+                         off, ap->hex->data_len, ap->hex->data_len ? ap->hex->data_len - 1 : 0);
+            } else {
+                ap->hex->cursor = (size_t)off;
+                ap->hex->nibble = 0;
+                hex_scroll_to_cursor(ap->hex, ap->win_h);
             }
             E.mode = MODE_NORMAL;
             full_redraw(true);

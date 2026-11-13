@@ -755,15 +755,20 @@ void pane_insert_char(Pane *p, char c) {
     if (c == '\n') { auto_indent_newline(p); return; }
     const char *open = "{([\"'", *close = "})]\"'";
     const char *cp = strchr(open, c);
+    /* the closer already under the cursor (the one auto-inserted): step over it.
+     * Checked first, a quote being both an opener and a closer. */
+    if (strchr(close, c) && p->cursor < gb_len(p->buf) && gb_at(p->buf, p->cursor) == c)
+        { p->cursor++; goto done; }
+    /* no pair for a quote right after a letter or digit (it's, don't) */
+    char before = p->cursor > 0 ? gb_at(p->buf, p->cursor - 1) : ' ';
+    if (cp && (c == '"' || c == '\'') && (isalnum((unsigned char)before) || before == '_'))
+        cp = NULL;
     if (cp) {
         char cl = close[cp-open];
         gb_insert_char(p->buf, p->cursor, c);
         gb_insert_char(p->buf, p->cursor+1, cl);
         p->cursor++;
     } else {
-        const char *clp = strchr(close, c);
-        if (clp && p->cursor < gb_len(p->buf) && gb_at(p->buf, p->cursor) == c)
-            { p->cursor++; goto done; }
         gb_insert_char(p->buf, p->cursor, c); p->cursor++;
     }
     pane_push_undo(p); 

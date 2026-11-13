@@ -471,7 +471,7 @@ static void render_output(void) {
             snprintf(hdr, sizeof hdr, " %s in the background  |  ^B: back to the console",
                      run_compiling() ? "Compiling" : "Running");
         else
-            snprintf(hdr, sizeof hdr, " Output  |  Enter: close   ^B: build & run again");
+            snprintf(hdr, sizeof hdr, " Output  |  Enter: close   ^B: build & run again   PgUp/PgDn, wheel: scroll");
         wattron(E.out_win, COLOR_PAIR(COLOR_PAIR_TITLE) | A_BOLD | A_REVERSE);
         mvwhline(E.out_win, 0, 0, ' ', w);
         mvwaddnstr(E.out_win, 0, 0, hdr, w);
@@ -615,6 +615,15 @@ static void build_and_run(void) {
  * its output keeps coming), ^B returns to the console, ^Q still quits.
  * Returns false for keys the editor should handle itself. */
 static bool console_key(int key) {
+    if (E.out_visible && !run_active() && E.mode == MODE_NORMAL) {   /* the output of the last run */
+        switch (key) {
+            case KEY_PPAGE:  out_scroll_by(-(out_text_rows - 1)); return true;
+            case KEY_NPAGE:  out_scroll_by(out_text_rows - 1);    return true;
+            case KEY_SR:     out_scroll_by(-1);                   return true;   /* Shift-Up */
+            case KEY_SF:     out_scroll_by(1);                    return true;   /* Shift-Down */
+            default:         return false;
+        }
+    }
     if (!(E.out_focus && E.out_visible && run_active() && E.mode == MODE_NORMAL)) return false;
     switch (key) {
         case 27:
@@ -2128,14 +2137,15 @@ static void curses_start(void) {
 #ifdef _WIN32
 /* wgetch() as on Linux: a typed character beyond ASCII comes as its UTF-8 bytes, one per
  * call (the console driver gives WIN_KEY_CHAR | its UTF-16 unit: winsize.c) */
+static unsigned char key_q[4];
+static int key_qn, key_qi;
+static bool key_queued(void) { return key_qi < key_qn; }    /* the rest of a character, no wait */
 static int key_read(WINDOW *w) {
-    static unsigned char q[4];
-    static int qn, qi;
-    if (qi < qn) return q[qi++];
+    if (key_qi < key_qn) return key_q[key_qi++];
     for (;;) {
-        int k = wgetch(w), n = win_key_utf8(k, q);
+        int k = wgetch(w), n = win_key_utf8(k, key_q);
         if (n < 0) return k;
-        if (n > 0) { qn = n; qi = 1; return q[0]; }
+        if (n > 0) { key_qn = n; key_qi = 1; return key_q[0]; }
     }
 }
 #else
@@ -2258,14 +2268,11 @@ static void pane_wheel(Pane *p, int dir, int wy, int wx, unsigned long b) {
  * elsewhere: a selection; a row of the tree / F8 / F9 / table: selects it,
  * a second click on the selected one is Enter; a key named on a hint bar:
  * that key). Dialogs keep the keyboard only. */
-static void mouse_event(void) {
-    MEVENT ev;
-    if (getmouse(&ev) != OK) return;
+static void mouse_at(int y, int x, unsigned long b) {
     static int press_pane = -1;                      /* text pane of the last press */
-    unsigned long b = (unsigned long)ev.bstate;
     int dir = b & BUTTON4_PRESSED ? -1 : (b & MOUSE_WHEEL_DOWN) ? 1 : 0;
     bool click = b & BUTTON1_PRESSED, release = b & BUTTON1_RELEASED;
-    int y = ev.y, x = ev.x, wy, wx;
+    int wy, wx;
 
     if (release) {                                   /* end of a drag in the text */
         int i = press_pane;
@@ -2376,6 +2383,80 @@ static void mouse_event(void) {
     }
 }
 
+static void mouse_event(void) {
+    MEVENT ev;
+    if (getmouse(&ev) == OK) mouse_at(ev.y, ev.x, (unsigned long)ev.bstate);
+}
+
+/* The text a paste brings (bracketed paste on Linux, a burst of keys on
+ * Windows), as one insertion: no auto-indent, no auto-closed pairs. */
+static void paste_flush(char *s, int n) {
+    if (n <= 0 || E.mode != MODE_NORMAL) return;
+    s[n] = '\0';
+    if (E.out_focus && run_active()) {
+        run_input_str(s, (size_t)n);
+    } else if (E.tree_focus && E.tree && E.tree->visible) {
+        /* a path / URL pasted into the tree field: one line */
+        char q[sizeof E.tree->query];
+        size_t o = strlen(E.tree->query);
+        memcpy(q, E.tree->query, o);
+        for (int pi = 0; pi < n && o + 1 < sizeof q; pi++) {
+            char c = s[pi];
+            if (c == '\n' || c == '\r') { if (o) break; continue; }
+            if (c == '\t') c = ' ';
+            q[o++] = c;
+        }
+        q[o] = '\0';
+        ft_query_set(E.tree, q);
+    } else {
+        Pane *ap2 = E.panes[E.active];
+        if (!ap2->hex_mode && !ap2->table_mode && !ap2->mem_mode && !ap2->dis_mode &&
+            !ap2->img_mode && !ap2->doc_mode) {
+            pane_insert_str(ap2, s, (size_t)n);
+            if (E.hl && E.hl->visible) E.hl->dirty = true;
+        }
+    }
+}
+
+#ifdef _WIN32
+/* A paste on Windows: the console has no bracketed paste, the text comes as
+ * keys, all already waiting when the first one is read. A key with others
+ * behind it starts a batch, taken while keys keep coming (a long paste can
+ * arrive in pieces); a key that is not text ends it and is read next. Two
+ * keys or fewer go the usual way, as typed. true when key was consumed. */
+static bool win_paste_burst(WINDOW *w, int key, char *buf, int cap) {
+    bool text = key == '\t' || key == '\n' || key == '\r' || (key >= 32 && key < 256 && key != 127);
+    Pane *p = E.panes[E.active];
+    if (!text || E.mode != MODE_NORMAL || E.tree_focus || E.hl_focus || finfo_focus ||
+        (E.out_focus && run_active()) || p->hex_mode || p->table_mode || p->mem_mode ||
+        p->dis_mode || p->img_mode || p->doc_mode || !win_input_pending())
+        return false;                                /* only the text: elsewhere keys are commands */
+    int n = 0, pend = -1;
+    buf[n++] = (char)key;
+    wtimeout(w, 15);
+    for (;;) {
+        int c = key_read(w);
+        if (c == ERR) break;
+        if (!(c == '\t' || c == '\n' || c == '\r' || (c >= 32 && c < 256 && c != 127))) { pend = c; break; }
+        if (n < cap - 1) buf[n++] = (char)c;
+    }
+    wtimeout(w, -1);
+    if (n <= 2) {                                    /* typed fast, not pasted */
+        if (pend != -1) ungetch(pend);
+        for (int i = n - 1; i >= 1; i--) ungetch((unsigned char)buf[i]);
+        return false;
+    }
+    int m = 0;                                       /* the console sends Enter as \r */
+    for (int i = 0; i < n; i++) {
+        if (buf[i] == '\r') { if (i + 1 < n && buf[i + 1] == '\n') continue; buf[m++] = '\n'; }
+        else buf[m++] = buf[i];
+    }
+    paste_flush(buf, m);
+    if (pend != -1) ungetch(pend);
+    return true;
+}
+#endif
+
 void editor_run(const char *initial_file) {
     #ifdef _WIN32
     win_init_utf8();
@@ -2470,9 +2551,34 @@ void editor_run(const char *initial_file) {
 	#ifdef _WIN32
     		if (tmo < 0) tmo = 100;   /* pas de SIGWINCH sous Windows : on sonde la taille toutes les 100 ms */
 	#endif
+#ifdef _WIN32
+        /* the wheel is taken before ncurses, which drops it (winsize.c): first what is
+         * there now (keys pushed back included), then the wait */
+        int key = ERR, wd = 0, wy = 0, wx = 0;
+        if (key_queued()) key = key_read(kw);
+        else {
+            int wr = win_wait_input(0, &wd, &wy, &wx);
+            if (wr != 2) {
+                wtimeout(kw, 0);
+                key = key_read(kw);
+                if (key == ERR) {
+                    wr = win_wait_input(tmo, &wd, &wy, &wx);
+                    if (wr == 1) { wtimeout(kw, tmo); key = key_read(kw); }
+                }
+                wtimeout(kw, -1);
+            }
+            if (wr == 2) {
+                mouse_at(wy, wx, wd < 0 ? (unsigned long)BUTTON4_PRESSED : (unsigned long)MOUSE_WHEEL_DOWN);
+                force_full_dirty();
+                full_redraw(false);
+                continue;
+            }
+        }
+#else
         if (tmo >= 0) wtimeout(kw, tmo);
         int key = key_read(kw);
         if (tmo >= 0) wtimeout(kw, -1);
+#endif
         {                                           /* live console: new output, end */
             int ev = run_poll();
             if (ev & RUN_EV_DONE) {
@@ -2592,33 +2698,7 @@ void editor_run(const char *initial_file) {
                 
                 if (!consumed && sn >= 5
                         && sq[1]=='2' && sq[2]=='0' && sq[3]=='1' && sq[4]=='~') {
-                    if (in_paste && paste_len > 0 && E.mode == MODE_NORMAL &&
-                        E.out_focus && run_active()) {
-                        run_input_str(paste_batch, (size_t)paste_len);
-                    } else if (in_paste && paste_len > 0 && E.mode == MODE_NORMAL &&
-                               E.tree_focus && E.tree && E.tree->visible) {
-                        /* a path / URL pasted into the tree field: one line */
-                        paste_batch[paste_len] = '\0';
-                        char q[sizeof E.tree->query];
-                        size_t o = strlen(E.tree->query);
-                        memcpy(q, E.tree->query, o);
-                        for (int pi = 0; pi < paste_len && o + 1 < sizeof q; pi++) {
-                            char c = paste_batch[pi];
-                            if (c == '\n' || c == '\r') { if (o) break; continue; }
-                            if (c == '\t') c = ' ';
-                            q[o++] = c;
-                        }
-                        q[o] = '\0';
-                        ft_query_set(E.tree, q);
-                    } else if (in_paste && paste_len > 0 && E.mode == MODE_NORMAL) {
-                        paste_batch[paste_len] = '\0';
-                        Pane *ap2 = E.panes[E.active];
-                        if (!ap2->hex_mode && !ap2->table_mode && !ap2->mem_mode && !ap2->dis_mode &&
-                            !ap2->img_mode && !ap2->doc_mode) {
-                            pane_insert_str(ap2, paste_batch, paste_len);
-                            if (E.hl && E.hl->visible) E.hl->dirty = true;
-                        }
-                    }
+                    if (in_paste) paste_flush(paste_batch, paste_len);
                     in_paste = false; paste_len = 0;
                     for (int si = sn - 1; si >= 5; si--)
                         if (sq[si] != ERR) ungetch(sq[si]);
@@ -2724,6 +2804,9 @@ void editor_run(const char *initial_file) {
             continue;
         }
 
+#ifdef _WIN32
+        if (win_paste_burst(kw, key, paste_batch, (int)sizeof paste_batch)) { full_redraw(true); continue; }
+#endif
         if (console_key(key)) { full_redraw(false); continue; }
 
         EditorMode prev_mode = E.mode;

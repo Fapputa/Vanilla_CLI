@@ -72,6 +72,8 @@ const char *win_appdir(void);                   /* created if missing; NULL, err
 int  win_apppath(char *out, size_t sz, const char *name);   /* <appdir>\name; 0, errno set */
 #define WIN_KEY_CHAR 0x40000000                  /* | a typed UTF-16 unit, from winsize.c */
 int  win_key_utf8(int key, unsigned char b[4]);  /* its UTF-8 bytes; 0 half a pair; -1 not one */
+int  win_wait_input(int ms, int *dir, int *y, int *x);   /* 0 none, 1 for wgetch, 2 a wheel notch */
+int  win_input_pending(void);                    /* a key already waiting (pastes) */
 #else
 #  include <sys/mman.h>
 #  include <sys/wait.h>
